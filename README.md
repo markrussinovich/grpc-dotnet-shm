@@ -76,6 +76,10 @@ An alternative way to use gRPC in .NET is to define the Protobuf contracts direc
 
 For more information, see the documentation on [learn.microsoft.com](https://learn.microsoft.com/aspnet/core/grpc/code-first) or the [protobuf-net.Grpc website](https://protobuf-net.github.io/protobuf-net.Grpc/).
 
+### Go implementation
+
+For a Go implementation with shared memory support, see [grpc-go-shmem](https://github.com/markrussinovich/grpc-go-shmem).
+
 ## To contribute
 
 Contributions are welcome!
