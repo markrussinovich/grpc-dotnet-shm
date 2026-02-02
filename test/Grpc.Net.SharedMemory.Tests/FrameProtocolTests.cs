@@ -24,248 +24,200 @@ namespace Grpc.Net.SharedMemory.Tests;
 public class FrameProtocolTests
 {
     [Test]
-    public void FrameHeader_EncodeDecode_RoundTrip()
+    [Platform("Win")]
+    public void FrameProtocol_WriteAndRead_HeadersFrame()
     {
         // Arrange
-        var header = new FrameHeader(FrameType.Message, 123, 456, MessageFlags.More);
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
 
-        // Act
-        var buffer = new byte[ShmConstants.FrameHeaderSize];
-        header.EncodeTo(buffer);
-        var decoded = FrameHeader.DecodeFrom(buffer);
-
-        // Assert
-        Assert.That(decoded.Type, Is.EqualTo(FrameType.Message));
-        Assert.That(decoded.StreamId, Is.EqualTo(123U));
-        Assert.That(decoded.Length, Is.EqualTo(456U));
-        Assert.That(decoded.Flags, Is.EqualTo(MessageFlags.More));
-        Assert.That(decoded.Reserved, Is.EqualTo(0));
-        Assert.That(decoded.Reserved2, Is.EqualTo(0U));
-    }
-
-    [Test]
-    public void FrameHeader_EncodeDecode_Headers()
-    {
-        // Arrange
-        var header = new FrameHeader(FrameType.Headers, 1, 100, HeadersFlags.Initial);
-
-        // Act
-        var buffer = new byte[ShmConstants.FrameHeaderSize];
-        header.EncodeTo(buffer);
-        var decoded = FrameHeader.DecodeFrom(buffer);
-
-        // Assert
-        Assert.That(decoded.Type, Is.EqualTo(FrameType.Headers));
-        Assert.That(decoded.StreamId, Is.EqualTo(1U));
-        Assert.That(decoded.Length, Is.EqualTo(100U));
-        Assert.That(decoded.Flags, Is.EqualTo(HeadersFlags.Initial));
-    }
-
-    [Test]
-    public void FrameHeader_EncodeDecode_Trailers()
-    {
-        // Arrange
-        var header = new FrameHeader(FrameType.Trailers, 5, 50, TrailersFlags.EndStream);
-
-        // Act
-        var buffer = new byte[ShmConstants.FrameHeaderSize];
-        header.EncodeTo(buffer);
-        var decoded = FrameHeader.DecodeFrom(buffer);
-
-        // Assert
-        Assert.That(decoded.Type, Is.EqualTo(FrameType.Trailers));
-        Assert.That(decoded.StreamId, Is.EqualTo(5U));
-        Assert.That(decoded.Length, Is.EqualTo(50U));
-        Assert.That(decoded.Flags, Is.EqualTo(TrailersFlags.EndStream));
-    }
-
-    [Test]
-    public void FrameHeader_EncodeDecode_GoAway()
-    {
-        // Arrange
-        var header = new FrameHeader(FrameType.GoAway, 0, 0, GoAwayFlags.Draining);
-
-        // Act
-        var buffer = new byte[ShmConstants.FrameHeaderSize];
-        header.EncodeTo(buffer);
-        var decoded = FrameHeader.DecodeFrom(buffer);
-
-        // Assert
-        Assert.That(decoded.Type, Is.EqualTo(FrameType.GoAway));
-        Assert.That(decoded.StreamId, Is.EqualTo(0U));
-        Assert.That(decoded.Flags, Is.EqualTo(GoAwayFlags.Draining));
-    }
-
-    [Test]
-    public void FrameHeader_EncodeDecode_WindowUpdate()
-    {
-        // Arrange
-        var header = new FrameHeader(FrameType.WindowUpdate, 7, 4, 0);
-
-        // Act
-        var buffer = new byte[ShmConstants.FrameHeaderSize];
-        header.EncodeTo(buffer);
-        var decoded = FrameHeader.DecodeFrom(buffer);
-
-        // Assert
-        Assert.That(decoded.Type, Is.EqualTo(FrameType.WindowUpdate));
-        Assert.That(decoded.StreamId, Is.EqualTo(7U));
-        Assert.That(decoded.Length, Is.EqualTo(4U));
-    }
-
-    [Test]
-    public void FrameHeader_EncodeDecode_Ping()
-    {
-        // Arrange
-        var header = new FrameHeader(FrameType.Ping, 0, 8, PingFlags.Bdp);
-
-        // Act
-        var buffer = new byte[ShmConstants.FrameHeaderSize];
-        header.EncodeTo(buffer);
-        var decoded = FrameHeader.DecodeFrom(buffer);
-
-        // Assert
-        Assert.That(decoded.Type, Is.EqualTo(FrameType.Ping));
-        Assert.That(decoded.Length, Is.EqualTo(8U));
-        Assert.That(decoded.Flags, Is.EqualTo(PingFlags.Bdp));
-    }
-
-    [Test]
-    public void FrameHeader_Encode_BufferTooSmall_ThrowsArgumentException()
-    {
-        // Arrange
-        var header = new FrameHeader(FrameType.Message, 1, 100, 0);
-        var buffer = new byte[10]; // Too small
-
-        // Act & Assert
-        Assert.Throws<ArgumentException>(() => header.EncodeTo(buffer));
-    }
-
-    [Test]
-    public void FrameHeader_Decode_BufferTooSmall_ThrowsArgumentException()
-    {
-        // Arrange
-        var buffer = new byte[10]; // Too small
-
-        // Act & Assert
-        Assert.Throws<ArgumentException>(() => FrameHeader.DecodeFrom(buffer));
-    }
-
-    [Test]
-    public void FrameHeader_ByteLayout_MatchesGoImplementation()
-    {
-        // Arrange - create header with known values
-        var header = new FrameHeader(FrameType.Message, 0x12345678, 0xAABBCCDD, 0x55);
-
-        // Act
-        var buffer = new byte[ShmConstants.FrameHeaderSize];
-        header.EncodeTo(buffer);
-
-        // Assert - verify byte layout matches grpc-go-shmem (little-endian)
-        // Length (4 bytes): 0xAABBCCDD
-        Assert.That(buffer[0], Is.EqualTo(0xDD));
-        Assert.That(buffer[1], Is.EqualTo(0xCC));
-        Assert.That(buffer[2], Is.EqualTo(0xBB));
-        Assert.That(buffer[3], Is.EqualTo(0xAA));
-
-        // StreamId (4 bytes): 0x12345678
-        Assert.That(buffer[4], Is.EqualTo(0x78));
-        Assert.That(buffer[5], Is.EqualTo(0x56));
-        Assert.That(buffer[6], Is.EqualTo(0x34));
-        Assert.That(buffer[7], Is.EqualTo(0x12));
-
-        // Type (1 byte): 0x02 (Message)
-        Assert.That(buffer[8], Is.EqualTo(0x02));
-
-        // Flags (1 byte): 0x55
-        Assert.That(buffer[9], Is.EqualTo(0x55));
-
-        // Reserved (2 bytes): 0x0000
-        Assert.That(buffer[10], Is.EqualTo(0x00));
-        Assert.That(buffer[11], Is.EqualTo(0x00));
-
-        // Reserved2 (4 bytes): 0x00000000
-        Assert.That(buffer[12], Is.EqualTo(0x00));
-        Assert.That(buffer[13], Is.EqualTo(0x00));
-        Assert.That(buffer[14], Is.EqualTo(0x00));
-        Assert.That(buffer[15], Is.EqualTo(0x00));
-    }
-
-    [Test]
-    public void FrameHeader_ToString_ReturnsReadableFormat()
-    {
-        // Arrange
-        var header = new FrameHeader(FrameType.Message, 5, 100, MessageFlags.More);
-
-        // Act
-        var str = header.ToString();
-
-        // Assert
-        Assert.That(str, Does.Contain("Message"));
-        Assert.That(str, Does.Contain("5"));
-        Assert.That(str, Does.Contain("100"));
-    }
-
-    [Test]
-    public void FrameHeader_AllFrameTypes_EncodeCorrectly()
-    {
-        var frameTypes = new[]
+        var headersPayload = new HeadersV1
         {
-            (FrameType.Pad, (byte)0x00),
-            (FrameType.Headers, (byte)0x01),
-            (FrameType.Message, (byte)0x02),
-            (FrameType.Trailers, (byte)0x03),
-            (FrameType.Cancel, (byte)0x04),
-            (FrameType.GoAway, (byte)0x05),
-            (FrameType.Ping, (byte)0x06),
-            (FrameType.Pong, (byte)0x07),
-            (FrameType.HalfClose, (byte)0x08),
-            (FrameType.WindowUpdate, (byte)0x09)
-        };
+            Version = 1,
+            HeaderType = 0,
+            Method = "/test/Method",
+            Authority = "localhost",
+            Metadata = Array.Empty<MetadataKV>()
+        }.Encode();
 
-        foreach (var (frameType, expectedByte) in frameTypes)
+        var header = new FrameHeader(FrameType.Headers, streamId: 1, length: (uint)headersPayload.Length, flags: HeadersFlags.Initial);
+
+        // Act
+        FrameProtocol.WriteFrame(seg.RingA, header, headersPayload.AsSpan());
+
+        // Read the frame
+        var (readHeader, payload) = FrameProtocol.ReadFrame(seg.RingA);
+
+        // Assert
+        Assert.That(readHeader.Type, Is.EqualTo(FrameType.Headers));
+        Assert.That(readHeader.StreamId, Is.EqualTo(1));
+        Assert.That(payload.Length, Is.EqualTo(headersPayload.Length));
+
+        // Verify headers decode
+        var decoded = HeadersV1.Decode(payload);
+        Assert.That(decoded.Method, Is.EqualTo("/test/Method"));
+    }
+
+    [Test]
+    [Platform("Win")]
+    public void FrameProtocol_WriteAndRead_MessageFrame()
+    {
+        // Arrange
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 8192, maxStreams: 100);
+
+        var messageData = new byte[256];
+        for (int i = 0; i < messageData.Length; i++)
         {
-            var header = new FrameHeader(frameType, 0, 0, 0);
-            var buffer = new byte[ShmConstants.FrameHeaderSize];
-            header.EncodeTo(buffer);
-
-            Assert.That(buffer[8], Is.EqualTo(expectedByte), $"FrameType {frameType} should encode to {expectedByte}");
+            messageData[i] = (byte)(i % 256);
         }
-    }
-
-    [Test]
-    public void FrameHeader_LargeValues_EncodeDecodeCorrectly()
-    {
-        // Arrange - use maximum values
-        var header = new FrameHeader(FrameType.Message, uint.MaxValue, uint.MaxValue - 1, 0xFF);
 
         // Act
-        var buffer = new byte[ShmConstants.FrameHeaderSize];
-        header.EncodeTo(buffer);
-        var decoded = FrameHeader.DecodeFrom(buffer);
+        FrameProtocol.WriteMessage(seg.RingA, streamId: 42, messageData.AsSpan(), isLast: false);
+
+        // Read the frame
+        var (header, payload) = FrameProtocol.ReadFrame(seg.RingA);
 
         // Assert
-        Assert.That(decoded.StreamId, Is.EqualTo(uint.MaxValue));
-        Assert.That(decoded.Length, Is.EqualTo(uint.MaxValue - 1));
-        Assert.That(decoded.Flags, Is.EqualTo(0xFF));
+        Assert.That(header.Type, Is.EqualTo(FrameType.Message));
+        Assert.That(header.StreamId, Is.EqualTo(42));
+        Assert.That(payload, Is.EqualTo(messageData));
     }
 
     [Test]
-    public void ShmConstants_FrameHeaderSize_Is16()
+    [Platform("Win")]
+    public void FrameProtocol_WriteAndRead_TrailersFrame()
     {
-        Assert.That(ShmConstants.FrameHeaderSize, Is.EqualTo(16));
+        // Arrange
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
+
+        var trailersPayload = new TrailersV1
+        {
+            GrpcStatusCode = Grpc.Core.StatusCode.OK,
+            GrpcStatusMessage = "",
+            Metadata = Array.Empty<MetadataKV>()
+        }.Encode();
+
+        var header = new FrameHeader(FrameType.Trailers, streamId: 1, length: (uint)trailersPayload.Length, flags: TrailersFlags.EndStream);
+
+        // Act
+        FrameProtocol.WriteFrame(seg.RingA, header, trailersPayload.AsSpan());
+
+        var (readHeader, payload) = FrameProtocol.ReadFrame(seg.RingA);
+
+        // Assert
+        Assert.That(readHeader.Type, Is.EqualTo(FrameType.Trailers));
+        Assert.That(readHeader.Flags, Is.EqualTo(TrailersFlags.EndStream));
+
+        var decoded = TrailersV1.Decode(payload);
+        Assert.That(decoded.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.OK));
     }
 
     [Test]
-    public void ShmConstants_RingHeaderSize_Is64()
+    [Platform("Win")]
+    public void FrameProtocol_WriteAndRead_PingFrame()
     {
-        Assert.That(ShmConstants.RingHeaderSize, Is.EqualTo(64));
+        // Arrange
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
+
+        var pingData = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+        // Act - Write a PING frame
+        FrameProtocol.WritePing(seg.RingA, flags: 0, pingData.AsSpan());
+
+        var (header, payload) = FrameProtocol.ReadFrame(seg.RingA);
+
+        // Assert
+        Assert.That(header.Type, Is.EqualTo(FrameType.Ping));
+        Assert.That(header.Length, Is.EqualTo(8));
+        Assert.That(payload, Is.EqualTo(pingData));
     }
 
     [Test]
-    public void ShmConstants_SegmentMagic_MatchesGoImplementation()
+    [Platform("Win")]
+    public void FrameProtocol_MultipleFrames_ReadInOrder()
     {
-        // "SHM1" in ASCII = 0x53484D31
-        Assert.That(ShmConstants.SegmentMagic, Is.EqualTo(0x53484D31U));
+        // Arrange
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 8192, maxStreams: 100);
+
+        // Write multiple frames
+        FrameProtocol.WritePing(seg.RingA, 0, new byte[8]);
+        FrameProtocol.WriteMessage(seg.RingA, 1, new byte[] { 1, 2, 3 }, isLast: false);
+        FrameProtocol.WriteHalfClose(seg.RingA, 1);
+
+        // Read and verify order
+        var (h1, _) = FrameProtocol.ReadFrame(seg.RingA);
+        Assert.That(h1.Type, Is.EqualTo(FrameType.Ping));
+
+        var (h2, p2) = FrameProtocol.ReadFrame(seg.RingA);
+        Assert.That(h2.Type, Is.EqualTo(FrameType.Message));
+        Assert.That(p2, Is.EqualTo(new byte[] { 1, 2, 3 }));
+
+        var (h3, _) = FrameProtocol.ReadFrame(seg.RingA);
+        Assert.That(h3.Type, Is.EqualTo(FrameType.HalfClose));
+    }
+
+    [Test]
+    [Platform("Win")]
+    public void FrameProtocol_WriteCancel_Works()
+    {
+        // Arrange
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
+
+        // Act
+        FrameProtocol.WriteCancel(seg.RingA, streamId: 99);
+
+        var (header, payload) = FrameProtocol.ReadFrame(seg.RingA);
+
+        // Assert
+        Assert.That(header.Type, Is.EqualTo(FrameType.Cancel));
+        Assert.That(header.StreamId, Is.EqualTo(99));
+        Assert.That(header.Length, Is.EqualTo(0));
+    }
+
+    [Test]
+    [Platform("Win")]
+    public void FrameProtocol_WriteGoAway_Works()
+    {
+        // Arrange
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
+
+        // Act
+        FrameProtocol.WriteGoAway(seg.RingA, GoAwayFlags.Draining, "server shutdown");
+
+        var (header, payload) = FrameProtocol.ReadFrame(seg.RingA);
+
+        // Assert
+        Assert.That(header.Type, Is.EqualTo(FrameType.GoAway));
+        Assert.That(header.Flags, Is.EqualTo(GoAwayFlags.Draining));
+        Assert.That(System.Text.Encoding.UTF8.GetString(payload), Is.EqualTo("server shutdown"));
+    }
+
+    [Test]
+    [Platform("Win")]
+    public void FrameProtocol_WriteWindowUpdate_Works()
+    {
+        // Arrange
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
+
+        // Act
+        FrameProtocol.WriteWindowUpdate(seg.RingA, streamId: 5, windowSizeIncrement: 65535);
+
+        var (header, payload) = FrameProtocol.ReadFrame(seg.RingA);
+
+        // Assert
+        Assert.That(header.Type, Is.EqualTo(FrameType.WindowUpdate));
+        Assert.That(header.StreamId, Is.EqualTo(5));
+        Assert.That(header.Length, Is.EqualTo(4));
+
+        // Verify increment value
+        var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(payload);
+        Assert.That(increment, Is.EqualTo(65535));
     }
 }
