@@ -1,0 +1,3 @@
+<Project>
+  <!-- Opt out of parent Directory.Build.props for this standalone test project -->
+</Project>
