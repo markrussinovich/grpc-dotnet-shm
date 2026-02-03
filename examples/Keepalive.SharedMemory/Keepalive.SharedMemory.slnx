@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Keepalive.SharedMemory</RootNamespace>
+  </PropertyGroup>
+  <Files Include="Server/**">
+    <Link>Server/%(RecursiveDir)%(Filename)%(Extension)</Link>
+  </Files>
+  <Files Include="Client/**">
+    <Link>Client/%(RecursiveDir)%(Filename)%(Extension)</Link>
+  </Files>
+</Project>
