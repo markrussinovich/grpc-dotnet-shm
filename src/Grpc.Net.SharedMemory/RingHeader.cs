@@ -25,62 +25,67 @@ namespace Grpc.Net.SharedMemory;
 /// This layout matches grpc-go-shmem for interoperability.
 /// 
 /// Layout (grpc-go-shmem compatible):
-/// - Offset 0-7:   capacity (ulong) - ring data area size (power of 2)
-/// - Offset 8-15:  writeIdx (ulong) - monotonic write index
-/// - Offset 16-23: readIdx (ulong) - monotonic read index  
-/// - Offset 24-27: dataSeq (uint) - data availability sequence for signaling
-/// - Offset 28-31: spaceSeq (uint) - space availability sequence for signaling
-/// - Offset 32-35: contigSeq (uint) - contiguity sequence for signaling
-/// - Offset 36-39: closed (uint) - atomic closed flag
-/// - Offset 40-43: dataWaiters (uint) - count of readers blocked on data
-/// - Offset 44-47: spaceWaiters (uint) - count of writers blocked on space
-/// - Offset 48-51: contigWaiters (uint) - count of writers waiting for contiguity
-/// - Offset 52-63: reserved (12 bytes) - future use
+/// - Offset 0x00:  capacity (ulong) - ring data area size (power of 2)
+/// - Offset 0x08:  widx (ulong) - monotonic write index (producer)
+/// - Offset 0x10:  ridx (ulong) - monotonic read index (consumer)
+/// - Offset 0x18:  dataSeq (uint) - data sequence for futex (producer increments)
+/// - Offset 0x1C:  spaceSeq (uint) - space sequence for futex (consumer increments)
+/// - Offset 0x20:  closed (uint) - closed flag (producer sets to 1)
+/// - Offset 0x24:  pad (uint) - padding
+/// - Offset 0x28:  contigSeq (uint) - contiguity sequence (consumer increments on every read commit)
+/// - Offset 0x2C:  spaceWaiters (uint) - number of writers waiting on space
+/// - Offset 0x30:  contigWaiters (uint) - number of writers waiting on contiguity
+/// - Offset 0x34:  dataWaiters (uint) - number of readers waiting for data
+/// - Offset 0x38-0x3F: reserved (8 bytes) - padding to 64B
 /// </summary>
 [StructLayout(LayoutKind.Explicit, Size = 64)]
 public struct RingHeader
 {
     /// <summary>Ring data area capacity in bytes (must be power of 2).</summary>
-    [FieldOffset(0)]
+    [FieldOffset(0x00)]
     public ulong Capacity;
 
     /// <summary>Monotonic write index (producer advances this).</summary>
-    [FieldOffset(8)]
+    [FieldOffset(0x08)]
     public ulong WriteIdx;
 
     /// <summary>Monotonic read index (consumer advances this).</summary>
-    [FieldOffset(16)]
+    [FieldOffset(0x10)]
     public ulong ReadIdx;
 
     /// <summary>Data availability sequence number for futex/event signaling.</summary>
-    [FieldOffset(24)]
+    [FieldOffset(0x18)]
     public uint DataSeq;
 
     /// <summary>Space availability sequence number for futex/event signaling.</summary>
-    [FieldOffset(28)]
+    [FieldOffset(0x1C)]
     public uint SpaceSeq;
 
-    /// <summary>Contiguity sequence number for signaling.</summary>
-    [FieldOffset(32)]
-    public uint ContigSeq;
-
     /// <summary>Ring closed flag (0 = open, 1 = closed).</summary>
-    [FieldOffset(36)]
+    [FieldOffset(0x20)]
     public uint Closed;
 
-    /// <summary>Number of readers waiting for data.</summary>
-    [FieldOffset(40)]
-    public uint DataWaiters;
+    /// <summary>Padding.</summary>
+    [FieldOffset(0x24)]
+    public uint Pad;
+
+    /// <summary>Contiguity sequence number for signaling.</summary>
+    [FieldOffset(0x28)]
+    public uint ContigSeq;
 
     /// <summary>Number of writers waiting for space.</summary>
-    [FieldOffset(44)]
+    [FieldOffset(0x2C)]
     public uint SpaceWaiters;
 
     /// <summary>Number of writers waiting for contiguity.</summary>
-    [FieldOffset(48)]
+    [FieldOffset(0x30)]
     public uint ContigWaiters;
 
-    // Offset 52-63: Reserved (12 bytes) - implicitly zeroed
+    /// <summary>Number of readers waiting for data.</summary>
+    [FieldOffset(0x34)]
+    public uint DataWaiters;
+
+    // Offset 0x38-0x3F: Reserved (8 bytes) - implicitly zeroed
 }
 
 /// <summary>

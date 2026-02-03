@@ -27,68 +27,88 @@ namespace Grpc.Net.SharedMemory;
 /// Segment header structure (128 bytes) that identifies and configures a shared memory segment.
 /// This layout matches grpc-go-shmem for interoperability.
 /// 
-/// Layout:
-/// - Offset 0-7:    magic (8 bytes) - "GRPCSHM\0"
-/// - Offset 8-11:   version (uint32) - protocol version
-/// - Offset 12-15:  flags (uint32) - reserved flags
-/// - Offset 16-23:  totalSize (uint64) - total segment size
-/// - Offset 24-31:  ringAOffset (uint64) - offset to Ring A in segment
-/// - Offset 32-39:  ringACapacity (uint64) - data area capacity for Ring A
-/// - Offset 40-47:  ringBOffset (uint64) - offset to Ring B in segment
-/// - Offset 48-55:  ringBCapacity (uint64) - data area capacity for Ring B
-/// - Offset 56-59:  maxStreams (uint32) - maximum concurrent streams
-/// - Offset 60-63:  clientReady (uint32) - client ready flag
-/// - Offset 64-67:  serverReady (uint32) - server ready flag
-/// - Offset 68-127: reserved (60 bytes) - future use
+/// Layout (grpc-go-shmem compatible):
+/// - Offset 0x00: magic (8 bytes) - "GRPCSHM\0"
+/// - Offset 0x08: version (uint32) - protocol version
+/// - Offset 0x0C: flags (uint32) - reserved flags
+/// - Offset 0x10: totalSize (uint64) - total segment size
+/// - Offset 0x18: ringAOff (uint64) - offset to Ring A header
+/// - Offset 0x20: ringACap (uint64) - ring A capacity (power of 2)
+/// - Offset 0x28: ringBOff (uint64) - offset to Ring B header
+/// - Offset 0x30: ringBCap (uint64) - ring B capacity (power of 2)
+/// - Offset 0x38: serverPID (uint32) - server process ID
+/// - Offset 0x3C: clientPID (uint32) - client process ID
+/// - Offset 0x40: serverReady (uint32) - server ready flag (0->1)
+/// - Offset 0x44: clientReady (uint32) - client mapped flag (0->1)
+/// - Offset 0x48: closed (uint32) - closed flag (0 open, 1 closed)
+/// - Offset 0x4C: pad (uint32) - padding
+/// - Offset 0x50: maxStreams (uint32) - max concurrent streams
+/// - Offset 0x54-0x7F: reserved (44 bytes) - padding to 128B
 /// </summary>
 [StructLayout(LayoutKind.Explicit, Size = 128)]
 public struct SegmentHeader
 {
     /// <summary>Magic bytes identifying this as a shared memory segment ("GRPCSHM\0").</summary>
-    [FieldOffset(0)]
+    [FieldOffset(0x00)]
     public ulong MagicValue;
 
     /// <summary>Protocol version.</summary>
-    [FieldOffset(8)]
+    [FieldOffset(0x08)]
     public uint Version;
 
     /// <summary>Reserved flags.</summary>
-    [FieldOffset(12)]
+    [FieldOffset(0x0C)]
     public uint Flags;
 
     /// <summary>Total segment size in bytes.</summary>
-    [FieldOffset(16)]
+    [FieldOffset(0x10)]
     public ulong TotalSize;
 
     /// <summary>Offset to Ring A (client→server) in the segment.</summary>
-    [FieldOffset(24)]
+    [FieldOffset(0x18)]
     public ulong RingAOffset;
 
     /// <summary>Data area capacity for Ring A.</summary>
-    [FieldOffset(32)]
+    [FieldOffset(0x20)]
     public ulong RingACapacity;
 
     /// <summary>Offset to Ring B (server→client) in the segment.</summary>
-    [FieldOffset(40)]
+    [FieldOffset(0x28)]
     public ulong RingBOffset;
 
     /// <summary>Data area capacity for Ring B.</summary>
-    [FieldOffset(48)]
+    [FieldOffset(0x30)]
     public ulong RingBCapacity;
 
-    /// <summary>Maximum concurrent streams.</summary>
-    [FieldOffset(56)]
-    public uint MaxStreams;
+    /// <summary>Server process ID.</summary>
+    [FieldOffset(0x38)]
+    public uint ServerPID;
 
-    /// <summary>Client ready flag.</summary>
-    [FieldOffset(60)]
-    public uint ClientReady;
+    /// <summary>Client process ID.</summary>
+    [FieldOffset(0x3C)]
+    public uint ClientPID;
 
     /// <summary>Server ready flag.</summary>
-    [FieldOffset(64)]
+    [FieldOffset(0x40)]
     public uint ServerReady;
 
-    // Offset 68-127: Reserved (60 bytes) - implicitly zeroed
+    /// <summary>Client ready flag.</summary>
+    [FieldOffset(0x44)]
+    public uint ClientReady;
+
+    /// <summary>Closed flag (0 = open, 1 = closed).</summary>
+    [FieldOffset(0x48)]
+    public uint Closed;
+
+    /// <summary>Padding.</summary>
+    [FieldOffset(0x4C)]
+    public uint Pad;
+
+    /// <summary>Maximum concurrent streams.</summary>
+    [FieldOffset(0x50)]
+    public uint MaxStreams;
+
+    // Offset 0x54-0x7F: Reserved (44 bytes) - implicitly zeroed
 }
 
 /// <summary>
@@ -208,8 +228,13 @@ public sealed class Segment : IDisposable
             RingACapacity = ringCapacity,
             RingBOffset = ringBOffset,
             RingBCapacity = ringCapacity,
-            MaxStreams = maxStreams,
-            ServerReady = 1  // Server is ready when creating
+            ServerPID = (uint)Environment.ProcessId,
+            ClientPID = 0,
+            ServerReady = 1,  // Server is ready when creating
+            ClientReady = 0,
+            Closed = 0,
+            Pad = 0,
+            MaxStreams = maxStreams
         };
 
         // Write header to buffer
@@ -307,17 +332,21 @@ public sealed class Segment : IDisposable
         span.Clear(); // Zero all bytes first
         
         // Write grpc-go-shmem compatible header (128 bytes)
-        BinaryPrimitives.WriteUInt64LittleEndian(span[0..8], header.MagicValue);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[8..12], header.Version);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[12..16], header.Flags);
-        BinaryPrimitives.WriteUInt64LittleEndian(span[16..24], header.TotalSize);
-        BinaryPrimitives.WriteUInt64LittleEndian(span[24..32], header.RingAOffset);
-        BinaryPrimitives.WriteUInt64LittleEndian(span[32..40], header.RingACapacity);
-        BinaryPrimitives.WriteUInt64LittleEndian(span[40..48], header.RingBOffset);
-        BinaryPrimitives.WriteUInt64LittleEndian(span[48..56], header.RingBCapacity);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[56..60], header.MaxStreams);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[60..64], header.ClientReady);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[64..68], header.ServerReady);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[0x00..0x08], header.MagicValue);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x08..0x0C], header.Version);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x0C..0x10], header.Flags);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[0x10..0x18], header.TotalSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[0x18..0x20], header.RingAOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[0x20..0x28], header.RingACapacity);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[0x28..0x30], header.RingBOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[0x30..0x38], header.RingBCapacity);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x38..0x3C], header.ServerPID);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x3C..0x40], header.ClientPID);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x40..0x44], header.ServerReady);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x44..0x48], header.ClientReady);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x48..0x4C], header.Closed);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x4C..0x50], header.Pad);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x50..0x54], header.MaxStreams);
     }
 
     private static SegmentHeader ReadSegmentHeader(byte[] buffer)
@@ -325,17 +354,21 @@ public sealed class Segment : IDisposable
         var span = buffer.AsSpan(0, ShmConstants.SegmentHeaderSize);
         return new SegmentHeader
         {
-            MagicValue = BinaryPrimitives.ReadUInt64LittleEndian(span[0..8]),
-            Version = BinaryPrimitives.ReadUInt32LittleEndian(span[8..12]),
-            Flags = BinaryPrimitives.ReadUInt32LittleEndian(span[12..16]),
-            TotalSize = BinaryPrimitives.ReadUInt64LittleEndian(span[16..24]),
-            RingAOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[24..32]),
-            RingACapacity = BinaryPrimitives.ReadUInt64LittleEndian(span[32..40]),
-            RingBOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[40..48]),
-            RingBCapacity = BinaryPrimitives.ReadUInt64LittleEndian(span[48..56]),
-            MaxStreams = BinaryPrimitives.ReadUInt32LittleEndian(span[56..60]),
-            ClientReady = BinaryPrimitives.ReadUInt32LittleEndian(span[60..64]),
-            ServerReady = BinaryPrimitives.ReadUInt32LittleEndian(span[64..68])
+            MagicValue = BinaryPrimitives.ReadUInt64LittleEndian(span[0x00..0x08]),
+            Version = BinaryPrimitives.ReadUInt32LittleEndian(span[0x08..0x0C]),
+            Flags = BinaryPrimitives.ReadUInt32LittleEndian(span[0x0C..0x10]),
+            TotalSize = BinaryPrimitives.ReadUInt64LittleEndian(span[0x10..0x18]),
+            RingAOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[0x18..0x20]),
+            RingACapacity = BinaryPrimitives.ReadUInt64LittleEndian(span[0x20..0x28]),
+            RingBOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[0x28..0x30]),
+            RingBCapacity = BinaryPrimitives.ReadUInt64LittleEndian(span[0x30..0x38]),
+            ServerPID = BinaryPrimitives.ReadUInt32LittleEndian(span[0x38..0x3C]),
+            ClientPID = BinaryPrimitives.ReadUInt32LittleEndian(span[0x3C..0x40]),
+            ServerReady = BinaryPrimitives.ReadUInt32LittleEndian(span[0x40..0x44]),
+            ClientReady = BinaryPrimitives.ReadUInt32LittleEndian(span[0x44..0x48]),
+            Closed = BinaryPrimitives.ReadUInt32LittleEndian(span[0x48..0x4C]),
+            Pad = BinaryPrimitives.ReadUInt32LittleEndian(span[0x4C..0x50]),
+            MaxStreams = BinaryPrimitives.ReadUInt32LittleEndian(span[0x50..0x54])
         };
     }
 

@@ -128,8 +128,11 @@ public class SegmentTests
     [Platform("Win")]
     public void RingHeader_Layout_MatchesGoShmem()
     {
-        // Verify field offsets match grpc-go-shmem
-        // Capacity at offset 0, WriteIdx at 8, ReadIdx at 16, etc.
+        // Verify field offsets match grpc-go-shmem shm_segment.go RingHeader
+        // Go layout:
+        // 0x00: capacity, 0x08: widx, 0x10: ridx, 0x18: dataSeq, 0x1C: spaceSeq
+        // 0x20: closed, 0x24: pad, 0x28: contigSeq, 0x2C: spaceWaiters
+        // 0x30: contigWaiters, 0x34: dataWaiters, 0x38-0x3F: reserved
         var header = new RingHeader
         {
             Capacity = 0x1234567890ABCDEF,
@@ -137,11 +140,12 @@ public class SegmentTests
             ReadIdx = 0x2222222222222222,
             DataSeq = 0x33333333,
             SpaceSeq = 0x44444444,
-            ContigSeq = 0x55555555,
-            Closed = 0x66666666,
-            DataWaiters = 0x77777777,
+            Closed = 0x55555555,
+            Pad = 0x66666666,
+            ContigSeq = 0x77777777,
             SpaceWaiters = 0x88888888,
-            ContigWaiters = 0x99999999
+            ContigWaiters = 0x99999999,
+            DataWaiters = 0xAAAAAAAA
         };
 
         // Marshal to bytes and verify layout
@@ -156,12 +160,18 @@ public class SegmentTests
             handle.Free();
         }
 
-        // Check capacity is at offset 0
-        Assert.That(BitConverter.ToUInt64(bytes, 0), Is.EqualTo(0x1234567890ABCDEF));
-        // Check writeIdx is at offset 8
-        Assert.That(BitConverter.ToUInt64(bytes, 8), Is.EqualTo(0x1111111111111111));
-        // Check readIdx is at offset 16
-        Assert.That(BitConverter.ToUInt64(bytes, 16), Is.EqualTo(0x2222222222222222));
+        // Verify layout matches Go
+        Assert.That(BitConverter.ToUInt64(bytes, 0x00), Is.EqualTo(0x1234567890ABCDEF), "capacity at 0x00");
+        Assert.That(BitConverter.ToUInt64(bytes, 0x08), Is.EqualTo(0x1111111111111111), "widx at 0x08");
+        Assert.That(BitConverter.ToUInt64(bytes, 0x10), Is.EqualTo(0x2222222222222222), "ridx at 0x10");
+        Assert.That(BitConverter.ToUInt32(bytes, 0x18), Is.EqualTo(0x33333333), "dataSeq at 0x18");
+        Assert.That(BitConverter.ToUInt32(bytes, 0x1C), Is.EqualTo(0x44444444), "spaceSeq at 0x1C");
+        Assert.That(BitConverter.ToUInt32(bytes, 0x20), Is.EqualTo(0x55555555), "closed at 0x20");
+        Assert.That(BitConverter.ToUInt32(bytes, 0x24), Is.EqualTo(0x66666666), "pad at 0x24");
+        Assert.That(BitConverter.ToUInt32(bytes, 0x28), Is.EqualTo(0x77777777), "contigSeq at 0x28");
+        Assert.That(BitConverter.ToUInt32(bytes, 0x2C), Is.EqualTo(0x88888888), "spaceWaiters at 0x2C");
+        Assert.That(BitConverter.ToUInt32(bytes, 0x30), Is.EqualTo(0x99999999), "contigWaiters at 0x30");
+        Assert.That(BitConverter.ToUInt32(bytes, 0x34), Is.EqualTo(0xAAAAAAAA), "dataWaiters at 0x34");
     }
 
     [Test]
