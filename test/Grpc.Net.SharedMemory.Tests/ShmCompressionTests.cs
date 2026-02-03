@@ -18,123 +18,191 @@
 
 using Grpc.Net.SharedMemory.Compression;
 using NUnit.Framework;
+using System.IO.Compression;
 
 namespace Grpc.Net.SharedMemory.Tests;
 
+/// <summary>
+/// Tests for compression support in shared memory transport.
+/// SHM equivalent of TCP compression tests in FunctionalTests.
+/// </summary>
 [TestFixture]
 public class ShmCompressionTests
 {
+    #region Compressor Unit Tests
+
     [Test]
-    public void GzipCompressor_CompressDecompress_RoundTrips()
+    public void IdentityCompressor_Compress_ReturnsOriginalData()
     {
         // Arrange
-        var compressor = new GzipCompressor();
-        var original = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+        var compressor = IdentityCompressor.Instance;
+        var data = new byte[] { 1, 2, 3, 4, 5 };
 
         // Act
-        var compressed = compressor.Compress(original);
-        var decompressed = compressor.Decompress(compressed);
+        var compressed = compressor.Compress(data);
 
         // Assert
-        Assert.That(decompressed, Is.EqualTo(original));
+        Assert.That(compressed, Is.EqualTo(data));
     }
 
     [Test]
-    public void GzipCompressor_HasCorrectName()
+    public void IdentityCompressor_Decompress_ReturnsOriginalData()
     {
         // Arrange
-        var compressor = new GzipCompressor();
-
-        // Assert
-        Assert.That(compressor.Name, Is.EqualTo("gzip"));
-    }
-
-    [Test]
-    public void DeflateCompressor_CompressDecompress_RoundTrips()
-    {
-        // Arrange
-        var compressor = new DeflateCompressor();
-        var original = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+        var compressor = IdentityCompressor.Instance;
+        var data = new byte[] { 1, 2, 3, 4, 5 };
 
         // Act
-        var compressed = compressor.Compress(original);
-        var decompressed = compressor.Decompress(compressed);
+        var decompressed = compressor.Decompress(data);
 
         // Assert
-        Assert.That(decompressed, Is.EqualTo(original));
+        Assert.That(decompressed, Is.EqualTo(data));
     }
 
     [Test]
-    public void DeflateCompressor_HasCorrectName()
+    public void IdentityCompressor_Properties_AreCorrect()
     {
-        // Arrange
-        var compressor = new DeflateCompressor();
-
-        // Assert
-        Assert.That(compressor.Name, Is.EqualTo("deflate"));
-    }
-
-    [Test]
-    public void IdentityCompressor_PassesThrough()
-    {
-        // Arrange
-        var compressor = new IdentityCompressor();
-        var original = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-
-        // Act
-        var compressed = compressor.Compress(original);
-        var decompressed = compressor.Decompress(compressed);
-
-        // Assert
-        Assert.That(compressed, Is.EqualTo(original));
-        Assert.That(decompressed, Is.EqualTo(original));
-    }
-
-    [Test]
-    public void IdentityCompressor_HasCorrectName()
-    {
-        // Arrange
-        var compressor = new IdentityCompressor();
+        // Arrange & Act
+        var compressor = IdentityCompressor.Instance;
 
         // Assert
         Assert.That(compressor.Name, Is.EqualTo("identity"));
+        Assert.That(compressor.IsIdentity, Is.True);
     }
 
     [Test]
-    public void Registry_GetCompressor_ReturnsGzip()
+    public void GzipCompressor_Properties_AreCorrect()
     {
-        // Act
-        var compressor = ShmCompressorRegistry.Get("gzip");
+        // Arrange & Act
+        var compressor = GzipCompressor.Default;
 
         // Assert
-        Assert.That(compressor, Is.Not.Null);
-        Assert.That(compressor!.Name, Is.EqualTo("gzip"));
+        Assert.That(compressor.Name, Is.EqualTo("gzip"));
+        Assert.That(compressor.IsIdentity, Is.False);
     }
 
     [Test]
-    public void Registry_GetCompressor_ReturnsDeflate()
+    public void GzipCompressor_CompressDecompress_RoundTrip()
     {
+        // Arrange
+        var compressor = GzipCompressor.Default;
+        var original = new byte[1000];
+        Random.Shared.NextBytes(original);
+
         // Act
-        var compressor = ShmCompressorRegistry.Get("deflate");
+        var compressed = compressor.Compress(original);
+        var decompressed = compressor.Decompress(compressed);
 
         // Assert
-        Assert.That(compressor, Is.Not.Null);
-        Assert.That(compressor!.Name, Is.EqualTo("deflate"));
+        Assert.That(decompressed, Is.EqualTo(original));
     }
 
     [Test]
-    public void Registry_GetCompressor_ReturnsIdentity()
+    public void GzipCompressor_CompressibleData_ReducesSize()
     {
+        // Arrange
+        var compressor = GzipCompressor.Default;
+        // Highly compressible data (repeated pattern)
+        var data = new byte[10000];
+        for (int i = 0; i < data.Length; i++)
+        {
+            data[i] = (byte)(i % 4);
+        }
+
         // Act
-        var compressor = ShmCompressorRegistry.Get("identity");
+        var compressed = compressor.Compress(data);
 
         // Assert
-        Assert.That(compressor, Is.Not.Null);
-        Assert.That(compressor!.Name, Is.EqualTo("identity"));
+        Assert.That(compressed.Length, Is.LessThan(data.Length), "Gzip should compress repeating data");
     }
 
     [Test]
-    public void Registry_GetCompressor_ReturnsNullForUnknown()
+    public void GzipCompressor_EmptyData_RoundTrip()
+    {
+        // Arrange
+        var compressor = GzipCompressor.Default;
+        var empty = Array.Empty<byte>();
+
+        // Act
+        var compressed = compressor.Compress(empty);
+        var decompressed = compressor.Decompress(compressed);
+
+        // Assert
+        Assert.That(decompressed, Is.Empty);
+    }
+
+    [Test]
+    public void GzipCompressor_DifferentCompressionLevels_Work()
+    {
+        // Arrange
+        var data = new byte[1000];
+        Random.Shared.NextBytes(data);
+
+        var levels = new[] 
+        { 
+            CompressionLevel.Fastest, 
+            CompressionLevel.Optimal, 
+            CompressionLevel.SmallestSize 
+        };
+
+        foreach (var level in levels)
+        {
+            // Act
+            var compressor = new GzipCompressor(level);
+            var compressed = compressor.Compress(data);
+            var decompressed = compressor.Decompress(compressed);
+
+            // Assert
+            Assert.That(decompressed, Is.EqualTo(data), $"Round trip failed for level {level}");
+        }
+    }
+
+    #endregion
+
+    #region Deflate Compressor Tests
+
+    [Test]
+    public void DeflateCompressor_Properties_AreCorrect()
+    {
+        // Arrange & Act
+        var compressor = DeflateCompressor.Default;
+
+        // Assert
+        Assert.That(compressor.Name, Is.EqualTo("deflate"));
+        Assert.That(compressor.IsIdentity, Is.False);
+    }
+
+    [Test]
+    public void DeflateCompressor_CompressDecompress_RoundTrip()
+    {
+        // Arrange
+        var compressor = DeflateCompressor.Default;
+        var original = new byte[1000];
+        Random.Shared.NextBytes(original);
+
+        // Act
+        var compressed = compressor.Compress(original);
+        var decompressed = compressor.Decompress(compressed);
+
+        // Assert
+        Assert.That(decompressed, Is.EqualTo(original));
+    }
+
+    #endregion
+
+    #region Compressor Registry Tests
+
+    [Test]
+    public void CompressorRegistry_Get_ReturnsRegisteredCompressor()
+    {
+        // Act & Assert - static class, call methods directly
+        Assert.That(ShmCompressorRegistry.Get("gzip"), Is.Not.Null);
+        Assert.That(ShmCompressorRegistry.Get("identity"), Is.Not.Null);
+        Assert.That(ShmCompressorRegistry.Get("deflate"), Is.Not.Null);
+    }
+
+    [Test]
+    public void CompressorRegistry_Get_UnknownName_ReturnsNull()
     {
         // Act
         var compressor = ShmCompressorRegistry.Get("unknown");
@@ -144,100 +212,87 @@ public class ShmCompressionTests
     }
 
     [Test]
-    public void Registry_RegisterCustomCompressor()
+    public void CompressorRegistry_Register_AddsNewCompressor()
     {
         // Arrange
-        var customCompressor = new TestCompressor("test-comp");
+        var customCompressor = new TestCompressor();
 
         // Act
         ShmCompressorRegistry.Register(customCompressor);
-        var retrieved = ShmCompressorRegistry.Get("test-comp");
+        var retrieved = ShmCompressorRegistry.Get("test");
 
         // Assert
-        Assert.That(retrieved, Is.Not.Null);
-        Assert.That(retrieved!.Name, Is.EqualTo("test-comp"));
+        Assert.That(retrieved, Is.SameAs(customCompressor));
     }
 
     [Test]
-    public void CompressionOptions_Default_HasSensibleDefaults()
+    public void CompressorRegistry_IsRegistered_ReturnsCorrectValue()
+    {
+        // Act & Assert
+        Assert.That(ShmCompressorRegistry.IsRegistered("gzip"), Is.True);
+        Assert.That(ShmCompressorRegistry.IsRegistered("unknown"), Is.False);
+    }
+
+    [Test]
+    public void CompressorRegistry_GetRegisteredNames_ReturnsNames()
     {
         // Act
+        var names = ShmCompressorRegistry.GetRegisteredNames().ToList();
+
+        // Assert
+        Assert.That(names, Does.Contain("gzip"));
+        Assert.That(names, Does.Contain("identity"));
+    }
+
+    #endregion
+
+    #region Compression Options Tests
+
+    [Test]
+    public void CompressionOptions_Default_HasCorrectValues()
+    {
+        // Arrange & Act
         var options = ShmCompressionOptions.Default;
 
         // Assert
-        Assert.That(options.SendCompress, Is.EqualTo("identity"));
-        Assert.That(options.AcceptedCompressors, Is.Not.Empty);
+        Assert.That(options.Enabled, Is.True);
+        Assert.That(options.AcceptedCompressors, Is.Not.Null);
     }
 
     [Test]
-    public void CompressionOptions_Gzip_UsesGzip()
+    public void CompressionOptions_None_DisablesCompression()
     {
-        // Act
-        var options = ShmCompressionOptions.Gzip;
+        // Arrange & Act
+        var options = ShmCompressionOptions.None;
 
         // Assert
-        Assert.That(options.SendCompress, Is.EqualTo("gzip"));
+        Assert.That(options.Enabled, Is.False);
     }
 
     [Test]
-    public void CompressionOptions_ShouldCompress_ReturnsFalse_ForSmallData()
+    public void CompressionOptions_SendCompressor_CanBeSet()
     {
-        // Arrange
-        var options = new ShmCompressionOptions 
-        { 
-            SendCompress = "gzip",
-            MinSizeForCompression = 100 
-        };
-        var smallData = new byte[50];
-
-        // Act
-        var shouldCompress = options.ShouldCompress(smallData);
-
-        // Assert
-        Assert.That(shouldCompress, Is.False);
-    }
-
-    [Test]
-    public void CompressionOptions_ShouldCompress_ReturnsTrue_ForLargeData()
-    {
-        // Arrange
-        var options = new ShmCompressionOptions 
-        { 
-            SendCompress = "gzip",
-            MinSizeForCompression = 100 
-        };
-        var largeData = new byte[200];
-
-        // Act
-        var shouldCompress = options.ShouldCompress(largeData);
-
-        // Assert
-        Assert.That(shouldCompress, Is.True);
-    }
-
-    [Test]
-    public void CompressionOptions_GetAcceptEncoding_ReturnsCommaSeparated()
-    {
-        // Arrange
+        // Arrange & Act
         var options = new ShmCompressionOptions
         {
-            AcceptedCompressors = new[] { "gzip", "deflate", "identity" }
+            SendCompressor = GzipCompressor.Default
         };
 
-        // Act
-        var acceptEncoding = options.GetAcceptEncoding();
-
         // Assert
-        Assert.That(acceptEncoding, Does.Contain("gzip"));
-        Assert.That(acceptEncoding, Does.Contain("deflate"));
-        Assert.That(acceptEncoding, Does.Contain("identity"));
+        Assert.That(options.SendCompressor, Is.SameAs(GzipCompressor.Default));
     }
+
+    #endregion
+
+    #region Helper Classes
 
     private class TestCompressor : IShmCompressor
     {
-        public TestCompressor(string name) => Name = name;
-        public string Name { get; }
-        public byte[] Compress(byte[] data) => data;
-        public byte[] Decompress(byte[] data) => data;
+        public string Name => "test";
+        public bool IsIdentity => false;
+        public byte[] Compress(ReadOnlySpan<byte> data) => data.ToArray();
+        public byte[] Decompress(ReadOnlySpan<byte> data) => data.ToArray();
     }
+
+    #endregion
 }

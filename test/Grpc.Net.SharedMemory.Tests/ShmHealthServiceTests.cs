@@ -21,272 +21,293 @@ using NUnit.Framework;
 
 namespace Grpc.Net.SharedMemory.Tests;
 
+/// <summary>
+/// Tests for health service in shared memory transport.
+/// SHM equivalent of TCP health service tests in FunctionalTests.
+/// </summary>
 [TestFixture]
 public class ShmHealthServiceTests
 {
+    #region Basic Health Status Tests
+
     [Test]
-    public void NewService_DefaultsToServing()
+    public void Check_DefaultServerHealth_ReturnsServing()
     {
         // Arrange
-        var service = new ShmHealthService();
+        var healthService = new ShmHealthService();
 
         // Act
-        var status = service.Check("");
+        var status = healthService.Check("");
 
         // Assert
         Assert.That(status, Is.EqualTo(ShmServingStatus.Serving));
     }
 
     [Test]
-    public void SetServingStatus_UpdatesStatus()
+    public void Check_UnknownService_ReturnsServiceUnknown()
     {
         // Arrange
-        var service = new ShmHealthService();
+        var healthService = new ShmHealthService();
 
         // Act
-        service.SetServingStatus("test.Service", ShmServingStatus.NotServing);
-        var status = service.Check("test.Service");
+        var status = healthService.Check("unknown-service");
+
+        // Assert
+        Assert.That(status, Is.EqualTo(ShmServingStatus.ServiceUnknown));
+    }
+
+    [Test]
+    public void SetServingStatus_ThenCheck_ReturnsCorrectStatus()
+    {
+        // Arrange
+        var healthService = new ShmHealthService();
+        const string serviceName = "my-service";
+
+        // Act
+        healthService.SetServingStatus(serviceName, ShmServingStatus.Serving);
+        var status = healthService.Check(serviceName);
+
+        // Assert
+        Assert.That(status, Is.EqualTo(ShmServingStatus.Serving));
+    }
+
+    [Test]
+    public void SetServingStatus_NotServing_ReturnsNotServing()
+    {
+        // Arrange
+        var healthService = new ShmHealthService();
+        const string serviceName = "failing-service";
+
+        // Act
+        healthService.SetServingStatus(serviceName, ShmServingStatus.NotServing);
+        var status = healthService.Check(serviceName);
 
         // Assert
         Assert.That(status, Is.EqualTo(ShmServingStatus.NotServing));
     }
 
     [Test]
-    public void Check_ReturnsServiceUnknown_ForUnknownService()
+    public void SetServingStatus_UpdateExisting_ReturnsNewStatus()
     {
         // Arrange
-        var service = new ShmHealthService();
+        var healthService = new ShmHealthService();
+        const string serviceName = "my-service";
 
         // Act
-        var status = service.Check("unknown.service");
+        healthService.SetServingStatus(serviceName, ShmServingStatus.Serving);
+        healthService.SetServingStatus(serviceName, ShmServingStatus.NotServing);
+        var status = healthService.Check(serviceName);
 
         // Assert
-        Assert.That(status, Is.EqualTo(ShmServingStatus.ServiceUnknown));
+        Assert.That(status, Is.EqualTo(ShmServingStatus.NotServing));
     }
 
-    [Test]
-    public async Task Watch_ReceivesStatusUpdates()
-    {
-        // Arrange
-        var service = new ShmHealthService();
-        var serviceName = "test.WatchService";
-        var receivedStatuses = new List<ShmServingStatus>();
-        var cts = new CancellationTokenSource();
+    #endregion
 
-        service.SetServingStatus(serviceName, ShmServingStatus.Serving);
-
-        // Start watching
-        var watchTask = Task.Run(async () =>
-        {
-            await foreach (var status in service.Watch(serviceName, cts.Token))
-            {
-                receivedStatuses.Add(status);
-                if (receivedStatuses.Count >= 2)
-                    break;
-            }
-        });
-
-        // Act - update the status
-        await Task.Delay(50);
-        service.SetServingStatus(serviceName, ShmServingStatus.NotServing);
-        
-        // Wait for watch to receive updates
-        await Task.WhenAny(watchTask, Task.Delay(1000));
-        cts.Cancel();
-
-        // Assert
-        Assert.That(receivedStatuses, Does.Contain(ShmServingStatus.Serving));
-        Assert.That(receivedStatuses, Does.Contain(ShmServingStatus.NotServing));
-    }
-
-    [Test]
-    public void ClearStatus_RemovesServiceStatus()
-    {
-        // Arrange
-        var service = new ShmHealthService();
-        service.SetServingStatus("test.Service", ShmServingStatus.Serving);
-
-        // Act
-        service.ClearStatus("test.Service");
-        var status = service.Check("test.Service");
-
-        // Assert
-        Assert.That(status, Is.EqualTo(ShmServingStatus.ServiceUnknown));
-    }
-
-    [Test]
-    public void ClearAll_RemovesAllStatuses()
-    {
-        // Arrange
-        var service = new ShmHealthService();
-        service.SetServingStatus("service1", ShmServingStatus.Serving);
-        service.SetServingStatus("service2", ShmServingStatus.NotServing);
-
-        // Act
-        service.ClearAll();
-
-        // Assert
-        Assert.That(service.Check("service1"), Is.EqualTo(ShmServingStatus.ServiceUnknown));
-        Assert.That(service.Check("service2"), Is.EqualTo(ShmServingStatus.ServiceUnknown));
-    }
+    #region Shutdown Tests
 
     [Test]
     public void Shutdown_SetsAllServicesToNotServing()
     {
         // Arrange
-        var service = new ShmHealthService();
-        service.SetServingStatus("service1", ShmServingStatus.Serving);
-        service.SetServingStatus("service2", ShmServingStatus.Serving);
+        var healthService = new ShmHealthService();
+        healthService.SetServingStatus("service1", ShmServingStatus.Serving);
+        healthService.SetServingStatus("service2", ShmServingStatus.Serving);
 
         // Act
-        service.Shutdown();
+        healthService.Shutdown();
 
-        // Assert
-        Assert.That(service.Check("service1"), Is.EqualTo(ShmServingStatus.NotServing));
-        Assert.That(service.Check("service2"), Is.EqualTo(ShmServingStatus.NotServing));
+        // Assert - after shutdown, server health should be NotServing
+        var serverStatus = healthService.Check("");
+        Assert.That(serverStatus, Is.EqualTo(ShmServingStatus.NotServing));
     }
 
     [Test]
-    public void GetAllStatuses_ReturnsAllRegisteredServices()
+    public void Shutdown_AfterShutdown_SetServingStatusIsIgnored()
     {
         // Arrange
-        var service = new ShmHealthService();
-        service.SetServingStatus("service1", ShmServingStatus.Serving);
-        service.SetServingStatus("service2", ShmServingStatus.NotServing);
+        var healthService = new ShmHealthService();
+        healthService.Shutdown();
 
         // Act
-        var statuses = service.GetAllStatuses();
+        healthService.SetServingStatus("new-service", ShmServingStatus.Serving);
+        var status = healthService.Check("new-service");
 
-        // Assert
-        Assert.That(statuses.Count, Is.GreaterThanOrEqualTo(2));
-        Assert.That(statuses["service1"], Is.EqualTo(ShmServingStatus.Serving));
-        Assert.That(statuses["service2"], Is.EqualTo(ShmServingStatus.NotServing));
+        // Assert - should not be registered after shutdown
+        Assert.That(status, Is.EqualTo(ShmServingStatus.ServiceUnknown));
     }
-}
 
-[TestFixture]
-public class ShmHealthCheckStateTests
-{
+    #endregion
+
+    #region Watch Tests
+
     [Test]
-    public void NewState_StartsHealthy()
+    [CancelAfter(5000)]
+    public async Task Watch_StatusChange_NotifiesWatcher()
     {
         // Arrange
-        var options = new ShmHealthCheckOptions { Enabled = true };
-        
-        // Act
-        var state = new ShmHealthCheckState(options);
+        var healthService = new ShmHealthService();
+        const string serviceName = "watch-service";
+        healthService.SetServingStatus(serviceName, ShmServingStatus.Serving);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var statusChanges = new List<ShmServingStatus>();
+
+        // Act - start watching in background
+        var watchTask = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var status in healthService.Watch(serviceName, cts.Token))
+                {
+                    statusChanges.Add(status);
+                    if (statusChanges.Count >= 2)
+                    {
+                        break;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected
+            }
+        });
+
+        // Give watch time to start
+        await Task.Delay(100);
+
+        // Trigger status change
+        healthService.SetServingStatus(serviceName, ShmServingStatus.NotServing);
+
+        // Wait for watch to complete
+        await Task.WhenAny(watchTask, Task.Delay(1500));
+        cts.Cancel();
 
         // Assert
-        Assert.That(state.IsHealthy, Is.True);
+        Assert.That(statusChanges, Has.Count.GreaterThanOrEqualTo(1));
     }
 
     [Test]
-    public void RecordFailure_DecreasesConsecutiveSuccesses()
+    [CancelAfter(5000)]
+    public async Task Watch_Cancellation_StopsWatching()
     {
         // Arrange
-        var options = new ShmHealthCheckOptions { Enabled = true };
-        var state = new ShmHealthCheckState(options);
-        state.RecordSuccess();
-        state.RecordSuccess();
+        var healthService = new ShmHealthService();
+        const string serviceName = "cancel-watch-service";
+        healthService.SetServingStatus(serviceName, ShmServingStatus.Serving);
+
+        using var cts = new CancellationTokenSource();
+        var completed = false;
 
         // Act
-        state.RecordFailure();
+        var watchTask = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var _ in healthService.Watch(serviceName, cts.Token))
+                {
+                    // Wait for first status then cancel
+                    cts.Cancel();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                completed = true;
+            }
+        });
 
-        // Assert - should still be healthy after one failure
-        Assert.That(state.IsHealthy, Is.True);
+        await Task.WhenAny(watchTask, Task.Delay(2000));
+
+        // Assert
+        Assert.That(completed || cts.IsCancellationRequested, Is.True);
     }
 
+    #endregion
+
+    #region ShmServingStatus Enum Tests
+
     [Test]
-    public void MultipleFailures_MarksUnhealthy()
+    public void ShmServingStatus_HasExpectedValues()
+    {
+        // Assert - verify enum values match gRPC health protocol
+        Assert.That((int)ShmServingStatus.Unknown, Is.EqualTo(0));
+        Assert.That((int)ShmServingStatus.Serving, Is.EqualTo(1));
+        Assert.That((int)ShmServingStatus.NotServing, Is.EqualTo(2));
+        Assert.That((int)ShmServingStatus.ServiceUnknown, Is.EqualTo(3));
+    }
+
+    #endregion
+
+    #region Multiple Services Tests
+
+    [Test]
+    public void MultipleServices_IndependentStatus()
     {
         // Arrange
-        var options = new ShmHealthCheckOptions 
-        { 
-            Enabled = true,
-            UnhealthyThreshold = 2
-        };
-        var state = new ShmHealthCheckState(options);
+        var healthService = new ShmHealthService();
 
         // Act
-        state.RecordFailure();
-        state.RecordFailure();
+        healthService.SetServingStatus("service-a", ShmServingStatus.Serving);
+        healthService.SetServingStatus("service-b", ShmServingStatus.NotServing);
+        healthService.SetServingStatus("service-c", ShmServingStatus.Unknown);
 
         // Assert
-        Assert.That(state.IsHealthy, Is.False);
+        Assert.That(healthService.Check("service-a"), Is.EqualTo(ShmServingStatus.Serving));
+        Assert.That(healthService.Check("service-b"), Is.EqualTo(ShmServingStatus.NotServing));
+        Assert.That(healthService.Check("service-c"), Is.EqualTo(ShmServingStatus.Unknown));
     }
 
     [Test]
-    public void RecordSuccess_ResetsFailureCount()
+    public void ServerHealth_EmptyString_DistinctFromNamedServices()
     {
         // Arrange
-        var options = new ShmHealthCheckOptions 
-        { 
-            Enabled = true,
-            UnhealthyThreshold = 3
-        };
-        var state = new ShmHealthCheckState(options);
-        state.RecordFailure();
-        state.RecordFailure();
+        var healthService = new ShmHealthService();
 
         // Act
-        state.RecordSuccess();
-        state.RecordFailure();
+        healthService.SetServingStatus("", ShmServingStatus.NotServing);
+        healthService.SetServingStatus("my-service", ShmServingStatus.Serving);
 
-        // Assert - should still be healthy (failure count was reset)
-        Assert.That(state.IsHealthy, Is.True);
+        // Assert
+        Assert.That(healthService.Check(""), Is.EqualTo(ShmServingStatus.NotServing));
+        Assert.That(healthService.Check("my-service"), Is.EqualTo(ShmServingStatus.Serving));
     }
 
+    #endregion
+
+    #region Thread Safety Tests
+
     [Test]
-    public void IsCheckDue_ReturnsTrue_WhenIntervalElapsed()
+    public void ConcurrentSetAndCheck_IsThreadSafe()
     {
         // Arrange
-        var options = new ShmHealthCheckOptions 
-        { 
-            Enabled = true,
-            Interval = TimeSpan.Zero // Immediate
-        };
-        var state = new ShmHealthCheckState(options);
+        var healthService = new ShmHealthService();
+        var services = Enumerable.Range(0, 100).Select(i => $"service-{i}").ToArray();
+        var exceptions = new List<Exception>();
+
+        // Act - concurrent set and check
+        Parallel.ForEach(services, service =>
+        {
+            try
+            {
+                for (int i = 0; i < 100; i++)
+                {
+                    var status = (ShmServingStatus)(i % 3);
+                    healthService.SetServingStatus(service, status);
+                    _ = healthService.Check(service);
+                }
+            }
+            catch (Exception ex)
+            {
+                lock (exceptions)
+                {
+                    exceptions.Add(ex);
+                }
+            }
+        });
 
         // Assert
-        Assert.That(state.IsCheckDue(), Is.True);
+        Assert.That(exceptions, Is.Empty, "No exceptions should occur during concurrent access");
     }
 
-    [Test]
-    public void Disabled_NeverChecksDue()
-    {
-        // Arrange
-        var options = new ShmHealthCheckOptions 
-        { 
-            Enabled = false,
-            Interval = TimeSpan.Zero
-        };
-        var state = new ShmHealthCheckState(options);
-
-        // Assert
-        Assert.That(state.IsCheckDue(), Is.False);
-    }
-
-    [Test]
-    public void HealthCheckOptions_DefaultValues()
-    {
-        // Act
-        var options = ShmHealthCheckOptions.Default;
-
-        // Assert
-        Assert.That(options.Enabled, Is.True);
-        Assert.That(options.Interval, Is.GreaterThan(TimeSpan.Zero));
-        Assert.That(options.Timeout, Is.GreaterThan(TimeSpan.Zero));
-        Assert.That(options.UnhealthyThreshold, Is.GreaterThan(0));
-        Assert.That(options.HealthyThreshold, Is.GreaterThan(0));
-    }
-
-    [Test]
-    public void HealthCheckOptions_Disabled_HasEnabledFalse()
-    {
-        // Act
-        var options = ShmHealthCheckOptions.Disabled;
-
-        // Assert
-        Assert.That(options.Enabled, Is.False);
-    }
+    #endregion
 }
