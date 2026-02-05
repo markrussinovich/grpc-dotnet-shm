@@ -177,7 +177,6 @@ public class Program
 
         await foreach (var connection in listener.AcceptConnectionsAsync(ct).ConfigureAwait(false))
         {
-            Console.WriteLine($"Connection accepted: {connection.Name}");
             _ = HandleConnectionAsync(connection, ct);
         }
     }
@@ -186,10 +185,8 @@ public class Program
     {
         try
         {
-            Console.WriteLine($"Waiting for streams on {connection.Name}...");
             await foreach (var stream in connection.AcceptStreamsAsync(ct).ConfigureAwait(false))
             {
-                Console.WriteLine($"Stream received: {stream.StreamId}, method: {stream.RequestHeaders?.Method}");
                 _ = HandleStreamAsync(stream, ct);
             }
         }
@@ -228,20 +225,16 @@ public class Program
 
     private static async Task HandleUnaryCallAsync(ShmGrpcStream stream, CancellationToken ct)
     {
-        Console.WriteLine($"  Handling unary call {stream.StreamId}...");
-        
         // Read first message
         byte[]? requestData = null;
         await foreach (var message in stream.ReceiveMessagesAsync(ct).ConfigureAwait(false))
         {
-            Console.WriteLine($"    Received {message.Length} bytes for stream {stream.StreamId}");
             requestData = message;
             break; // Only expect one message for unary
         }
 
         if (requestData == null)
         {
-            Console.WriteLine($"    No data received for stream {stream.StreamId}");
             return;
         }
 
@@ -260,15 +253,12 @@ public class Program
 
         // Send response headers
         await stream.SendResponseHeadersAsync().ConfigureAwait(false);
-        Console.WriteLine($"    Sent headers for stream {stream.StreamId}");
 
         // Send response message
         await stream.SendMessageAsync(response.ToByteArray(), ct).ConfigureAwait(false);
-        Console.WriteLine($"    Sent message for stream {stream.StreamId}");
 
-        // Send trailers - signal this is the end
+        // Send trailers - signal this is the end (also removes stream from connection)
         await stream.SendTrailersAsync(StatusCode.OK).ConfigureAwait(false);
-        Console.WriteLine($"    Sent trailers for stream {stream.StreamId}");
     }
 
     private static async Task HandleStreamingCallAsync(ShmGrpcStream stream, CancellationToken ct)
