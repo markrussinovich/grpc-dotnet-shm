@@ -79,7 +79,7 @@ Last updated: 2026-02-06
 
 | Criterion | Rating | Details |
 |-----------|--------|---------|
-| **Minimal memory copies** | **C** | 2 copies/direction vs Go's 1 send + 0-1 receive |
+| **Minimal memory copies** | **B+** | Pooled buffers via ArrayPool on send + receive; same copy count, zero GC pressure |
 | **Minimal kernel calls** | **A** | Equivalent to Go (adaptive spin + futex on Linux) |
 | **Full gRPC integration** | **D** | Client ShmHandler works; server has no framework integration |
 | **Feature parity with Go** | **C+** | Core transport byte-compatible; compression/retry/telemetry are dead code; fallback/security missing |
