@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Runtime.Versioning;
@@ -220,21 +221,33 @@ public sealed class ShmHandler : HttpMessageHandler
                 throw new NotSupportedException("Compression not yet supported");
             }
 
-            // Read message body
-            var messageBuffer = new byte[length];
-            var messageBytesRead = await ReadExactlyAsync(bodyStream, messageBuffer, cancellationToken);
-            if (messageBytesRead < length) throw new InvalidDataException("Incomplete gRPC message body");
+            // Read message body into a pooled buffer to avoid per-message heap allocation
+            var messageBuffer = ArrayPool<byte>.Shared.Rent((int)length);
+            try
+            {
+                var messageBytesRead = await ReadExactlyAsync(bodyStream, messageBuffer.AsMemory(0, (int)length), cancellationToken);
+                if (messageBytesRead < length) throw new InvalidDataException("Incomplete gRPC message body");
 
-            await stream.SendMessageAsync(messageBuffer, cancellationToken);
+                await stream.SendMessageAsync(messageBuffer.AsMemory(0, (int)length), cancellationToken);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(messageBuffer);
+            }
         }
     }
 
     private static async Task<int> ReadExactlyAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
     {
+        return await ReadExactlyAsync(stream, buffer.AsMemory(), cancellationToken);
+    }
+
+    private static async Task<int> ReadExactlyAsync(Stream stream, Memory<byte> buffer, CancellationToken cancellationToken)
+    {
         var totalRead = 0;
         while (totalRead < buffer.Length)
         {
-            var bytesRead = await stream.ReadAsync(buffer.AsMemory(totalRead), cancellationToken);
+            var bytesRead = await stream.ReadAsync(buffer.Slice(totalRead), cancellationToken);
             if (bytesRead == 0) return totalRead;
             totalRead += bytesRead;
         }

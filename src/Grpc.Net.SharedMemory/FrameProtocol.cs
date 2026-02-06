@@ -18,6 +18,8 @@
 
 namespace Grpc.Net.SharedMemory;
 
+using System.Buffers;
+
 /// <summary>
 /// High-level frame protocol operations for reading and writing gRPC frames
 /// to the shared memory ring buffer.
@@ -169,6 +171,53 @@ public static class FrameProtocol
             }
 
             return (header, payload);
+        }
+    }
+
+    /// <summary>
+    /// Reads a frame from the ring buffer using ArrayPool to avoid per-frame heap allocation.
+    /// The caller is responsible for returning the payload array to <see cref="ArrayPool{T}.Shared"/>
+    /// when done (unless PayloadLength is 0, in which case Payload is <see cref="Array.Empty{T}"/>).
+    /// </summary>
+    /// <param name="ring">The ring buffer to read from.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The frame header, pooled payload buffer, and actual payload length.</returns>
+    public static (FrameHeader Header, byte[] Payload, int PayloadLength) ReadFramePooled(ShmRing ring, CancellationToken cancellationToken = default)
+    {
+        while (true)
+        {
+            // Read frame header
+            var headerReservation = ring.ReserveRead(ShmConstants.FrameHeaderSize, cancellationToken);
+
+            Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+            CopyFromReservation(headerReservation, headerBytes);
+            ring.CommitRead(headerReservation, ShmConstants.FrameHeaderSize);
+
+            var header = FrameHeader.DecodeFrom(headerBytes);
+
+            // Skip PAD frames
+            if (header.Type == FrameType.Pad)
+            {
+                if (header.Length > 0)
+                {
+                    var padReservation = ring.ReserveRead((int)header.Length, cancellationToken);
+                    ring.CommitRead(padReservation, (int)header.Length);
+                }
+                continue;
+            }
+
+            // Read payload into a pooled buffer if present
+            if (header.Length > 0)
+            {
+                var payloadLength = (int)header.Length;
+                var payload = ArrayPool<byte>.Shared.Rent(payloadLength);
+                var payloadReservation = ring.ReserveRead(payloadLength, cancellationToken);
+                CopyFromReservation(payloadReservation, payload.AsSpan(0, payloadLength));
+                ring.CommitRead(payloadReservation, payloadLength);
+                return (header, payload, payloadLength);
+            }
+
+            return (header, Array.Empty<byte>(), 0);
         }
     }
 

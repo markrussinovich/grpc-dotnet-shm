@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Net;
 using System.Net.Http.Headers;
 using Grpc.Core;
@@ -101,9 +102,11 @@ public sealed class ShmControlHandler : HttpMessageHandler
             // Create response with streaming content
             var response = new HttpResponseMessage(HttpStatusCode.OK)
             {
-                Content = new ShmControlResponseContent(stream),
                 Version = new Version(2, 0)
             };
+            
+            // Set content with access to trailing headers
+            response.Content = new ShmControlResponseContent(stream, response.TrailingHeaders);
 
             // Add response headers
             if (responseHeaders.Metadata != null)
@@ -119,7 +122,13 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
             return response;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
+        {
+            // Clean up the stream on cancellation
+            await stream.CancelAsync().ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception)
         {
             await stream.CancelAsync().ConfigureAwait(false);
             throw;
@@ -212,11 +221,13 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
         finally
         {
-            ctlSegment.Dispose();
+            // Use UnmapWithoutClose to avoid affecting the server's control segment
+            // The server needs to keep accepting new connections
+            ctlSegment.UnmapWithoutClose();
         }
     }
 
-    private static async Task WriteControlFrameAsync(ShmRing ring, FrameType type, byte[] payload, CancellationToken ct)
+    private static Task WriteControlFrameAsync(ShmRing ring, FrameType type, byte[] payload, CancellationToken ct)
     {
         var header = new FrameHeader
         {
@@ -229,19 +240,41 @@ public sealed class ShmControlHandler : HttpMessageHandler
         var headerBytes = header.ToBytes();
         var totalLength = headerBytes.Length + payload.Length;
 
-        // Wait for space
-        while (!ring.CanWrite(totalLength))
-        {
-            ct.ThrowIfCancellationRequested();
-            await Task.Delay(1, ct).ConfigureAwait(false);
-        }
+        // Reserve space atomically for header + payload
+        // This is critical: we must commit header+payload together so the reader
+        // sees a complete frame, not a header without its payload
+        var reservation = ring.ReserveWrite(totalLength, ct);
 
-        // Write header and payload
-        ring.Write(headerBytes, ct);
+        // Copy header into reservation
+        headerBytes.CopyTo(reservation.First.Span);
+
+        // Copy payload, handling potential wrap
         if (payload.Length > 0)
         {
-            ring.Write(payload, ct);
+            var payloadStart = headerBytes.Length;
+            if (payloadStart < reservation.First.Length)
+            {
+                // Header fit in first segment, payload starts there
+                var firstChunkLen = Math.Min(payload.Length, reservation.First.Length - payloadStart);
+                payload.AsSpan(0, firstChunkLen).CopyTo(reservation.First.Span.Slice(payloadStart));
+
+                if (firstChunkLen < payload.Length)
+                {
+                    // Payload wraps to second segment
+                    payload.AsSpan(firstChunkLen).CopyTo(reservation.Second.Span);
+                }
+            }
+            else
+            {
+                // Header spanned both segments, payload is entirely in second
+                var payloadOffset = payloadStart - reservation.First.Length;
+                payload.CopyTo(reservation.Second.Span.Slice(payloadOffset));
+            }
         }
+
+        // Commit the entire frame atomically
+        ring.CommitWrite(reservation, totalLength);
+        return Task.CompletedTask;
     }
 
     private static async Task<(FrameHeader header, Memory<byte> payload)> ReadControlFrameAsync(ShmRing ring, CancellationToken ct)
@@ -303,21 +336,33 @@ public sealed class ShmControlHandler : HttpMessageHandler
                 throw new NotSupportedException("Compression not yet supported");
             }
 
-            // Read message body
-            var messageBuffer = new byte[length];
-            var messageBytesRead = await ReadExactlyAsync(bodyStream, messageBuffer, cancellationToken).ConfigureAwait(false);
-            if (messageBytesRead < length) throw new InvalidDataException("Incomplete gRPC message body");
+            // Read message body into a pooled buffer to avoid per-message heap allocation
+            var messageBuffer = ArrayPool<byte>.Shared.Rent((int)length);
+            try
+            {
+                var messageBytesRead = await ReadExactlyAsync(bodyStream, messageBuffer.AsMemory(0, (int)length), cancellationToken).ConfigureAwait(false);
+                if (messageBytesRead < length) throw new InvalidDataException("Incomplete gRPC message body");
 
-            await stream.SendMessageAsync(messageBuffer, cancellationToken).ConfigureAwait(false);
+                await stream.SendMessageAsync(messageBuffer.AsMemory(0, (int)length), cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(messageBuffer);
+            }
         }
     }
 
     private static async Task<int> ReadExactlyAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
     {
+        return await ReadExactlyAsync(stream, buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<int> ReadExactlyAsync(Stream stream, Memory<byte> buffer, CancellationToken cancellationToken)
+    {
         var totalRead = 0;
         while (totalRead < buffer.Length)
         {
-            var bytesRead = await stream.ReadAsync(buffer.AsMemory(totalRead), cancellationToken).ConfigureAwait(false);
+            var bytesRead = await stream.ReadAsync(buffer.Slice(totalRead), cancellationToken).ConfigureAwait(false);
             if (bytesRead == 0) return totalRead;
             totalRead += bytesRead;
         }
@@ -421,10 +466,12 @@ public sealed class ShmControlHandler : HttpMessageHandler
 internal sealed class ShmControlResponseContent : HttpContent
 {
     private readonly ShmGrpcStream _stream;
+    private readonly HttpHeaders _trailingHeaders;
 
-    public ShmControlResponseContent(ShmGrpcStream stream)
+    public ShmControlResponseContent(ShmGrpcStream stream, HttpHeaders trailingHeaders)
     {
         _stream = stream;
+        _trailingHeaders = trailingHeaders;
         Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
     }
 
@@ -435,16 +482,39 @@ internal sealed class ShmControlResponseContent : HttpContent
 
     protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
     {
-        // Write gRPC-format messages to the output stream
+        // ReceiveMessagesAsync now returns raw protobuf data (the 5-byte gRPC framing
+        // was stripped). We need to add the gRPC framing back for the HTTP response
+        // since the gRPC client library expects wire format [compressed:1][length:4][data]
         await foreach (var message in _stream.ReceiveMessagesAsync(cancellationToken))
         {
-            // gRPC message format: [compressed:1][length:4][data]
+            // Write gRPC wire format: [compressed:1][length:4 BE][data]
             var header = new byte[5];
             header[0] = 0; // Not compressed
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(1), (uint)message.Length);
-
             await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
             await stream.WriteAsync(message, cancellationToken).ConfigureAwait(false);
+        }
+
+        // After receiving all messages, the stream should have trailers
+        // Populate the HTTP response's trailing headers
+        if (_stream.Trailers != null)
+        {
+            var trailers = _stream.Trailers;
+            _trailingHeaders.TryAddWithoutValidation("grpc-status", ((int)trailers.GrpcStatusCode).ToString());
+            if (!string.IsNullOrEmpty(trailers.GrpcStatusMessage))
+            {
+                _trailingHeaders.TryAddWithoutValidation("grpc-message", Uri.EscapeDataString(trailers.GrpcStatusMessage));
+            }
+            if (trailers.Metadata != null)
+            {
+                foreach (var kv in trailers.Metadata)
+                {
+                    var values = kv.Values.Select(v => v is byte[] bytes
+                        ? Convert.ToBase64String(bytes)
+                        : v?.ToString() ?? "");
+                    _trailingHeaders.TryAddWithoutValidation(kv.Key, values);
+                }
+            }
         }
     }
 

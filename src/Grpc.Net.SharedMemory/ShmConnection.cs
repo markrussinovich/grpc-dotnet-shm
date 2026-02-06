@@ -16,8 +16,8 @@
 
 #endregion
 
+using System.Buffers;
 using System.Collections.Concurrent;
-using System.Runtime.Versioning;
 using System.Threading.Channels;
 
 namespace Grpc.Net.SharedMemory;
@@ -39,6 +39,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private bool _goAwaySent;
     private bool _goAwayReceived;
     private bool _draining;
+    private volatile bool _readerStopped;
     private uint _maxConcurrentStreams;
 
     // Connection-level flow control (matches grpc-go-shmem)
@@ -81,9 +82,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     public bool IsClient => _isClient;
 
     /// <summary>
-    /// Gets whether the connection has been closed.
+    /// Gets whether the connection has been closed or is no longer functional.
     /// </summary>
-    public bool IsClosed => _disposed || _goAwaySent || _goAwayReceived;
+    public bool IsClosed => _disposed || _goAwaySent || _goAwayReceived || _readerStopped;
 
     /// <summary>
     /// Gets whether the connection is draining (not accepting new streams).
@@ -106,7 +107,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="name">The name of the shared memory segment to connect to.</param>
     /// <param name="keepaliveOptions">Optional keepalive options.</param>
     /// <returns>A new client connection.</returns>
-    [SupportedOSPlatform("windows")]
     public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null)
     {
         var segment = Segment.Open(name);
@@ -327,17 +327,27 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         FrameProtocol.WriteFrame(TxRing, header, payload, _disposeCts.Token);
     }
 
+    /// <summary>
+    /// Sends a frame with a two-part payload (scatter write), avoiding an intermediate copy.
+    /// </summary>
+    internal void SendFrame(FrameType type, uint streamId, byte flags, ReadOnlySpan<byte> payload1, ReadOnlySpan<byte> payload2)
+    {
+        ThrowIfDisposed();
+        var header = new FrameHeader(type, streamId, (uint)(payload1.Length + payload2.Length), flags);
+        FrameProtocol.WriteFrame(TxRing, header, payload1, payload2, _disposeCts.Token);
+    }
+
     private async Task FrameReaderLoopAsync()
     {
         try
         {
             while (!_disposeCts.Token.IsCancellationRequested)
             {
-                // Read frame from receive ring
-                var (header, payload) = await Task.Run(() =>
-                    FrameProtocol.ReadFrame(RxRing, _disposeCts.Token), _disposeCts.Token);
+                // Read frame from receive ring using pooled buffers to avoid per-frame allocation
+                var (header, payload, payloadLength) = await Task.Run(() =>
+                    FrameProtocol.ReadFramePooled(RxRing, _disposeCts.Token), _disposeCts.Token);
 
-                await ProcessFrameAsync(header, payload);
+                await ProcessFrameAsync(header, payload, payloadLength);
             }
         }
         catch (OperationCanceledException)
@@ -347,32 +357,37 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         catch (Exception ex)
         {
             // Log error and close connection
-            System.Diagnostics.Debug.WriteLine($"Frame reader error: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"Frame reader error: {ex}");
+        }
+        finally
+        {
+            // Mark connection as no longer functional - the reader can't process any more frames
+            _readerStopped = true;
         }
     }
 
-    private async Task ProcessFrameAsync(FrameHeader header, byte[] payload)
+    private async Task ProcessFrameAsync(FrameHeader header, byte[] payload, int payloadLength)
     {
         switch (header.Type)
         {
             case FrameType.Headers:
-                await HandleHeadersFrameAsync(header, payload);
+                await HandleHeadersFrameAsync(header, payload, payloadLength);
                 break;
 
             case FrameType.Message:
             case FrameType.Trailers:
             case FrameType.HalfClose:
             case FrameType.Cancel:
-                // Route to stream
+                // Route to stream - ownership of the pooled buffer transfers to the stream
                 if (_streams.TryGetValue(header.StreamId, out var stream))
                 {
-                    stream.OnFrameReceived(header, payload);
+                    stream.OnFrameReceived(header, payload, payloadLength);
 
                     // BDP estimation: track bytes received
                     if (header.Type == FrameType.Message)
                     {
-                        var sendBdpPing = _bdpEstimator.Add((uint)payload.Length);
-                        var windowUpdate = OnConnectionDataReceived((uint)payload.Length);
+                        var sendBdpPing = _bdpEstimator.Add((uint)payloadLength);
+                        var windowUpdate = OnConnectionDataReceived((uint)payloadLength);
                         if (windowUpdate > 0)
                         {
                             SendConnectionWindowUpdate(windowUpdate);
@@ -383,28 +398,41 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                         }
                     }
                 }
+                else
+                {
+                    // No matching stream - return the pooled buffer
+                    ReturnPooledBuffer(payload, payloadLength);
+                }
                 break;
 
             case FrameType.Ping:
                 // Use new handler for BDP and enforcement
                 HandlePing(header, payload);
+                ReturnPooledBuffer(payload, payloadLength);
                 break;
 
             case FrameType.Pong:
                 // Use new handler for BDP and keepalive
                 HandlePong(header, payload);
+                ReturnPooledBuffer(payload, payloadLength);
                 break;
 
             case FrameType.GoAway:
                 _goAwayReceived = true;
-                var message = payload.Length > 0 ? System.Text.Encoding.UTF8.GetString(payload) : null;
+                var message = payloadLength > 0 ? System.Text.Encoding.UTF8.GetString(payload.AsSpan(0, payloadLength)) : null;
+                ReturnPooledBuffer(payload, payloadLength);
                 GoAwayReceived?.Invoke(this, new GoAwayEventArgs(header.Flags, message));
                 break;
 
             case FrameType.WindowUpdate:
                 // Route window update to stream or connection
                 var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(payload);
+                ReturnPooledBuffer(payload, payloadLength);
                 AddSendQuota(header.StreamId, increment);
+                break;
+
+            default:
+                ReturnPooledBuffer(payload, payloadLength);
                 break;
         }
     }
@@ -414,7 +442,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// For server: creates a new stream from client request.
     /// For client: routes to existing stream (response headers).
     /// </summary>
-    private async Task HandleHeadersFrameAsync(FrameHeader header, byte[] payload)
+    private async Task HandleHeadersFrameAsync(FrameHeader header, byte[] payload, int payloadLength)
     {
         var streamId = header.StreamId;
 
@@ -422,7 +450,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         if (_streams.TryGetValue(streamId, out var existingStream))
         {
             // Route to existing stream (e.g., response headers for client)
-            existingStream.OnFrameReceived(header, payload);
+            existingStream.OnFrameReceived(header, payload, payloadLength);
             return;
         }
 
@@ -434,6 +462,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             {
                 // Invalid stream ID from client - reject
                 System.Diagnostics.Debug.WriteLine($"Invalid stream ID {streamId} from client (must be odd)");
+                ReturnPooledBuffer(payload, payloadLength);
                 RejectStream(streamId, "invalid stream ID");
                 return;
             }
@@ -441,6 +470,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // Check if draining
             if (_draining || _goAwaySent || _goAwayReceived)
             {
+                ReturnPooledBuffer(payload, payloadLength);
                 RejectStream(streamId, "transport is draining");
                 return;
             }
@@ -448,21 +478,27 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // Check max concurrent streams
             if (_streams.Count >= (int)_maxConcurrentStreams)
             {
+                ReturnPooledBuffer(payload, payloadLength);
                 RejectStream(streamId, "max concurrent streams exceeded");
                 return;
             }
 
-            // Decode headers
+            // Decode headers from the pooled buffer
             HeadersV1 headersV1;
             try
             {
-                headersV1 = HeadersV1.Decode(payload);
+                headersV1 = HeadersV1.Decode(payload.AsSpan(0, payloadLength).ToArray());
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"Failed to decode headers: {ex.Message}");
                 RejectStream(streamId, "invalid headers");
                 return;
+            }
+            finally
+            {
+                // Always return the pooled buffer - headers are decoded into managed objects
+                ReturnPooledBuffer(payload, payloadLength);
             }
 
             // Create new server stream
@@ -764,6 +800,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     }
 
     #endregion
+
+    /// <summary>
+    /// Returns a pooled buffer to the ArrayPool if it was rented (payloadLength > 0).
+    /// </summary>
+    private static void ReturnPooledBuffer(byte[] buffer, int payloadLength)
+    {
+        if (payloadLength > 0)
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
 
     private void ThrowIfDisposed()
     {
