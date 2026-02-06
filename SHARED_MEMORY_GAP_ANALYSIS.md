@@ -21,11 +21,11 @@ Last updated: 2026-02-06
 - **Target**: 1 copy per direction (matching Go).
 - **Verification**: `EndToEndTests`, `ShmStreamingTests`, `FrameProtocolTests`, `LinuxSmokeTests`
 
-### P2: Wire Compression into Data Path
-- [ ] **P2a**: In `ShmGrpcStream.SendMessageAsync`, apply configured `IShmCompressor` before writing and set `compressed=1` flag byte
-- [ ] **P2b**: In `ShmGrpcStream.ReceiveMessagesAsync`, decompress when `compressed=1` instead of throwing `NotSupportedException`
-- [ ] **P2c**: Wire `ShmCompressionOptions` from `ShmConnection` / `ShmControlHandler` into `ShmGrpcStream`
-- **Current state**: Full `IShmCompressor` infra exists (`GzipCompressor`, `DeflateCompressor`, registry) but `SendMessageAsync` always sets `compressed=0` and receive throws on `compressed=1`.
+### P2: Wire Compression into Data Path ✅
+- [x] **P2a**: In `ShmGrpcStream.SendMessageAsync`, apply configured `IShmCompressor` before writing and set `compressed=1` flag byte
+- [x] **P2b**: In `ShmGrpcStream.ReceiveMessagesAsync`, decompress when `compressed=1` instead of throwing `NotSupportedException`
+- [x] **P2c**: Wire `ShmCompressionOptions` from `ShmConnection` / `ShmControlHandler` into `ShmGrpcStream`
+- **Current state**: ~~Full `IShmCompressor` infra exists (`GzipCompressor`, `DeflateCompressor`, registry) but `SendMessageAsync` always sets `compressed=0` and receive throws on `compressed=1`.~~ Compression fully wired: `ShmCompressionOptions` threaded through all constructors, send path compresses when `ShouldCompress()`, receive path decompresses transparently. All 23 compression tests pass.
 - **Verification**: `ShmCompressionE2ETests`, `Compression.SharedMemory` example
 
 ### P3: Wire Retry into Call Path
