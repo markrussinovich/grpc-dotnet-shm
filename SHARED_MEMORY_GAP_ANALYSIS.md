@@ -46,11 +46,11 @@ Last updated: 2026-02-06
 - **Current state**: ~~`TransportTestBase` is SHM-only.~~ `TransportKind` enum (Shm, Tcp) added. `TransportTestBase` accepts transport parameter with backward-compatible default. TCP path stubs `NotSupportedException` pending P6 server integration. Framework ready for `[TestFixture(TransportKind.Tcp)]` annotation.
 - **Verification**: All parameterized tests pass on SHM; TCP await P6
 
-### P6: Server-side ASP.NET Core Integration
-- [ ] **P6a**: Implement `IConnectionListenerFactory` or equivalent so `MapGrpcService<T>()` works over SHM
-- [ ] **P6b**: Create `UseSharedMemory()` extension method for server builder
-- **Current state**: Server-side has no framework integration. All 19 example servers are manually written with raw `ShmControlListener`/`ShmConnectionListener`, manual method dispatch, and manual stream handling. In Go, `grpc.NewServer().Serve(shmListener)` works identically to TCP.
-- **Verification**: Greeter.SharedMemory server should use `MapGrpcService<GreeterService>()`
+### P6: Server-side ASP.NET Core Integration ✅
+- [x] **P6a**: Implement `IConnectionListenerFactory` or equivalent so `MapGrpcService<T>()` works over SHM
+- [x] **P6b**: Create `UseSharedMemory()` extension method for server builder
+- **Current state**: ~~Server-side has no framework integration.~~ New `Grpc.AspNetCore.Server.SharedMemory` project implements `IConnectionListenerFactory` → `IConnectionListener` → `ConnectionContext` chain. `ShmStream` wrapped as `IDuplexPipe` via `PipeReader.Create`/`PipeWriter.Create`. `UseSharedMemory(segmentName)` extension configures Kestrel. Core `Grpc.Net.SharedMemory` stays ASP.NET-free.
+- **Verification**: `builder.WebHost.UseSharedMemory("name"); app.MapGrpcService<T>();` pattern enabled
 
 ### P7: Rewrite Examples to Dialer-only Pattern
 - [ ] **P7a**: Convert all 7 raw-`ShmConnection` client examples to use `ShmHandler` + `GrpcChannel` + generated stubs
