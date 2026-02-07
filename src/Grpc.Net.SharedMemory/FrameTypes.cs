@@ -64,7 +64,22 @@ public enum FrameType : byte
     Accept = 0x11,
 
     /// <summary>Connection rejected frame (control segment only).</summary>
-    Reject = 0x12
+    Reject = 0x12,
+
+    // Security handshake frame types (0x20-0x2F reserved)
+    // These match grpc-go-shmem for interoperability
+
+    /// <summary>Security handshake initiation frame (client → server).</summary>
+    HandshakeInit = 0x20,
+
+    /// <summary>Security handshake response frame (server → client).</summary>
+    HandshakeResp = 0x21,
+
+    /// <summary>Security handshake acknowledgement frame (client → server).</summary>
+    HandshakeAck = 0x22,
+
+    /// <summary>Security handshake failure frame (either direction).</summary>
+    HandshakeFail = 0x23
 }
 
 /// <summary>

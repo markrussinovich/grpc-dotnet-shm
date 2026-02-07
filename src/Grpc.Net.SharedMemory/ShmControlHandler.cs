@@ -49,6 +49,19 @@ public sealed class ShmControlHandler : HttpMessageHandler
     private bool _disposed;
 
     /// <summary>
+    /// Gets or sets the optional security handshaker to use during connection setup.
+    /// When set, a 3-step Init→Resp→Ack handshake is performed on the data rings
+    /// before any gRPC frames are exchanged.
+    /// </summary>
+    public IShmSecurityHandshaker? Handshaker { get; set; }
+
+    /// <summary>
+    /// Gets the authentication info from the last successful handshake, or null if
+    /// no handshaker was configured or the handshake hasn't completed.
+    /// </summary>
+    public ShmAuthInfo? AuthInfo { get; private set; }
+
+    /// <summary>
     /// Creates a new ShmControlHandler that connects to the specified shared memory segment
     /// using the grpc-go-shmem control segment protocol.
     /// </summary>
@@ -280,6 +293,22 @@ public sealed class ShmControlHandler : HttpMessageHandler
                     // Open the data segment
                     var dataSegment = Segment.Open(dataSegmentName);
                     await dataSegment.WaitForServerAsync(ct).ConfigureAwait(false);
+
+                    // Perform security handshake before gRPC processing starts
+                    if (Handshaker != null)
+                    {
+                        using var hsCts = new CancellationTokenSource(ShmSecurityHandshaker.DefaultTimeout);
+                        using var hsLinked = CancellationTokenSource.CreateLinkedTokenSource(ct, hsCts.Token);
+                        AuthInfo = await Handshaker.ClientHandshakeAsync(
+                            (type, payload, hsCt) => Task.Run(() =>
+                                WriteControlFrameAsync(dataSegment.RingA, type, payload.ToArray(), hsCt), hsCt),
+                            async (hsCt) =>
+                            {
+                                var (hdr, pld) = await ReadControlFrameAsync(dataSegment.RingB, hsCt).ConfigureAwait(false);
+                                return (hdr.Type, (ReadOnlyMemory<byte>)pld);
+                            },
+                            hsLinked.Token).ConfigureAwait(false);
+                    }
 
                     // Signal that client has mapped the segment
                     dataSegment.SetClientReady(true);

@@ -33,6 +33,18 @@ public sealed class ShmConnectionListener : IDisposable, IAsyncDisposable
     private bool _disposed;
 
     /// <summary>
+    /// Gets or sets the optional security handshaker to use for incoming connections.
+    /// When set, a 3-step Init→Resp→Ack handshake is performed before accepting streams.
+    /// </summary>
+    public IShmSecurityHandshaker? Handshaker { get; set; }
+
+    /// <summary>
+    /// Gets the authentication info from the last successful handshake, or null if
+    /// no handshaker was configured or the handshake hasn't completed.
+    /// </summary>
+    public ShmAuthInfo? AuthInfo { get; internal set; }
+
+    /// <summary>
     /// Gets the endpoint name for this listener.
     /// </summary>
     public EndPoint EndPoint { get; }
