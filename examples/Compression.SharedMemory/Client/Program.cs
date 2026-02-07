@@ -16,10 +16,14 @@
 
 #endregion
 
+using Echo;
 using Grpc.Core;
+using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
-using Grpc.Net.SharedMemory.Compression;
-using System.Text;
+
+// The ONLY transport difference from TCP is using ShmHandler instead of the default HttpHandler.
+// Compression is handled transparently at the SHM transport layer via ShmCompressionOptions.
+// No special gRPC-level configuration is needed.
 
 const string SegmentName = "compression_example_shm";
 
@@ -27,103 +31,52 @@ Console.WriteLine("=== Compression SharedMemory Client ===");
 Console.WriteLine($"Segment: {SegmentName}");
 Console.WriteLine();
 
-// Configure compression options
-var compressionOptions = new ShmCompressionOptions
+try
 {
-    Enabled = true,
-    SendCompress = "gzip",
-    AcceptedCompressors = new List<string> { "gzip", "deflate", "identity" },
-    MinSizeForCompression = 100 // Compress messages >= 100 bytes
-};
-
-Console.WriteLine("Compression options:");
-Console.WriteLine($"  Send: {compressionOptions.SendCompress ?? "identity"}");
-Console.WriteLine($"  Accept: {compressionOptions.GetAcceptEncoding()}");
-Console.WriteLine($"  Min size: {compressionOptions.MinSizeForCompression} bytes");
-Console.WriteLine();
-
-// Connect to server
-Console.WriteLine("Connecting to server...");
-using var connection = await ShmConnection.ConnectAsClient(SegmentName);
-Console.WriteLine("Connected!");
-Console.WriteLine();
-
-// Create a stream
-var stream = connection.CreateStream();
-
-// Create a message that will benefit from compression
-var messageText = "Hello with compression! " + new string('A', 500);
-var messageBytes = Encoding.UTF8.GetBytes(messageText);
-
-Console.WriteLine($"Request message: {messageBytes.Length} bytes");
-
-// Compress the message
-var compressor = compressionOptions.GetSendCompressor();
-var shouldCompress = compressionOptions.ShouldCompress(messageBytes.Length);
-
-byte[] payloadToSend;
-if (shouldCompress && !compressor.IsIdentity)
-{
-    payloadToSend = compressor.Compress(messageBytes);
-    Console.WriteLine($"Compressed with {compressor.Name}: {messageBytes.Length} -> {payloadToSend.Length} bytes ({(double)payloadToSend.Length / messageBytes.Length:P1})");
-}
-else
-{
-    payloadToSend = messageBytes;
-    Console.WriteLine("Sending uncompressed");
-}
-
-// Send request headers with compression info
-var requestHeaders = new HeadersV1
-{
-    HeaderType = 0,
-    Method = "/example.Compression/Echo",
-    Authority = "localhost",
-    Metadata = new[]
+    using var handler = new ShmHandler(SegmentName);
+    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
     {
-        new MetadataKV("grpc-accept-encoding", compressionOptions.GetAcceptEncoding()),
-        new MetadataKV("grpc-encoding", shouldCompress ? compressor.Name : "identity")
-    }
-};
+        HttpHandler = handler
+    });
 
-await stream.SendRequestHeadersAsync(requestHeaders);
-Console.WriteLine("Sent request headers");
+    var client = new Echo.Echo.EchoClient(channel);
+    Console.WriteLine("Connected to server");
+    Console.WriteLine();
 
-// Send the message (use original bytes - in real implementation, framing would handle compression)
-await stream.SendMessageAsync(messageBytes);
-Console.WriteLine("Sent message");
+    // Create a message large enough to benefit from compression (500+ chars)
+    var largePayload = "Hello with compression! " + new string('A', 500);
 
-// Signal half-close
-await stream.SendHalfCloseAsync();
+    Console.WriteLine($"Sending message ({largePayload.Length} chars):");
+    Console.WriteLine($"  Preview: {largePayload[..60]}...");
+    Console.WriteLine();
 
-// Receive response headers
-var responseHeaders = await stream.ReceiveResponseHeadersAsync();
-Console.WriteLine($"Received response headers");
+    // Standard unary call — compression is transparent at the SHM layer
+    var response = await client.UnaryEchoAsync(new EchoRequest { Message = largePayload });
 
-// Check server's encoding
-foreach (var kv in responseHeaders.Metadata)
-{
-    if (kv.Key.Equals("grpc-encoding", StringComparison.OrdinalIgnoreCase))
+    Console.WriteLine($"Received response ({response.Message.Length} chars):");
+    Console.WriteLine($"  Preview: {response.Message[..Math.Min(60, response.Message.Length)]}...");
+    Console.WriteLine();
+
+    // Demonstrate that gRPC-level metadata still works alongside SHM compression
+    var headers = new Metadata
     {
-        var encoding = Encoding.UTF8.GetString(kv.Values[0]);
-        Console.WriteLine($"Server encoding: {encoding}");
-    }
-}
+        { "grpc-accept-encoding", "identity,gzip" }
+    };
 
-// Receive response message
-var (frameType, payload) = await stream.ReceiveFrameAsync();
-if (frameType == FrameType.Message && payload != null)
-{
-    var responseText = Encoding.UTF8.GetString(payload);
-    Console.WriteLine($"Response ({payload.Length} bytes): {responseText.Substring(0, Math.Min(80, responseText.Length))}...");
-}
+    Console.WriteLine("Sending second request with grpc-accept-encoding metadata...");
+    var response2 = await client.UnaryEchoAsync(
+        new EchoRequest { Message = largePayload },
+        new CallOptions(headers: headers));
 
-// Receive trailers
-(frameType, payload) = await stream.ReceiveFrameAsync();
-if (frameType == FrameType.Trailers && payload != null)
+    Console.WriteLine($"Received response: {response2.Message[..Math.Min(60, response2.Message.Length)]}...");
+}
+catch (Exception ex)
 {
-    var trailers = TrailersV1.Decode(payload);
-    Console.WriteLine($"Status: {(StatusCode)trailers.GrpcStatusCode} - {trailers.GrpcStatusMessage}");
+    Console.WriteLine($"Error: {ex.Message}");
+    Console.WriteLine();
+    Console.WriteLine("Make sure the server is running first:");
+    Console.WriteLine("  cd examples/Compression.SharedMemory/Server");
+    Console.WriteLine("  dotnet run");
 }
 
 Console.WriteLine();

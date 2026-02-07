@@ -15,7 +15,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Protobuf Include="route_guide.proto" GrpcServices="Both" />
+    <Protobuf Include="echo.proto" GrpcServices="Both" />
   </ItemGroup>
 
 </Project>

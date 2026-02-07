@@ -6,12 +6,18 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <SignAssembly>false</SignAssembly>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\..\src\Grpc.Net.SharedMemory\Grpc.Net.SharedMemory.csproj" />
-    <ProjectReference Include="..\..\..\src\Grpc.Core.Api\Grpc.Core.Api.csproj" />
+    <ProjectReference Include="../../Echo.SharedMemory/Proto/Proto.csproj" />
+    <ProjectReference Include="../../../src/Grpc.Net.SharedMemory/Grpc.Net.SharedMemory.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Grpc.Core.Api" Version="2.70.0" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.70.0" />
   </ItemGroup>
 
 </Project>
