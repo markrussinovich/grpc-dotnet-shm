@@ -34,10 +34,10 @@ Last updated: 2026-02-06
 - **Current state**: ~~`ShmRetryPolicy`, `ShmRetryThrottling`, `ShmRetryState` all exist with full unit tests but are never invoked from the RPC call path.~~ `ShmHandler` already had retry wiring. `ShmControlHandler` now has matching retry loop: constructor accepts `ShmRetryPolicy?`/`ShmRetryThrottling?`, `SendAsync` uses `ShmRetryState` with exponential backoff, trailing header inspection, and token-bucket throttling. All 23 retry tests pass.
 - **Verification**: `ShmRetryPolicyTests`, `ShmHedgingTests`, `Retrier.SharedMemory` example
 
-### P4: Wire Telemetry Call Sites
-- [ ] **P4a**: Add `ShmTelemetry.Record*` calls at key points in `ShmConnection`, `ShmGrpcStream`, and `ShmHandler`
-- [ ] **P4b**: Instrument: call start/end, message sent/received, errors, connection open/close, message sizes
-- **Current state**: 14 OTel counters/histograms/gauges + ActivitySource + `IShmStatsHandler` events defined (~500 lines) with **zero call sites** in the transport.
+### P4: Wire Telemetry Call Sites ✅
+- [x] **P4a**: Add `ShmTelemetry.Record*` calls at key points in `ShmConnection`, `ShmGrpcStream`, and `ShmHandler`
+- [x] **P4b**: Instrument: call start/end, message sent/received, errors, connection open/close, message sizes
+- **Current state**: ~~14 OTel counters/histograms/gauges + ActivitySource + `IShmStatsHandler` events defined (~500 lines) with **zero call sites** in the transport.~~ All 12 counters, 3 histograms, and 3 gauges now have live call sites in `ShmConnection` (connection lifecycle, ping/pong/RTT, window updates, BDP, errors) and `ShmGrpcStream` (stream start/close, message sent/received with compression info).
 - **Verification**: `ShmDiagnosticsTests`
 
 ### P5: Parameterized Transport Test Runner
