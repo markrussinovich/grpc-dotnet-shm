@@ -59,12 +59,12 @@ Last updated: 2026-02-06
 - **Go reference**: ALL Go examples use `grpc.WithShmTransport()` on client + `grpc.NewServer().Serve(shmListener)` on server — the **only** difference from TCP.
 - **Verification**: All 7 examples build with 0 warnings, 0 errors. 192 tests pass.
 
-### P8: TCP Fallback + Mixed Transport
-- [ ] **P8a**: Implement `dialShmWithFallback` equivalent in `ShmControlHandler`
-- [ ] **P8b**: Implement `AllowMixedTransport` to handle both `shm://` and TCP addresses
-- [ ] **P8c**: Add transport selection with 4 policies: disabled / preferred / required / auto
-- **Current state**: Not implemented. Placeholder code exists.
-- **Verification**: New `ShmFallbackTests`
+### P8: TCP Fallback + Mixed Transport ✅
+- [x] **P8a**: Implement `ShmFallbackHandler` — `HttpMessageHandler` that tries SHM first, falls back to TCP (`dialShmWithFallback` equivalent)
+- [x] **P8b**: Support mixed transport via `ShmServicePolicy` with 4 policies: disabled / preferred / required / auto
+- [x] **P8c**: Fast-path optimization (after first SHM failure, subsequent calls skip SHM), observability counters (`ShmAttempts`, `ShmSuccesses`, `TcpFallbacks`), `RecordTransportSelected` telemetry
+- **Commit**: `d6f8ede2`
+- **Verification**: 25 new `ShmFallbackTests` — all policy modes, fallback behavior, fast-path, counter correctness, dispose semantics. 217 tests pass (2 pre-existing timeouts).
 
 ### P9: Security Handshake
 - [ ] **P9a**: Design `IShmSecurityHandshaker` interface
