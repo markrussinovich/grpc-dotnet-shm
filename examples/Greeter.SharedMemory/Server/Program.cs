@@ -16,91 +16,14 @@
 
 #endregion
 
-using System.Text;
-using Grpc.Core;
-using Grpc.Net.SharedMemory;
-using Server.Services;
+using Grpc.AspNetCore.Server.SharedMemory;
+using Server;
 
-const string SegmentName = "greeter-shm";
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddGrpc();
+builder.WebHost.UseSharedMemory("greeter_shm_example");
 
-Console.WriteLine("Starting shared memory gRPC server...");
-Console.WriteLine($"Segment name: {SegmentName}");
+var app = builder.Build();
+app.MapGrpcService<GreeterService>();
 
-// Create the greeter service
-var greeterService = new GreeterService();
-
-// Create the shared memory listener using ShmControlListener for grpc-go-shmem compatibility
-using var listener = new ShmControlListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
-Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
-Console.WriteLine("Press Ctrl+C to stop the server.");
-
-var cts = new CancellationTokenSource();
-Console.CancelKeyPress += (_, e) =>
-{
-    e.Cancel = true;
-    cts.Cancel();
-};
-
-try
-{
-    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
-    {
-        Console.WriteLine($"New connection accepted: {connection.Name}");
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
-                {
-                    try
-                    {
-                        var headers = stream.RequestHeaders;
-                        if (headers?.Method is { } method)
-                        {
-                            Console.WriteLine($"Received request for method: {method}");
-
-                            // Read the request message
-                            ReadOnlyMemory<byte> requestBytes = default;
-                            await foreach (var msg in stream.ReceiveMessagesAsync(cts.Token))
-                            {
-                                requestBytes = msg;
-                                break; // Unary: only expect one message
-                            }
-
-                            // Send response headers
-                            await stream.SendResponseHeadersAsync();
-
-                            // Handle the request
-                            var response = await greeterService.HandleMethodAsync(
-                                stream,
-                                method,
-                                requestBytes);
-
-                            await stream.SendMessageAsync(response);
-                            await stream.SendTrailersAsync(StatusCode.OK);
-
-                            Console.WriteLine("Response sent successfully.");
-                        }
-                    }
-                    catch (RpcException ex)
-                    {
-                        Console.WriteLine($"RPC error: {ex.Status}");
-                        await stream.SendTrailersAsync(ex.StatusCode, ex.Status.Detail);
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Stream error: {ex.Message}");
-                    }
-                }
-            }
-            catch (OperationCanceledException) { }
-        });
-    }
-}
-catch (OperationCanceledException)
-{
-    Console.WriteLine("Server stopping...");
-}
-
-Console.WriteLine("Server stopped.");
+await app.RunAsync();

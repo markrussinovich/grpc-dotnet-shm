@@ -32,8 +32,8 @@ Console.WriteLine($"Segment name: {SegmentName}");
 var greeterService = new GreeterService();
 var reflectionService = new ReflectionService();
 
-// Create the shared memory listener
-using var listener = new ShmConnectionListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+// Create the shared memory listener using ShmControlListener for grpc-go-shmem compatibility
+using var listener = new ShmControlListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
 Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
 Console.WriteLine("Press Ctrl+C to stop the server.");
 
@@ -46,47 +46,64 @@ Console.CancelKeyPress += (_, e) =>
 
 try
 {
-    while (!cts.Token.IsCancellationRequested)
+    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
     {
-        var serverStream = listener.Connection.CreateStream();
+        Console.WriteLine($"New connection accepted: {connection.Name}");
 
-        if (serverStream.RequestHeaders is { Method: var method } && method != null)
+        _ = Task.Run(async () =>
         {
             try
             {
-                Console.WriteLine($"Received request for method: {method}");
+                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
+                {
+                    try
+                    {
+                        var headers = stream.RequestHeaders;
+                        if (headers?.Method is { } method)
+                        {
+                            Console.WriteLine($"Received request for method: {method}");
 
-                if (method == "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo")
-                {
-                    await serverStream.SendResponseHeadersAsync();
-                    await reflectionService.HandleReflectionAsync(serverStream, cts.Token);
-                    await serverStream.SendTrailersAsync(StatusCode.OK);
-                }
-                else if (method == "/greet.Greeter/SayHello")
-                {
-                    await serverStream.SendResponseHeadersAsync();
-                    var response = await greeterService.SayHelloAsync(serverStream, Array.Empty<byte>());
-                    await serverStream.SendMessageAsync(response);
-                    await serverStream.SendTrailersAsync(StatusCode.OK);
-                }
-                else
-                {
-                    throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
-                }
-            }
-            catch (RpcException ex)
-            {
-                Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
-                await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error: {ex.Message}");
-                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
-            }
-        }
+                            if (method == "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo")
+                            {
+                                await stream.SendResponseHeadersAsync();
+                                await reflectionService.HandleReflectionAsync(stream, cts.Token);
+                                await stream.SendTrailersAsync(StatusCode.OK);
+                            }
+                            else if (method == "/greet.Greeter/SayHello")
+                            {
+                                // Read the request message
+                                ReadOnlyMemory<byte> requestBytes = default;
+                                await foreach (var msg in stream.ReceiveMessagesAsync(cts.Token))
+                                {
+                                    requestBytes = msg;
+                                    break;
+                                }
 
-        await Task.Delay(10, cts.Token);
+                                await stream.SendResponseHeadersAsync();
+                                var response = await greeterService.SayHelloAsync(stream, requestBytes);
+                                await stream.SendMessageAsync(response);
+                                await stream.SendTrailersAsync(StatusCode.OK);
+                            }
+                            else
+                            {
+                                throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
+                            }
+                        }
+                    }
+                    catch (RpcException ex)
+                    {
+                        Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+                        await stream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error: {ex.Message}");
+                        await stream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+        });
     }
 }
 catch (OperationCanceledException)

@@ -16,11 +16,8 @@
 
 #endregion
 
-using System.Buffers;
 using System.Threading.Channels;
 using Grpc.Core;
-using Grpc.Net.SharedMemory.Compression;
-using Grpc.Net.SharedMemory.Telemetry;
 
 namespace Grpc.Net.SharedMemory;
 
@@ -31,10 +28,9 @@ namespace Grpc.Net.SharedMemory;
 public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 {
     private readonly ShmConnection _connection;
-    private readonly Channel<(FrameType Type, byte[] Payload, int PayloadLength)> _inboundFrames;
+    private readonly Channel<(FrameType Type, byte[] Payload)> _inboundFrames;
     private readonly CancellationTokenSource _disposeCts;
     private readonly SemaphoreSlim _sendLock;
-    private readonly ShmCompressionOptions? _compressionOptions;
 
     private HeadersV1? _requestHeaders;
     private HeadersV1? _responseHeaders;
@@ -90,13 +86,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public bool IsServerStream { get; }
 
-    internal ShmGrpcStream(uint streamId, ShmConnection connection, bool isServerStream = false, ShmCompressionOptions? compressionOptions = null)
+    internal ShmGrpcStream(uint streamId, ShmConnection connection, bool isServerStream = false)
     {
         StreamId = streamId;
         _connection = connection;
         IsServerStream = isServerStream;
-        _compressionOptions = compressionOptions;
-        _inboundFrames = Channel.CreateUnbounded<(FrameType, byte[], int)>(new UnboundedChannelOptions
+        _inboundFrames = Channel.CreateUnbounded<(FrameType, byte[])>(new UnboundedChannelOptions
         {
             SingleReader = true,
             SingleWriter = true
@@ -139,7 +134,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         var payload = _requestHeaders.Encode();
         await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial, payload);
-        ShmTelemetry.RecordStreamStarted(StreamId, method);
     }
 
     /// <summary>
@@ -165,8 +159,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Sends a message payload with gRPC length-prefix header.
-    /// The data should be the raw protobuf message (without gRPC header).
+    /// Sends a message payload.
     /// </summary>
     public async Task SendMessageAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
@@ -176,42 +169,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
 
-        // Apply compression if configured
-        byte compressedFlag = 0;
-        ReadOnlyMemory<byte> wireData = data;
-        byte[]? compressedBuffer = null;
-
-        if (_compressionOptions != null && _compressionOptions.ShouldCompress(data.Length))
-        {
-            var compressor = _compressionOptions.GetSendCompressor();
-            if (compressor != null && !compressor.IsIdentity)
-            {
-                compressedBuffer = compressor.Compress(data.Span);
-                wireData = compressedBuffer;
-                compressedFlag = 1;
-            }
-        }
-
-        // gRPC wire format total: [compressed:1][length:4 BE][data]
-        var totalGrpcSize = 5 + wireData.Length;
-
-        // Wait for send window (account for full gRPC message size)
-        while (Interlocked.Read(ref _sendWindow) < totalGrpcSize)
+        // Wait for send window
+        while (Interlocked.Read(ref _sendWindow) < data.Length)
         {
             linkedCts.Token.ThrowIfCancellationRequested();
             await Task.Delay(1, linkedCts.Token); // Simple backpressure
         }
 
-        Interlocked.Add(ref _sendWindow, -totalGrpcSize);
-
-        // Build 5-byte gRPC length-prefix header separately and use scatter write
-        // to avoid copying data into an intermediate buffer
-        var grpcPrefix = new byte[5];
-        grpcPrefix[0] = compressedFlag;
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcPrefix.AsSpan(1, 4), (uint)wireData.Length);
-
-        await SendFrameScatterAsync(FrameType.Message, 0, grpcPrefix, wireData, linkedCts.Token);
-        ShmTelemetry.RecordMessageSent(StreamId, wireData.Length, compressedFlag != 0, compressedFlag != 0 ? data.Length : null);
+        Interlocked.Add(ref _sendWindow, -data.Length);
+        await SendFrameAsync(FrameType.Message, 0, data.ToArray(), linkedCts.Token);
     }
 
     /// <summary>
@@ -234,10 +200,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         var payload = _trailers.Encode();
         await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream, payload);
         _halfCloseSent = true;
-        ShmTelemetry.RecordStreamClosed(StreamId, (int)statusCode);
-        
-        // After sending trailers, the stream is complete - remove from connection
-        _connection.RemoveStream(StreamId);
     }
 
     /// <summary>
@@ -267,41 +229,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         catch { }
 
         _inboundFrames.Writer.TryComplete();
-        
-        // Remove from connection's stream tracking
-        _connection.RemoveStream(StreamId);
     }
 
     /// <summary>
     /// Receives the next frame from the stream.
-    /// Returns a correctly-sized copy of the payload (for external/raw-wire callers).
     /// </summary>
     /// <returns>The frame type and payload, or null if the stream is closed.</returns>
     public async Task<(FrameType Type, byte[] Payload)?> ReceiveFrameAsync(CancellationToken cancellationToken = default)
-    {
-        var pooledResult = await ReceiveFramePooledAsync(cancellationToken);
-        if (pooledResult == null) return null;
-
-        var (type, payload, payloadLength) = pooledResult.Value;
-        // Copy to a correctly-sized array and return the pooled buffer
-        byte[] result;
-        if (payloadLength == 0)
-        {
-            result = Array.Empty<byte>();
-        }
-        else
-        {
-            result = payload.AsSpan(0, payloadLength).ToArray();
-            ArrayPool<byte>.Shared.Return(payload);
-        }
-        return (type, result);
-    }
-
-    /// <summary>
-    /// Receives the next frame using pooled buffers (internal hot path).
-    /// The caller is responsible for returning the pooled buffer via ReturnPooledBuffer.
-    /// </summary>
-    internal async Task<(FrameType Type, byte[] Payload, int PayloadLength)?> ReceiveFramePooledAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
@@ -337,22 +271,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         while (true)
         {
-            var frame = await ReceiveFramePooledAsync(cancellationToken);
+            var frame = await ReceiveFrameAsync(cancellationToken);
             if (frame == null)
                 throw new InvalidOperationException("Stream closed before receiving headers");
 
-            var (type, payload, payloadLength) = frame.Value;
-            try
+            if (frame.Value.Type == FrameType.Headers)
             {
-                if (type == FrameType.Headers)
-                {
-                    _requestHeaders = HeadersV1.Decode(payload.AsSpan(0, payloadLength).ToArray());
-                    return _requestHeaders;
-                }
-            }
-            finally
-            {
-                ReturnPooledBuffer(payload, payloadLength);
+                _requestHeaders = HeadersV1.Decode(frame.Value.Payload);
+                return _requestHeaders;
             }
         }
     }
@@ -367,149 +293,58 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         while (true)
         {
-            var frame = await ReceiveFramePooledAsync(cancellationToken);
+            var frame = await ReceiveFrameAsync(cancellationToken);
             if (frame == null)
                 throw new InvalidOperationException("Stream closed before receiving headers");
 
-            var (type, payload, payloadLength) = frame.Value;
-            try
+            if (frame.Value.Type == FrameType.Headers)
             {
-                if (type == FrameType.Headers)
-                {
-                    _responseHeaders = HeadersV1.Decode(payload.AsSpan(0, payloadLength).ToArray());
-                    return _responseHeaders;
-                }
-            }
-            finally
-            {
-                ReturnPooledBuffer(payload, payloadLength);
+                _responseHeaders = HeadersV1.Decode(frame.Value.Payload);
+                return _responseHeaders;
             }
         }
     }
 
     /// <summary>
     /// Receives messages from the stream.
-    /// Decodes the gRPC wire format: [compressed:1][length:4 BE][data].
-    /// Returns the raw protobuf message data as a ReadOnlyMemory&lt;byte&gt;.
-    /// Uses pooled buffers: the yielded memory is valid until the next iteration.
     /// </summary>
-    public async IAsyncEnumerable<ReadOnlyMemory<byte>> ReceiveMessagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<byte[]> ReceiveMessagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        // Track the previous iteration's pooled buffer so we can return it
-        // after the caller has consumed the yielded data.
-        byte[]? previousPooledBuffer = null;
-        int previousPooledLength = 0;
-
-        try
+        while (!_halfCloseReceived && !_cancelled)
         {
-            // Read from the channel until it's completed or we get end-of-stream indicators
-            while (!_cancelled)
+            var frame = await ReceiveFrameAsync(cancellationToken);
+            if (frame == null) break;
+
+            switch (frame.Value.Type)
             {
-                var frame = await ReceiveFramePooledAsync(cancellationToken);
-                if (frame == null) break;
+                case FrameType.Message:
+                    // Send window update
+                    var increment = (uint)frame.Value.Payload.Length;
+                    if (increment > 0)
+                    {
+                        _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0,
+                            BitConverter.GetBytes(increment));
+                    }
+                    yield return frame.Value.Payload;
+                    break;
 
-                // Return the previous iteration's pooled buffer now that the caller has consumed it
-                if (previousPooledBuffer != null)
-                {
-                    ReturnPooledBuffer(previousPooledBuffer, previousPooledLength);
-                    previousPooledBuffer = null;
-                }
+                case FrameType.HalfClose:
+                    _halfCloseReceived = true;
+                    yield break;
 
-                var (type, framePayload, framePayloadLength) = frame.Value;
+                case FrameType.Trailers:
+                    _trailers = TrailersV1.Decode(frame.Value.Payload);
+                    _halfCloseReceived = true;
+                    yield break;
 
-                switch (type)
-                {
-                    case FrameType.Message:
-                        // Send window update (use actual payload length, not array length)
-                        var increment = (uint)framePayloadLength;
-                        if (increment > 0)
-                        {
-                            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0,
-                                BitConverter.GetBytes(increment));
-                        }
-
-                        // Decode gRPC wire format: [compressed:1][length:4 BE][data]
-                        if (framePayloadLength < 5)
-                        {
-                            ReturnPooledBuffer(framePayload, framePayloadLength);
-                            throw new InvalidDataException($"MESSAGE payload too short: {framePayloadLength} bytes, expected at least 5");
-                        }
-
-                        var compressed = framePayload[0] != 0;
-                        var messageLength = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(framePayload.AsSpan(1, 4));
-                        if (framePayloadLength != 5 + messageLength)
-                        {
-                            ReturnPooledBuffer(framePayload, framePayloadLength);
-                            throw new InvalidDataException($"MESSAGE payload length mismatch: got {framePayloadLength} bytes, expected {5 + messageLength}");
-                        }
-
-                        if (compressed)
-                        {
-                            // Decompress the message data
-                            if (_compressionOptions == null)
-                            {
-                                ReturnPooledBuffer(framePayload, framePayloadLength);
-                                throw new InvalidOperationException("Received compressed message but no compression options configured");
-                            }
-
-                            var decompressor = _compressionOptions.GetSendCompressor();
-                            if (decompressor.IsIdentity)
-                            {
-                                ReturnPooledBuffer(framePayload, framePayloadLength);
-                                throw new InvalidOperationException("Received compressed message but no real compressor configured (only identity)");
-                            }
-
-                            var decompressedData = decompressor.Decompress(framePayload.AsSpan(5, (int)messageLength));
-                            ReturnPooledBuffer(framePayload, framePayloadLength);
-
-                            // Yield decompressed data - use the decompressed array directly
-                            // (no pooling needed since Decompress allocates a new array)
-                            previousPooledBuffer = null;
-                            previousPooledLength = 0;
-                            ShmTelemetry.RecordMessageReceived(StreamId, decompressedData.Length, true);
-                            yield return decompressedData;
-                        }
-                        else
-                        {
-                            // Yield the protobuf data as a slice of the pooled buffer.
-                            // Defer returning the buffer until the next iteration when the caller is done.
-                            previousPooledBuffer = framePayload;
-                            previousPooledLength = framePayloadLength;
-                            ShmTelemetry.RecordMessageReceived(StreamId, (int)messageLength, false);
-                            yield return framePayload.AsMemory(5, (int)messageLength);
-                        }
-                        break;
-
-                    case FrameType.HalfClose:
-                        ReturnPooledBuffer(framePayload, framePayloadLength);
-                        _halfCloseReceived = true;
-                        yield break;
-
-                    case FrameType.Trailers:
-                        _trailers = TrailersV1.Decode(framePayload.AsSpan(0, framePayloadLength).ToArray());
-                        ReturnPooledBuffer(framePayload, framePayloadLength);
-                        _halfCloseReceived = true;
-                        ShmTelemetry.RecordStreamClosed(StreamId, (int)(_trailers.GrpcStatusCode));
-                        yield break;
-
-                    case FrameType.Cancel:
-                        ReturnPooledBuffer(framePayload, framePayloadLength);
-                        _cancelled = true;
-                        yield break;
-                }
-            }
-        }
-        finally
-        {
-            // Return any remaining pooled buffer (e.g., if the iterator was disposed early)
-            if (previousPooledBuffer != null)
-            {
-                ReturnPooledBuffer(previousPooledBuffer, previousPooledLength);
+                case FrameType.Cancel:
+                    _cancelled = true;
+                    yield break;
             }
         }
     }
 
-    internal void OnFrameReceived(FrameHeader header, byte[] payload, int payloadLength)
+    internal void OnFrameReceived(FrameHeader header, byte[] payload)
     {
         if (_disposed || _cancelled) return;
 
@@ -517,25 +352,22 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             case FrameType.Cancel:
                 _cancelled = true;
-                // Return pooled buffer since it won't flow through the channel
-                if (payloadLength > 0) ArrayPool<byte>.Shared.Return(payload);
                 _inboundFrames.Writer.TryComplete();
                 break;
 
             case FrameType.HalfClose:
-                // Queue the frame; the consumer will set _halfCloseReceived when reading
-                _inboundFrames.Writer.TryWrite((header.Type, payload, payloadLength));
-                _inboundFrames.Writer.TryComplete();
+                _halfCloseReceived = true;
+                _inboundFrames.Writer.TryWrite((header.Type, payload));
                 break;
 
             case FrameType.Trailers:
-                // Queue the frame; the consumer will decode and set _trailers when reading
-                _inboundFrames.Writer.TryWrite((header.Type, payload, payloadLength));
+                _halfCloseReceived = true;
+                _inboundFrames.Writer.TryWrite((header.Type, payload));
                 _inboundFrames.Writer.TryComplete();
                 break;
 
             default:
-                _inboundFrames.Writer.TryWrite((header.Type, payload, payloadLength));
+                _inboundFrames.Writer.TryWrite((header.Type, payload));
                 break;
         }
     }
@@ -572,22 +404,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Sends a frame with a two-part payload (scatter write) to avoid an intermediate copy.
-    /// </summary>
-    private async Task SendFrameScatterAsync(FrameType type, byte flags, ReadOnlyMemory<byte> payload1, ReadOnlyMemory<byte> payload2, CancellationToken cancellationToken = default)
-    {
-        await _sendLock.WaitAsync(cancellationToken);
-        try
-        {
-            _connection.SendFrame(type, StreamId, flags, payload1.Span, payload2.Span);
-        }
-        finally
-        {
-            _sendLock.Release();
-        }
-    }
-
     private static MetadataKV[] ConvertMetadata(Metadata? metadata)
     {
         if (metadata == null || metadata.Count == 0)
@@ -596,18 +412,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         return metadata.Select(e => e.IsBinary
             ? new MetadataKV(e.Key, e.ValueBytes)
             : new MetadataKV(e.Key, e.Value)).ToArray();
-    }
-
-    /// <summary>
-    /// Returns a pooled buffer to the ArrayPool if it was rented (payloadLength > 0).
-    /// Buffers with payloadLength == 0 are Array.Empty&lt;byte&gt; and must not be returned.
-    /// </summary>
-    private static void ReturnPooledBuffer(byte[] buffer, int payloadLength)
-    {
-        if (payloadLength > 0)
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
     }
 
     private void ThrowIfDisposed()
@@ -623,11 +427,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             _disposed = true;
             _disposeCts.Cancel();
             _inboundFrames.Writer.TryComplete();
-            // Drain and return any remaining pooled buffers in the channel
-            while (_inboundFrames.Reader.TryRead(out var frame))
-            {
-                ReturnPooledBuffer(frame.Payload, frame.PayloadLength);
-            }
             _connection.RemoveStream(StreamId);
             _sendLock.Dispose();
             _disposeCts.Dispose();

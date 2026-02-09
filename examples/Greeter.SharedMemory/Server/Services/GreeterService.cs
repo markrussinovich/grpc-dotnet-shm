@@ -16,56 +16,24 @@
 
 #endregion
 
-using System.Text;
 using Greet;
 using Grpc.Core;
-using Grpc.Net.SharedMemory;
-using Google.Protobuf;
+using Microsoft.Extensions.Logging;
 
-namespace Server.Services;
+namespace Server;
 
-/// <summary>
-/// Simple Greeter service that processes requests over shared memory.
-/// This demonstrates the shared memory transport pattern without full ASP.NET Core integration.
-/// </summary>
-public class GreeterService
+public class GreeterService : Greeter.GreeterBase
 {
-    /// <summary>
-    /// Handles an incoming SayHello request.
-    /// </summary>
-    /// <param name="stream">The gRPC stream from the client.</param>
-    /// <param name="requestData">The serialized request message.</param>
-    /// <returns>The serialized response message.</returns>
-    public Task<byte[]> SayHelloAsync(ShmGrpcStream stream, ReadOnlyMemory<byte> requestData)
+    private readonly ILogger _logger;
+
+    public GreeterService(ILoggerFactory loggerFactory)
     {
-        // Deserialize the request
-        var request = HelloRequest.Parser.ParseFrom(requestData.Span);
-
-        Console.WriteLine($"Received greeting request from: {request.Name}");
-
-        // Process the request (simple greeting logic)
-        var response = new HelloReply
-        {
-            Message = $"Hello {request.Name}!"
-        };
-
-        // Serialize and return the response
-        return Task.FromResult(response.ToByteArray());
+        _logger = loggerFactory.CreateLogger<GreeterService>();
     }
 
-    /// <summary>
-    /// Routes an incoming gRPC method call to the appropriate handler.
-    /// </summary>
-    /// <param name="stream">The gRPC stream.</param>
-    /// <param name="method">The method name (e.g., "/greet.Greeter/SayHello").</param>
-    /// <param name="requestData">The serialized request data.</param>
-    /// <returns>The serialized response data.</returns>
-    public Task<byte[]> HandleMethodAsync(ShmGrpcStream stream, string method, ReadOnlyMemory<byte> requestData)
+    public override Task<HelloReply> SayHello(HelloRequest request, ServerCallContext context)
     {
-        return method switch
-        {
-            "/greet.Greeter/SayHello" => SayHelloAsync(stream, requestData),
-            _ => throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"))
-        };
+        _logger.LogInformation("Sending hello to {Name}", request.Name);
+        return Task.FromResult(new HelloReply { Message = "Hello " + request.Name });
     }
 }

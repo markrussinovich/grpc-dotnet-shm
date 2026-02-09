@@ -16,11 +16,9 @@
 
 #endregion
 
-using System.Buffers;
 using System.Collections.Concurrent;
+using System.Runtime.Versioning;
 using System.Threading.Channels;
-using Grpc.Net.SharedMemory.Compression;
-using Grpc.Net.SharedMemory.Telemetry;
 
 namespace Grpc.Net.SharedMemory;
 
@@ -41,7 +39,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private bool _goAwaySent;
     private bool _goAwayReceived;
     private bool _draining;
-    private volatile bool _readerStopped;
     private uint _maxConcurrentStreams;
 
     // Connection-level flow control (matches grpc-go-shmem)
@@ -57,7 +54,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     // Keepalive (A73 RFC)
     private readonly ShmKeepaliveOptions _keepaliveOptions;
     private readonly ShmKeepaliveEnforcementPolicy? _enforcementPolicy;
-    private readonly ShmCompressionOptions? _compressionOptions;
     private Task? _keepaliveTask;
     private DateTime _lastPingAt;
     private DateTime _lastPingSentAt;
@@ -85,9 +81,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     public bool IsClient => _isClient;
 
     /// <summary>
-    /// Gets whether the connection has been closed or is no longer functional.
+    /// Gets whether the connection has been closed.
     /// </summary>
-    public bool IsClosed => _disposed || _goAwaySent || _goAwayReceived || _readerStopped;
+    public bool IsClosed => _disposed || _goAwaySent || _goAwayReceived;
 
     /// <summary>
     /// Gets whether the connection is draining (not accepting new streams).
@@ -110,10 +106,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="name">The name of the shared memory segment to connect to.</param>
     /// <param name="keepaliveOptions">Optional keepalive options.</param>
     /// <returns>A new client connection.</returns>
-    public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null, ShmCompressionOptions? compressionOptions = null)
+    [SupportedOSPlatform("windows")]
+    public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null)
     {
         var segment = Segment.Open(name);
-        return new ShmConnection(name, segment, isClient: true, keepaliveOptions, compressionOptions: compressionOptions);
+        return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
     }
 
     /// <summary>
@@ -130,27 +127,26 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         ulong ringCapacity = 64 * 1024 * 1024, 
         uint maxStreams = 100,
         ShmKeepaliveOptions? keepaliveOptions = null,
-        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null,
-        ShmCompressionOptions? compressionOptions = null)
+        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
     {
         var segment = Segment.Create(name, ringCapacity, maxStreams);
-        return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy, compressionOptions);
+        return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy);
     }
 
     /// <summary>
     /// Creates a server-side connection from an existing segment (used by ShmControlListener).
     /// </summary>
-    internal ShmConnection(string name, Segment segment, ShmCompressionOptions? compressionOptions = null)
-        : this(name, segment, isClient: false, compressionOptions: compressionOptions)
+    internal ShmConnection(string name, Segment segment)
+        : this(name, segment, isClient: false)
     {
     }
 
     /// <summary>
     /// Creates a client-side connection from an existing segment (used by ShmControlDialer).
     /// </summary>
-    internal static ShmConnection FromClientSegment(string name, Segment segment, ShmKeepaliveOptions? keepaliveOptions = null, ShmCompressionOptions? compressionOptions = null)
+    internal static ShmConnection FromClientSegment(string name, Segment segment, ShmKeepaliveOptions? keepaliveOptions = null)
     {
-        return new ShmConnection(name, segment, isClient: true, keepaliveOptions, compressionOptions: compressionOptions);
+        return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
     }
 
     private ShmConnection(
@@ -158,15 +154,13 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         Segment segment, 
         bool isClient, 
         ShmKeepaliveOptions? keepaliveOptions = null,
-        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null,
-        ShmCompressionOptions? compressionOptions = null)
+        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
     {
         Name = name;
         _segment = segment;
         _isClient = isClient;
         _keepaliveOptions = keepaliveOptions ?? ShmKeepaliveOptions.Default;
         _enforcementPolicy = enforcementPolicy;
-        _compressionOptions = compressionOptions;
         _streams = new ConcurrentDictionary<uint, ShmGrpcStream>();
         _disposeCts = new CancellationTokenSource();
         
@@ -210,8 +204,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         {
             _keepaliveTask = Task.Run(KeepaliveLoopAsync);
         }
-
-        ShmTelemetry.RecordConnectionStarted(name, isClient);
     }
 
     /// <summary>
@@ -224,7 +216,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         ThrowIfGoAway();
 
         var streamId = Interlocked.Add(ref _nextStreamId, 2) - 2; // Increment by 2, return previous value
-        var stream = new ShmGrpcStream(streamId, this, isServerStream: false, compressionOptions: _compressionOptions);
+        var stream = new ShmGrpcStream(streamId, this, isServerStream: false);
 
         if (!_streams.TryAdd(streamId, stream))
         {
@@ -321,7 +313,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         ThrowIfDisposed();
         var pingData = BitConverter.GetBytes(Environment.TickCount64);
         FrameProtocol.WritePing(TxRing, 0, pingData, _disposeCts.Token);
-        ShmTelemetry.RecordPingSent();
     }
 
     internal void RemoveStream(uint streamId)
@@ -336,27 +327,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         FrameProtocol.WriteFrame(TxRing, header, payload, _disposeCts.Token);
     }
 
-    /// <summary>
-    /// Sends a frame with a two-part payload (scatter write), avoiding an intermediate copy.
-    /// </summary>
-    internal void SendFrame(FrameType type, uint streamId, byte flags, ReadOnlySpan<byte> payload1, ReadOnlySpan<byte> payload2)
-    {
-        ThrowIfDisposed();
-        var header = new FrameHeader(type, streamId, (uint)(payload1.Length + payload2.Length), flags);
-        FrameProtocol.WriteFrame(TxRing, header, payload1, payload2, _disposeCts.Token);
-    }
-
     private async Task FrameReaderLoopAsync()
     {
         try
         {
             while (!_disposeCts.Token.IsCancellationRequested)
             {
-                // Read frame from receive ring using pooled buffers to avoid per-frame allocation
-                var (header, payload, payloadLength) = await Task.Run(() =>
-                    FrameProtocol.ReadFramePooled(RxRing, _disposeCts.Token), _disposeCts.Token);
+                // Read frame from receive ring
+                var (header, payload) = await Task.Run(() =>
+                    FrameProtocol.ReadFrame(RxRing, _disposeCts.Token), _disposeCts.Token);
 
-                await ProcessFrameAsync(header, payload, payloadLength);
+                await ProcessFrameAsync(header, payload);
             }
         }
         catch (OperationCanceledException)
@@ -366,38 +347,32 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         catch (Exception ex)
         {
             // Log error and close connection
-            System.Diagnostics.Debug.WriteLine($"Frame reader error: {ex}");
-            ShmTelemetry.RecordError("frame_reader", ex.Message);
-        }
-        finally
-        {
-            // Mark connection as no longer functional - the reader can't process any more frames
-            _readerStopped = true;
+            System.Diagnostics.Debug.WriteLine($"Frame reader error: {ex.Message}");
         }
     }
 
-    private async Task ProcessFrameAsync(FrameHeader header, byte[] payload, int payloadLength)
+    private async Task ProcessFrameAsync(FrameHeader header, byte[] payload)
     {
         switch (header.Type)
         {
             case FrameType.Headers:
-                await HandleHeadersFrameAsync(header, payload, payloadLength);
+                await HandleHeadersFrameAsync(header, payload);
                 break;
 
             case FrameType.Message:
             case FrameType.Trailers:
             case FrameType.HalfClose:
             case FrameType.Cancel:
-                // Route to stream - ownership of the pooled buffer transfers to the stream
+                // Route to stream
                 if (_streams.TryGetValue(header.StreamId, out var stream))
                 {
-                    stream.OnFrameReceived(header, payload, payloadLength);
+                    stream.OnFrameReceived(header, payload);
 
                     // BDP estimation: track bytes received
                     if (header.Type == FrameType.Message)
                     {
-                        var sendBdpPing = _bdpEstimator.Add((uint)payloadLength);
-                        var windowUpdate = OnConnectionDataReceived((uint)payloadLength);
+                        var sendBdpPing = _bdpEstimator.Add((uint)payload.Length);
+                        var windowUpdate = OnConnectionDataReceived((uint)payload.Length);
                         if (windowUpdate > 0)
                         {
                             SendConnectionWindowUpdate(windowUpdate);
@@ -408,41 +383,28 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                         }
                     }
                 }
-                else
-                {
-                    // No matching stream - return the pooled buffer
-                    ReturnPooledBuffer(payload, payloadLength);
-                }
                 break;
 
             case FrameType.Ping:
                 // Use new handler for BDP and enforcement
                 HandlePing(header, payload);
-                ReturnPooledBuffer(payload, payloadLength);
                 break;
 
             case FrameType.Pong:
                 // Use new handler for BDP and keepalive
                 HandlePong(header, payload);
-                ReturnPooledBuffer(payload, payloadLength);
                 break;
 
             case FrameType.GoAway:
                 _goAwayReceived = true;
-                var message = payloadLength > 0 ? System.Text.Encoding.UTF8.GetString(payload.AsSpan(0, payloadLength)) : null;
-                ReturnPooledBuffer(payload, payloadLength);
+                var message = payload.Length > 0 ? System.Text.Encoding.UTF8.GetString(payload) : null;
                 GoAwayReceived?.Invoke(this, new GoAwayEventArgs(header.Flags, message));
                 break;
 
             case FrameType.WindowUpdate:
                 // Route window update to stream or connection
                 var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(payload);
-                ReturnPooledBuffer(payload, payloadLength);
                 AddSendQuota(header.StreamId, increment);
-                break;
-
-            default:
-                ReturnPooledBuffer(payload, payloadLength);
                 break;
         }
     }
@@ -452,7 +414,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// For server: creates a new stream from client request.
     /// For client: routes to existing stream (response headers).
     /// </summary>
-    private async Task HandleHeadersFrameAsync(FrameHeader header, byte[] payload, int payloadLength)
+    private async Task HandleHeadersFrameAsync(FrameHeader header, byte[] payload)
     {
         var streamId = header.StreamId;
 
@@ -460,7 +422,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         if (_streams.TryGetValue(streamId, out var existingStream))
         {
             // Route to existing stream (e.g., response headers for client)
-            existingStream.OnFrameReceived(header, payload, payloadLength);
+            existingStream.OnFrameReceived(header, payload);
             return;
         }
 
@@ -472,7 +434,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             {
                 // Invalid stream ID from client - reject
                 System.Diagnostics.Debug.WriteLine($"Invalid stream ID {streamId} from client (must be odd)");
-                ReturnPooledBuffer(payload, payloadLength);
                 RejectStream(streamId, "invalid stream ID");
                 return;
             }
@@ -480,7 +441,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // Check if draining
             if (_draining || _goAwaySent || _goAwayReceived)
             {
-                ReturnPooledBuffer(payload, payloadLength);
                 RejectStream(streamId, "transport is draining");
                 return;
             }
@@ -488,16 +448,15 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // Check max concurrent streams
             if (_streams.Count >= (int)_maxConcurrentStreams)
             {
-                ReturnPooledBuffer(payload, payloadLength);
                 RejectStream(streamId, "max concurrent streams exceeded");
                 return;
             }
 
-            // Decode headers from the pooled buffer
+            // Decode headers
             HeadersV1 headersV1;
             try
             {
-                headersV1 = HeadersV1.Decode(payload.AsSpan(0, payloadLength).ToArray());
+                headersV1 = HeadersV1.Decode(payload);
             }
             catch (Exception ex)
             {
@@ -505,14 +464,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 RejectStream(streamId, "invalid headers");
                 return;
             }
-            finally
-            {
-                // Always return the pooled buffer - headers are decoded into managed objects
-                ReturnPooledBuffer(payload, payloadLength);
-            }
 
             // Create new server stream
-            var newStream = new ShmGrpcStream(streamId, this, isServerStream: true, compressionOptions: _compressionOptions);
+            var newStream = new ShmGrpcStream(streamId, this, isServerStream: true);
             newStream.SetRequestHeaders(headersV1);
 
             if (!_streams.TryAdd(streamId, newStream))
@@ -651,7 +605,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             var payload = new byte[4];
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, increment);
             SendFrame(FrameType.WindowUpdate, 0, 0, payload);
-            ShmTelemetry.RecordWindowUpdateSent(0, increment);
         }
     }
 
@@ -670,7 +623,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 SendConnectionWindowUpdate(delta);
             }
         }
-        ShmTelemetry.UpdateBdpWindow(newBdp);
 
         // Also update stream-level windows
         foreach (var stream in _streams.Values)
@@ -727,7 +679,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                     if (DateTime.UtcNow - _lastPingSentAt > _keepaliveOptions.PingTimeout)
                     {
                         // Timeout - close connection
-                        ShmTelemetry.RecordError("keepalive", "keepalive timeout");
                         SendGoAway("keepalive timeout");
                         break;
                     }
@@ -739,7 +690,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 _lastPingSentAt = DateTime.UtcNow;
                 var pingData = BitConverter.GetBytes(DateTime.UtcNow.Ticks);
                 SendFrame(FrameType.Ping, 0, 0, pingData);
-                ShmTelemetry.RecordPingSent();
             }
         }
         catch (OperationCanceledException)
@@ -773,7 +723,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 _pingStrikes++;
                 if (_pingStrikes > _enforcementPolicy.MaxPingStrikes)
                 {
-                    ShmTelemetry.RecordError("ping_enforcement", "too many pings without streams");
                     SendGoAway("too many pings without streams");
                     return;
                 }
@@ -785,7 +734,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 _pingStrikes++;
                 if (_pingStrikes > _enforcementPolicy.MaxPingStrikes)
                 {
-                    ShmTelemetry.RecordError("ping_enforcement", "too many pings");
                     SendGoAway("too many pings");
                     return;
                 }
@@ -813,25 +761,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         // Regular keepalive pong - clear pending ping
         _pendingPing = false;
-        if (_lastPingSentAt != DateTime.MinValue)
-        {
-            var rttMs = (DateTime.UtcNow - _lastPingSentAt).TotalMilliseconds;
-            ShmTelemetry.RecordPongReceived(rttMs);
-        }
     }
 
     #endregion
-
-    /// <summary>
-    /// Returns a pooled buffer to the ArrayPool if it was rented (payloadLength > 0).
-    /// </summary>
-    private static void ReturnPooledBuffer(byte[] buffer, int payloadLength)
-    {
-        if (payloadLength > 0)
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
-    }
 
     private void ThrowIfDisposed()
     {
@@ -873,8 +805,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
             _segment.Dispose();
             _disposeCts.Dispose();
-
-            ShmTelemetry.RecordConnectionClosed(Name, _isClient, "disposed");
         }
     }
 
@@ -905,8 +835,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
             _segment.Dispose();
             _disposeCts.Dispose();
-
-            ShmTelemetry.RecordConnectionClosed(Name, _isClient, "disposed");
         }
     }
 }

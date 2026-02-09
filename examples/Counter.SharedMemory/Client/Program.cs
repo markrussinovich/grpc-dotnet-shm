@@ -35,10 +35,10 @@ Console.WriteLine();
 try
 {
     // Create channel using shared memory handler
-    using var handler = new ShmHandler(SegmentName);
-    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
+    using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
     {
-        HttpHandler = handler
+        HttpHandler = new ShmHttpHandler(SegmentName),
+        DisposeHttpClient = true
     });
 
     var client = new Counter.CounterClient(channel);

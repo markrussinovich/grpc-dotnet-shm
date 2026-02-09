@@ -2,179 +2,179 @@
 
 ## Overview
 
-This document tracks gaps between the current .NET shared memory transport implementation
-and the target state, comparing against:
-1. **grpc-go-shmem** ([github.com/markrussinovich/grpc-go-shmem](https://github.com/markrussinovich/grpc-go-shmem)) - The Go reference implementation
+This document tracks gaps between the current .NET shared memory transport implementation and the target state, comparing against:
+1. **grpc-go-shmem** - The Go reference implementation for byte-level compatibility
 2. **gRPC .NET TCP transport** - For feature parity and test coverage equivalence
 3. **A73 RFC** - The gRPC shared memory transport specification
 
-Last updated: 2026-02-06
+---
+
+## 1. TCP Tests vs SHM Equivalents
+
+### Current SHM Test Coverage
+
+| SHM Test File | Tests |
+|--------------|-------|
+| `EndToEndTests.cs` | Unary, ServerStreaming, ClientStreaming, BiDi, Error, Cancel, Deadline, Metadata, LargeMessage |
+| `ShmConnectionTests.cs` | Connection lifecycle |
+| `ShmGrpcStreamTests.cs` | Stream state |
+| `FrameProtocolTests.cs` | Frame encoding |
+| `RingBufferTests.cs` | Ring operations |
+| `SegmentTests.cs` | Segment creation |
+| `HeadersTrailersTests.cs` | Header/trailer encoding |
+| **Total: ~40 tests** | |
+
+### Missing TCP Test Categories (from `test/FunctionalTests/`)
+
+| TCP Test Category | SHM Equivalent | Status |
+|------------------|----------------|--------|
+| `Client/UnaryTests.cs` | Partial (basic unary) | ⚠️ Missing advanced scenarios |
+| `Client/StreamingTests.cs` | Partial | ⚠️ Missing edge cases |
+| `Client/CancellationTests.cs` | 1 test | ❌ **Missing comprehensive cancellation** |
+| `Client/DeadlineTests.cs` | 1 test | ❌ **Missing server-side deadline enforcement** |
+| `Client/MetadataTests.cs` | 1 test | ❌ **Missing binary metadata** |
+| `Client/CompressionTests.cs` | None | ❌ **Not implemented** |
+| `Client/RetryTests.cs` | None | ❌ **Not implemented** |
+| `Client/HedgingTests.cs` | None | ❌ **Not implemented** |
+| `Client/ConnectionTests.cs` | None | ❌ **Missing connection lifecycle** |
+| `Client/MaxMessageSizeTests.cs` | 1 test | ⚠️ Partial |
+| `Client/InterceptorTests.cs` | None | ❌ **Missing interceptor integration** |
+| `Client/TelemetryTests.cs` | None | ❌ **Missing tracing** |
+| `Server/UnaryMethodTests.cs` | None | ❌ **Missing** |
+| `Server/ServerStreamingMethodTests.cs` | None | ❌ **Missing** |
+| `Server/ClientStreamingMethodTests.cs` | None | ❌ **Missing** |
+| `Server/DuplexStreamingMethodTests.cs` | None | ❌ **Missing** |
+| `Server/DeadlineTests.cs` | None | ❌ **Missing** |
+| `Server/LifetimeTests.cs` | None | ❌ **Missing** |
+| `Balancer/*Tests.cs` | None | ❌ **No SHM-aware balancer** |
+
+**Gap: ~60% of TCP functional tests have no SHM equivalent**
 
 ---
 
-## Prioritized Task List
+## 2. Zero-Copy & Kernel Call Equivalence
 
-### P1: Eliminate Extra Memory Copies (Send + Receive Path)
-- [x] **P1a**: Use `ReadFrameInto` / pooled buffers in `FrameReaderLoopAsync` to remove per-frame `new byte[N]` allocation on receive
-- [x] **P1b**: Remove double-copy on send: write gRPC prefix + payload directly into ring via scatter-write instead of allocating intermediate `byte[]` in `ShmHandler.SendMessagesAsync`
-- **Current state**: 2 bulk copies per direction. Go has 1 copy send / 0-1 copy receive.
-- **Target**: 1 copy per direction (matching Go).
-- **Verification**: `EndToEndTests`, `ShmStreamingTests`, `FrameProtocolTests`, `LinuxSmokeTests`
+### ✅ Zero-Copy: EQUIVALENT
 
-### P2: Wire Compression into Data Path ✅
-- [x] **P2a**: In `ShmGrpcStream.SendMessageAsync`, apply configured `IShmCompressor` before writing and set `compressed=1` flag byte
-- [x] **P2b**: In `ShmGrpcStream.ReceiveMessagesAsync`, decompress when `compressed=1` instead of throwing `NotSupportedException`
-- [x] **P2c**: Wire `ShmCompressionOptions` from `ShmConnection` / `ShmControlHandler` into `ShmGrpcStream`
-- **Current state**: ~~Full `IShmCompressor` infra exists (`GzipCompressor`, `DeflateCompressor`, registry) but `SendMessageAsync` always sets `compressed=0` and receive throws on `compressed=1`.~~ Compression fully wired: `ShmCompressionOptions` threaded through all constructors, send path compresses when `ShouldCompress()`, receive path decompresses transparently. All 23 compression tests pass.
-- **Verification**: `ShmCompressionE2ETests`, `Compression.SharedMemory` example
+| Aspect | Go grpc-go-shmem | .NET Implementation | Status |
+|--------|-----------------|---------------------|--------|
+| **Direct pointer to mmap** | `unsafe.Pointer(addr)` | `MappedMemoryManager` with `AcquirePointer()` | ✅ |
+| **Zero-copy Span/Slice** | `unsafe.Slice((*byte)(ptr), size)` | `new Span<byte>(_pointer, _length)` | ✅ |
+| **Ring buffer writes** | Direct `copy()` to mmap | `_data.Span.CopyTo()` over mmap | ✅ |
+| **Wrap-around handling** | Copy only when spanning | Same behavior | ✅ |
+| **Reservation pattern** | `ReserveWrite()` returns slices | `WriteReservation` struct | ✅ |
 
-### P3: Wire Retry into Call Path ✅
-- [x] **P3a**: Integrate `ShmRetryPolicy` into `ShmHandler.SendAsync` / `ShmControlHandler.SendAsync` retry loop
-- [x] **P3b**: Apply exponential backoff + token-based throttling on retryable status codes
-- **Current state**: ~~`ShmRetryPolicy`, `ShmRetryThrottling`, `ShmRetryState` all exist with full unit tests but are never invoked from the RPC call path.~~ `ShmHandler` already had retry wiring. `ShmControlHandler` now has matching retry loop: constructor accepts `ShmRetryPolicy?`/`ShmRetryThrottling?`, `SendAsync` uses `ShmRetryState` with exponential backoff, trailing header inspection, and token-bucket throttling. All 23 retry tests pass.
-- **Verification**: `ShmRetryPolicyTests`, `ShmHedgingTests`, `Retrier.SharedMemory` example
+### ✅ Kernel Calls: EQUIVALENT (Linux)
 
-### P4: Wire Telemetry Call Sites ✅
-- [x] **P4a**: Add `ShmTelemetry.Record*` calls at key points in `ShmConnection`, `ShmGrpcStream`, and `ShmHandler`
-- [x] **P4b**: Instrument: call start/end, message sent/received, errors, connection open/close, message sizes
-- **Current state**: ~~14 OTel counters/histograms/gauges + ActivitySource + `IShmStatsHandler` events defined (~500 lines) with **zero call sites** in the transport.~~ All 12 counters, 3 histograms, and 3 gauges now have live call sites in `ShmConnection` (connection lifecycle, ping/pong/RTT, window updates, BDP, errors) and `ShmGrpcStream` (stream start/close, message sent/received with compression info).
-- **Verification**: `ShmDiagnosticsTests`
-
-### P5: Parameterized Transport Test Runner ✅ (framework)
-- [x] **P5a**: Refactor `TransportTestBase` to support both TCP and SHM transport parameterization (matching Go's `listTestEnv()`)
-- [ ] **P5b**: Port the core TCP functional test scenarios to run over both transports via `[TestCase]` or `[TestFixture]` parameterization *(blocked by P6)*
-- **Current state**: ~~`TransportTestBase` is SHM-only.~~ `TransportKind` enum (Shm, Tcp) added. `TransportTestBase` accepts transport parameter with backward-compatible default. TCP path stubs `NotSupportedException` pending P6 server integration. Framework ready for `[TestFixture(TransportKind.Tcp)]` annotation.
-- **Verification**: All parameterized tests pass on SHM; TCP await P6
-
-### P6: Server-side ASP.NET Core Integration ✅
-- [x] **P6a**: Implement `IConnectionListenerFactory` or equivalent so `MapGrpcService<T>()` works over SHM
-- [x] **P6b**: Create `UseSharedMemory()` extension method for server builder
-- **Current state**: ~~Server-side has no framework integration.~~ New `Grpc.AspNetCore.Server.SharedMemory` project implements `IConnectionListenerFactory` → `IConnectionListener` → `ConnectionContext` chain. `ShmStream` wrapped as `IDuplexPipe` via `PipeReader.Create`/`PipeWriter.Create`. `UseSharedMemory(segmentName)` extension configures Kestrel. Core `Grpc.Net.SharedMemory` stays ASP.NET-free.
-- **Verification**: `builder.WebHost.UseSharedMemory("name"); app.MapGrpcService<T>();` pattern enabled
-
-### P7: Rewrite Examples to Dialer-only Pattern ✅
-- [x] **P7a**: Convert all 7 raw-`ShmConnection` client examples to use `ShmHandler` + `GrpcChannel` + generated stubs
-- [ ] **P7b**: Convert all 19 server examples to use ASP.NET Core integration (depends on P6)
-- **Current state**: All 7 raw client examples converted. Created shared `Echo.SharedMemory/Proto/` with `echo.proto` for 6 echo-based examples. RouteGuide reduced from 268 lines of manual framing to ~140 lines using generated stubs. All csproj files standardized to net9.0/2.70.0.
-- **Go reference**: ALL Go examples use `grpc.WithShmTransport()` on client + `grpc.NewServer().Serve(shmListener)` on server — the **only** difference from TCP.
-- **Verification**: All 7 examples build with 0 warnings, 0 errors. 192 tests pass.
-
-### P8: TCP Fallback + Mixed Transport ✅
-- [x] **P8a**: Implement `ShmFallbackHandler` — `HttpMessageHandler` that tries SHM first, falls back to TCP (`dialShmWithFallback` equivalent)
-- [x] **P8b**: Support mixed transport via `ShmServicePolicy` with 4 policies: disabled / preferred / required / auto
-- [x] **P8c**: Fast-path optimization (after first SHM failure, subsequent calls skip SHM), observability counters (`ShmAttempts`, `ShmSuccesses`, `TcpFallbacks`), `RecordTransportSelected` telemetry
-- **Commit**: `d6f8ede2`
-- **Verification**: 25 new `ShmFallbackTests` — all policy modes, fallback behavior, fast-path, counter correctness, dispose semantics. 217 tests pass (2 pre-existing timeouts).
-
-### P9: Security Handshake ✅
-- [x] **P9a**: `IShmSecurityHandshaker` interface + `ShmAuthInfo` + `HandshakeErrorCode` enum + `ShmHandshakeException`
-- [x] **P9b**: `ShmSecurityHandshaker` with 3-step Init→Resp→Ack protocol, PID-based identity, `VerifyIdentity` callback, crypto-random 16-byte nonces, Go-compatible wire format
-- [x] **P9c**: Frame types 0x20-0x23 added; wired into `ShmControlHandler.Handshaker` (client) and `ShmConnectionListener.Handshaker` (server) properties
-- **Commit**: `1882002f`
-- **Verification**: 24 new `ShmSecurityTests` — wire encoding round-trips, Go wire format verification, full protocol simulation (success, server-reject, client-reject, mutual verification, cancellation, unexpected frames). 241 tests pass (2 pre-existing timeouts).
-
----
-
-## Current Status Summary
-
-| Criterion | Rating | Details |
-|-----------|--------|---------|
-| **Minimal memory copies** | **A-** | Pooled buffers via ArrayPool on send + receive; same copy count, zero GC pressure |
-| **Minimal kernel calls** | **A** | Equivalent to Go (adaptive spin + futex on Linux) |
-| **Full gRPC integration** | **B+** | Client ShmHandler + ShmControlHandler; server ShmConnectionListener + ASP.NET Core integration; 7 modernized examples |
-| **Feature parity with Go** | **A-** | Core transport, compression, retry, telemetry, TCP fallback with policy, security handshake — all wired. Load balancing integration remains. |
-| **Test parity with TCP** | **B** | 327 tests covering all TCP categories, but separate codebase (not parameterized) |
-| **E2E example parity** | **D** | 3/19 clients follow dialer pattern; 0/19 servers follow it |
-
----
-
-## Detailed Reference Data
-
-### Memory Copy Analysis
-
-**Send Path (per message of N bytes):**
-| Copy | Location | Size | Description |
-|------|----------|------|-------------|
-| #1 | `ShmHandler.SendMessagesAsync` | N | HTTP content stream → `new byte[length]` |
-| #2 | `FrameProtocol.WriteFrame` → `WriteToReservation` | N | Heap buffer → shared memory ring |
-
-**Receive Path (per message of N bytes):**
-| Copy | Location | Size | Description |
-|------|----------|------|-------------|
-| #1 | `FrameProtocol.ReadFrame` → `CopyFromReservation` | N+5 | Shared memory ring → `new byte[header.Length]` |
-| #2 | `ShmResponseContent.SerializeToStreamAsync` | N | Heap → HTTP output stream |
-
-### Kernel Call Analysis (Linux)
-
-| Operation | Best Case | Typical | Worst Case |
-|-----------|-----------|---------|------------|
-| **Send** | 0 (spin succeeds) | 1 (futex WAKE) | 2 (WAIT + WAKE) |
-| **Receive** | 0 (spin succeeds) | 1 (futex WAKE) | 4 (2×WAIT + 2×WAKE) |
-
-### Feature Parity Inventory
-
-| Feature | Go | .NET | Status |
+| Syscall | Go | .NET | Status |
 |---------|-----|------|--------|
-| SPSC Ring Buffer | Full | Full | ✅ MATCH |
-| Frame Protocol (16B header, 13 types) | Full | Full | ✅ MATCH |
-| Segment Layout (128B header) | Full | Byte-compatible | ✅ MATCH |
-| Binary Headers/Trailers | Full | HeadersV1/TrailersV1 | ✅ MATCH |
-| Stream Multiplexing | Full | Full | ✅ MATCH |
-| Flow Control (conn + stream windows) | Full | Full | ✅ MATCH |
-| BDP Estimation | Full | Full | ✅ MATCH |
-| Keepalive (client + server) | Full | Full | ✅ MATCH |
-| Graceful Shutdown (GOAWAY) | Full | Basic | ⚠️ PARTIAL |
-| Control Segment Protocol | Full | Full | ✅ MATCH |
-| Compression | Transparent via gRPC | Infra exists, **throws at runtime** | ❌ NOT WIRED |
-| Retry / Hedging | Transparent via gRPC | Infra exists, **never called** | ❌ NOT WIRED |
-| Telemetry / OTel | Standard gRPC stats | 14 metrics defined, **zero call sites** | ❌ NOT WIRED |
-| Health Checks | Standard gRPC health | Standalone, not integrated | ❌ NOT WIRED |
-| Load Balancing | ShmPreferPicker + selector | Abstractions only | ❌ NOT WIRED |
-| TCP Fallback | `dialShmWithFallback` | Not implemented | ❌ MISSING |
-| Mixed Transport | `AllowMixedTransport` | Not implemented | ❌ MISSING |
-| Security Handshake | 3-step nonce protocol | Not implemented | ❌ MISSING |
-| Stream Scheduler | Weighted fair queueing | Not implemented | ❌ MISSING |
-| `shm://` Resolver | Built-in | Not implemented | ❌ MISSING |
+| **futex WAIT** | `syscall(SYS_FUTEX, ptr, FUTEX_WAIT, val, timeout)` | `Syscall.SysCall(SYS_futex, ptr, FUTEX_WAIT, val, timeout)` | ✅ |
+| **futex WAKE** | `syscall(SYS_FUTEX, ptr, FUTEX_WAKE, 1)` | `Syscall.SysCall(SYS_futex, ptr, FUTEX_WAKE, 1)` | ✅ |
+| **Cross-process** | Non-PRIVATE futex | Non-PRIVATE futex | ✅ |
+| **Adaptive spin** | Spin → block pattern | Same pattern | ✅ |
 
-### Test Coverage
+### ⚠️ Windows: Slight Difference
 
-| Category | TCP Tests | SHM Tests | SHM Coverage |
-|----------|-----------|-----------|--------------|
-| Unary | 17 | 10 | Partial |
-| Streaming | 27 | 21 | Good |
-| Cancellation | 15 | 8 | Partial |
-| Deadline | 8 | 11 | Exceeds |
-| Metadata | 6 | 15 | Exceeds |
-| Compression | 6 | 23 | Exceeds |
-| Retry | 13 | 19 | Exceeds |
-| Hedging | 11 | 8 | Partial |
-| Connection | 5 | 19 | Exceeds |
-| MaxMessageSize | 1 | 7 | Exceeds |
-| Interceptor | 1 | 7 | Exceeds |
-| Telemetry | 6 | 9 | Exceeds |
-| Lifetime | 3 | 10 | Exceeds |
-| **Total** | **~107** | **~327** | All categories covered |
+- **Go**: Uses `WaitOnAddress` API when available (in-process optimization)
+- **.NET**: Uses named events exclusively
+- **Impact**: Minimal for cross-process IPC (the primary use case)
 
-### Example Inventory
+---
 
-| Example | Client Pattern | Server Pattern | Dialer-only? |
-|---------|---------------|----------------|-------------|
-| Greeter.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Counter.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Error.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Channeler.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Downloader.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Mailer.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Racer.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Reflector.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Retrier.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Uploader.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Vigor.SharedMemory | ShmHandler ✅ | ShmControlListener ❌ | Client only |
-| Cancellation.SharedMemory | Raw ShmConnection ❌ | Raw ShmConnection ❌ | No |
-| Compression.SharedMemory | Raw ShmConnection ❌ | Raw ShmConnection ❌ | No |
-| Deadline.SharedMemory | Raw ShmConnection ❌ | Raw ShmConnection ❌ | No |
-| Interceptor.SharedMemory | Raw ShmConnection ❌ | Raw ShmConnection ❌ | No |
-| Keepalive.SharedMemory | Raw ShmConnection ❌ | Raw ShmConnection ❌ | No |
-| Metadata.SharedMemory | Raw ShmConnection ❌ | Raw ShmConnection ❌ | No |
-| RouteGuide.SharedMemory | Raw ShmConnection ❌ | Raw ShmConnection ❌ | No |
-| Progressor.SharedMemory | Mixed ❌ | Mixed ❌ | No |
+## 3. TCP E2E Examples vs SHM Equivalents
+
+### Current State
+
+| TCP Example | SHM Equivalent | Coverage |
+|-------------|----------------|----------|
+| **Greeter** (Unary) | ✅ `Greeter.SharedMemory/` | Basic unary RPC |
+| **Counter** (4 RPC types) | ❌ | Streaming demos |
+| **Mailer** (Bidirectional) | ❌ | Long-running streams |
+| **Racer** (Bidirectional) | ❌ | Concurrent streams |
+| **Interceptor** | ❌ | Middleware patterns |
+| **Retrier** | ❌ | Retry policies |
+| **Compressor** | ❌ | Compression |
+| **Progressor** | ❌ | Progress reporting |
+| **Downloader/Uploader** | ❌ | Large binary payloads |
+| **Channeler** | ❌ | Multi-threaded |
+| **Error** | ❌ | Error handling |
+| **Vigor** (Health) | ❌ | Health checks |
+| **Reflector** | ❌ | Server reflection |
+
+**Gap: 1/30 examples (3%) have SHM equivalents**
+
+---
+
+## 4. A73 RFC Feature Compliance
+
+Based on the gRPC A73 RFC (shared memory transport proposal):
+
+### ✅ Fully Implemented (26 features)
+
+| Category | Features |
+|----------|----------|
+| **Core Architecture** | Segment header (128B), Dual ring buffers, Power-of-2 capacity |
+| **Zero-Copy** | MappedMemoryManager, Direct pointer operations, Reservation pattern |
+| **Frame Types** | All 10 types: PAD, HEADERS, MESSAGE, TRAILERS, CANCEL, GOAWAY, PING, PONG, HALFCLOSE, WINDOW_UPDATE |
+| **Flow Control** | Connection-level window, Stream-level window, WINDOW_UPDATE handling |
+| **Stream Multiplexing** | Stream IDs (odd=client, even=server), Max streams enforcement |
+| **Graceful Shutdown** | GOAWAY frame, Drain mode |
+| **Error Handling** | CANCEL frame (RST_STREAM equiv), Trailers with error status |
+| **Synchronization** | Linux futex (FUTEX_WAIT/WAKE), Windows named events |
+
+### ❌ Missing A73 Features (Priority Order)
+
+| # | Feature | A73 Requirement | Priority |
+|---|---------|-----------------|----------|
+| 1 | **BDP Estimation** | Dynamic window sizing based on bandwidth-delay product | P1 |
+| 2 | **Keepalive Task** | Background task sending periodic PINGs | P1 |
+| 3 | **Keepalive Parameters** | Configurable Time, Timeout, PermitWithoutStream | P1 |
+| 4 | **Ping Strike Enforcement** | Detect "too many pings" → GOAWAY | P2 |
+
+### ⚠️ Partially Implemented
+
+| Feature | Status |
+|---------|--------|
+| **BDP PING flag** | Flag defined but unused |
+| **GOAWAY active stream handling** | Basic support, no stream count tracking on shutdown |
+| **Cross-process E2E tests** | In-process only, no true cross-process verification |
+
+---
+
+## 5. Summary of Gaps
+
+| Area | Status | Gap Severity |
+|------|--------|--------------|
+| **Zero-copy implementation** | ✅ Equivalent to Go | ✅ No gap |
+| **Kernel call efficiency** | ✅ Equivalent to Go | ✅ No gap |
+| **A73 Core features** | ~86% implemented | ⚠️ Missing BDP, Keepalive |
+| **Test coverage vs TCP** | ~40% equivalent | ❌ **60% gap** |
+| **E2E examples** | 3% equivalent | ❌ **97% gap** |
+
+---
+
+## 6. Recommended Priority Actions
+
+### Phase 1: A73 Feature Gaps (P1)
+
+1. **BDP Estimation** - Dynamic window sizing based on measured bandwidth
+2. **Keepalive Background Task** - Periodic PING sending with configurable parameters
+3. **Keepalive Configuration** - Time, Timeout, PermitWithoutStream options
+
+### Phase 2: Test Coverage (P1)
+
+1. Add cross-process E2E tests (true IPC verification)
+2. Port key TCP functional tests: `StreamingTests`, `CancellationTests`, `ConnectionTests`
+3. Add flow control stress tests
+
+### Phase 3: Examples (P2)
+
+1. `Counter.SharedMemory` - All 4 RPC types
+2. `Streaming.SharedMemory` - Focus streaming patterns
+3. `Error.SharedMemory` - Error handling patterns
+
+### Phase 4: Advanced Features (P2)
+
+1. Ping strike enforcement
+2. Compression support
+3. SHM-aware load balancer/resolver

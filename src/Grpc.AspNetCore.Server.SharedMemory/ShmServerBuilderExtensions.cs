@@ -72,8 +72,9 @@ public static class ShmServerBuilderExtensions
         {
             kestrelOptions.Listen(new ShmEndPoint(segmentName), listenOptions =>
             {
-                // Register the SHM transport factory for this listener
-                listenOptions.UseConnectionHandler<ShmConnectionHandler>();
+                // Use HTTP/2 prior-knowledge mode (h2c) — no TLS needed for local IPC.
+                // Kestrel's HTTP/2 engine runs over the ShmStream byte transport.
+                listenOptions.Protocols = HttpProtocols.Http2;
             });
         });
 
@@ -86,21 +87,5 @@ public static class ShmServerBuilderExtensions
         });
 
         return webHostBuilder;
-    }
-}
-
-/// <summary>
-/// A no-op connection handler — Kestrel's HTTP/2 processing handles everything.
-/// The shared memory transport is at the transport layer (IConnectionListenerFactory),
-/// so the connection handler doesn't need to do anything special.
-/// </summary>
-internal sealed class ShmConnectionHandler : ConnectionHandler
-{
-    public override Task OnConnectedAsync(ConnectionContext connection)
-    {
-        // Kestrel's HTTP/2 handling takes over from here automatically
-        // when the transport is registered via IConnectionListenerFactory.
-        // This handler is a placeholder for the Listen() API binding.
-        return Task.CompletedTask;
     }
 }

@@ -608,6 +608,23 @@ public sealed class Segment : IDisposable
         return Open(ctlName);
     }
 
+    /// <summary>
+    /// Unmaps the shared memory region without closing / cleaning up the backing file.
+    /// Used by clients that need to release the mapping while the server retains ownership.
+    /// </summary>
+    public void UnmapWithoutClose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        RingA.Dispose();
+        RingB.Dispose();
+        _memoryManager.Dispose();
+        _accessor.Dispose();
+        _mappedFile.Dispose();
+        // Intentionally do NOT delete the backing file
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

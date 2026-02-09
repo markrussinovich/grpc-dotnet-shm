@@ -16,13 +16,10 @@
 
 #endregion
 
-using Echo;
+using System.Net;
+using System.Text;
 using Grpc.Core;
-using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
-
-// The ONLY transport difference from TCP is using ShmHandler instead of the default HttpHandler.
-// All gRPC API usage (deadlines, cancellation, metadata, etc.) remains identical.
 
 const string SegmentName = "deadline_shm";
 
@@ -30,72 +27,84 @@ Console.WriteLine("Deadline Example - Shared Memory Client");
 Console.WriteLine($"Connecting to shm://{SegmentName}");
 Console.WriteLine();
 
-try
-{
-    using var handler = new ShmHandler(SegmentName);
-    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
-    {
-        HttpHandler = handler
-    });
+using var connection = ShmConnection.ConnectAsClient(SegmentName);
+Console.WriteLine("Connected to server");
+Console.WriteLine();
 
-    var client = new Echo.Echo.EchoClient(channel);
-    Console.WriteLine("Connected to server");
-    Console.WriteLine();
+// Test cases matching the Go example:
+// 1. A successful request
+await UnaryCall(connection, 1, "world", StatusCode.OK);
 
-    // Test cases matching the Go example:
+// 2. Exceeds deadline (message contains "delay")
+await UnaryCall(connection, 2, "delay", StatusCode.DeadlineExceeded);
 
-    // 1. A successful request within the deadline
-    await UnaryCall(client, 1, "world", StatusCode.OK);
+// 3. A successful request with propagated deadline
+await UnaryCall(connection, 3, "[propagate me]world", StatusCode.OK);
 
-    // 2. Exceeds deadline (server delays when message contains "delay")
-    await UnaryCall(client, 2, "delay", StatusCode.DeadlineExceeded);
-
-    // 3. A successful request with propagated deadline
-    await UnaryCall(client, 3, "[propagate me]world", StatusCode.OK);
-
-    // 4. Exceeds propagated deadline
-    await UnaryCall(client, 4, "[propagate me][propagate me]world", StatusCode.DeadlineExceeded);
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"Error: {ex.Message}");
-    Console.WriteLine();
-    Console.WriteLine("Make sure the server is running first:");
-    Console.WriteLine("  cd examples/Deadline.SharedMemory/Server");
-    Console.WriteLine("  dotnet run");
-}
+// 4. Exceeds propagated deadline
+await UnaryCall(connection, 4, "[propagate me][propagate me]world", StatusCode.DeadlineExceeded);
 
 Console.WriteLine();
 Console.WriteLine("All deadline tests completed!");
 
-async Task UnaryCall(Echo.Echo.EchoClient client, int requestId, string message, StatusCode expectedCode)
+async Task UnaryCall(ShmConnection conn, int requestId, string message, StatusCode expectedCode)
 {
+    var stream = conn.CreateStream();
+    var deadline = DateTime.UtcNow.AddSeconds(1); // 1 second deadline
+
     try
     {
-        // Set a 1-second deadline for the call
-        var options = new CallOptions(deadline: DateTime.UtcNow.AddSeconds(1));
+        // Send request with deadline
+        await stream.SendRequestHeadersAsync("/echo.Echo/UnaryEcho", SegmentName, null, deadline);
 
-        var response = await client.UnaryEchoAsync(
-            new EchoRequest { Message = message }, options);
+        // Send message
+        var messageBytes = Encoding.UTF8.GetBytes(message);
+        var framedMessage = new byte[5 + messageBytes.Length];
+        framedMessage[0] = 0;
+        var lengthBytes = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(messageBytes.Length));
+        Buffer.BlockCopy(lengthBytes, 0, framedMessage, 1, 4);
+        Buffer.BlockCopy(messageBytes, 0, framedMessage, 5, messageBytes.Length);
+        await stream.SendMessageAsync(framedMessage);
+        await stream.SendTrailersAsync(StatusCode.OK); // Half-close
 
-        Console.WriteLine($"request {requestId}: wanted = {expectedCode}, got = OK");
+        // Wait for response with timeout
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
 
-        if (expectedCode != StatusCode.OK)
+        try
         {
-            Console.WriteLine($"  WARNING: Expected {expectedCode} but got OK");
+            // Receive headers
+            await stream.ReceiveFrameAsync(cts.Token);
+
+            // Receive response
+            var frame = await stream.ReceiveFrameAsync(cts.Token);
+            if (frame?.Type == FrameType.Data)
+            {
+                var response = Encoding.UTF8.GetString(frame.Value.Payload.AsSpan(5));
+                Console.WriteLine($"request {requestId}: wanted = {expectedCode}, got = {StatusCode.OK}");
+
+                if (expectedCode != StatusCode.OK)
+                {
+                    Console.WriteLine($"  WARNING: Expected {expectedCode} but got OK");
+                }
+            }
+            else if (frame?.Type == FrameType.Trailers)
+            {
+                // Parse trailers for status
+                var trailers = TrailersV1.Decode(frame.Value.Payload);
+                Console.WriteLine($"request {requestId}: wanted = {expectedCode}, got = {trailers.GrpcStatusCode}");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine($"request {requestId}: wanted = {expectedCode}, got = {StatusCode.DeadlineExceeded}");
         }
     }
-    catch (RpcException ex) when (ex.StatusCode == StatusCode.DeadlineExceeded)
+    catch (Exception ex)
     {
-        Console.WriteLine($"request {requestId}: wanted = {expectedCode}, got = DeadlineExceeded");
-
-        if (expectedCode != StatusCode.DeadlineExceeded)
-        {
-            Console.WriteLine($"  WARNING: Expected {expectedCode} but got DeadlineExceeded");
-        }
+        Console.WriteLine($"request {requestId}: error - {ex.Message}");
     }
-    catch (RpcException ex)
+    finally
     {
-        Console.WriteLine($"request {requestId}: unexpected error - {ex.StatusCode}: {ex.Status.Detail}");
+        stream.Dispose();
     }
 }

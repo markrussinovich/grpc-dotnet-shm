@@ -98,6 +98,11 @@ public static class ShmTelemetry
         "errors",
         "Number of errors on shared memory transport");
 
+    private static readonly Counter<long> _transportSelectedCounter = Meter.CreateCounter<long>(
+        "shm.transport.selected",
+        "selections",
+        "Number of transport selections (shm vs tcp fallback)");
+
     // Histograms
     private static readonly Histogram<double> _rttHistogram = Meter.CreateHistogram<double>(
         "shm.rtt",
@@ -238,6 +243,16 @@ public static class ShmTelemetry
     }
 
     /// <summary>
+    /// Records which transport was selected (shared memory or TCP fallback).
+    /// </summary>
+    public static void RecordTransportSelected(string transport, string target)
+    {
+        _transportSelectedCounter.Add(1,
+            new KeyValuePair<string, object?>("transport", transport),
+            new KeyValuePair<string, object?>("target", target));
+    }
+
+    /// <summary>
     /// Records an error.
     /// </summary>
     public static void RecordError(string errorType, string message)
@@ -245,16 +260,6 @@ public static class ShmTelemetry
         _errorsCounter.Add(1,
             new KeyValuePair<string, object?>("type", errorType),
             new KeyValuePair<string, object?>("message", message));
-    }
-
-    /// <summary>
-    /// Records a transport selection decision (SHM vs TCP fallback).
-    /// </summary>
-    public static void RecordTransportSelected(string transport, string target)
-    {
-        _errorsCounter.Add(0,
-            new KeyValuePair<string, object?>("type", $"transport_selected_{transport}"),
-            new KeyValuePair<string, object?>("message", target));
     }
 
     /// <summary>

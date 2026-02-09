@@ -18,7 +18,6 @@
 
 using Google.Protobuf;
 using Grpc.Core;
-using Grpc.Net.SharedMemory;
 using Retry;
 
 namespace Server.Services;
@@ -43,26 +42,5 @@ public class RetrierService : Retrier.RetrierBase
         {
             Message = $"+ {request.Name}"
         });
-    }
-
-    /// <summary>
-    /// Handles method calls for shared memory transport.
-    /// </summary>
-    public Task<byte[]> HandleMethodAsync(ShmGrpcStream stream, string method, ReadOnlyMemory<byte> requestData)
-    {
-        // Simulate intermittent failures
-        if (_random.NextDouble() > DeliverySuccessRate)
-        {
-            throw new RpcException(new Status(StatusCode.Unavailable, "Delivery temporarily unavailable"));
-        }
-
-        // For demonstration, parse the package name from the method
-        // In production, requestData would contain the serialized Package message
-        var response = new Response
-        {
-            Message = $"+ Package delivered via {method}"
-        };
-
-        return Task.FromResult(response.ToByteArray());
     }
 }

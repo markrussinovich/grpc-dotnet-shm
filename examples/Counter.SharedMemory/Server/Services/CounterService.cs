@@ -20,7 +20,6 @@ using Count;
 using Google.Protobuf;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
-using Grpc.Net.SharedMemory;
 
 namespace Server.Services;
 
@@ -67,40 +66,5 @@ public class CounterService : Counter.CounterBase
         }
 
         Console.WriteLine("  Countdown: complete");
-    }
-
-    /// <summary>
-    /// Handles method calls for shared memory transport.
-    /// </summary>
-    public async Task<byte[]?> HandleMethodAsync(ShmGrpcStream stream, string method, CancellationToken cancellationToken)
-    {
-        // Route based on method name
-        if (method.EndsWith("IncrementCount"))
-        {
-            _counter.Increment(1);
-            var reply = new CounterReply { Count = _counter.Count };
-            return reply.ToByteArray();
-        }
-        else if (method.EndsWith("AccumulateCount"))
-        {
-            // For client streaming, we'd need to read multiple messages from the stream
-            // This is a simplified implementation
-            _counter.Increment(1);
-            var reply = new CounterReply { Count = _counter.Count };
-            return reply.ToByteArray();
-        }
-        else if (method.EndsWith("Countdown"))
-        {
-            // For server streaming, send multiple messages
-            for (var i = Math.Min(_counter.Count, 10); i >= 0; i--)
-            {
-                var reply = new CounterReply { Count = i };
-                await stream.SendMessageAsync(reply.ToByteArray());
-                await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
-            }
-            return null; // Messages already sent
-        }
-
-        throw new RpcException(new Status(StatusCode.Unimplemented, $"Method not found: {method}"));
     }
 }

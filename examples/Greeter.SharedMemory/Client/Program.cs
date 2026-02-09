@@ -20,49 +20,20 @@ using Greet;
 using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
 
-Console.WriteLine("Greeter Client - Shared Memory Transport");
-Console.WriteLine("=========================================");
-Console.WriteLine();
-
-// The segment name must match what the server creates
+// The segment name must match the server's UseSharedMemory() segment name
 const string SegmentName = "greeter_shm_example";
 
-Console.WriteLine($"Connecting to shared memory segment: {SegmentName}");
-Console.WriteLine("(Make sure the server is running first!)");
-Console.WriteLine();
-
-try
+using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
 {
-    // Create a channel using the shared memory handler
-    // The address is a placeholder - actual transport is via shared memory
-    using var handler = new ShmHandler(SegmentName);
-    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
-    {
-        HttpHandler = handler
-    });
+    HttpHandler = new ShmHttpHandler(SegmentName),
+    DisposeHttpClient = true
+});
 
-    var client = new Greeter.GreeterClient(channel);
+var client = new Greeter.GreeterClient(channel);
 
-    // Make a unary call
-    Console.Write("Enter your name: ");
-    var name = Console.ReadLine() ?? "World";
+var reply = await client.SayHelloAsync(new HelloRequest { Name = "GreeterClient" });
+Console.WriteLine("Greeting: " + reply.Message);
 
-    Console.WriteLine($"Sending request to SayHello(\"{name}\")...");
-
-    var reply = await client.SayHelloAsync(new HelloRequest { Name = name });
-
-    Console.WriteLine();
-    Console.WriteLine($"Response received: {reply.Message}");
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"Error: {ex.Message}");
-    Console.WriteLine();
-    Console.WriteLine("Make sure the server is running first:");
-    Console.WriteLine("  cd examples/Greeter.SharedMemory/Server");
-    Console.WriteLine("  dotnet run");
-}
-
-Console.WriteLine();
+Console.WriteLine("Shutting down");
 Console.WriteLine("Press any key to exit...");
 Console.ReadKey();

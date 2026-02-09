@@ -269,7 +269,7 @@ public class Program
         // Read and respond to each message
         await foreach (var requestData in stream.ReceiveMessagesAsync(ct).ConfigureAwait(false))
         {
-            var request = SimpleRequest.Parser.ParseFrom(requestData);
+            var request = SimpleRequest.Parser.ParseFrom(requestData.Span);
             var responseSize = request.ResponseSize;
             var payload = BenchmarkServiceImpl.GetOrCreatePayload(responseSize);
 
