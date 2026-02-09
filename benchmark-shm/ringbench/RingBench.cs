@@ -2,10 +2,14 @@
 // Compares: SHM ring buffer vs TCP loopback (raw socket)
 // Output: JSON results file + console summary
 //
+// IMPORTANT: All SHM benchmarks use CROSS-THREAD patterns matching Go exactly:
+//   - Streaming: writer thread + reader thread on same ring (concurrent)
+//   - Roundtrip: two rings + echo thread (ping-pong pattern)
+//
 // Go equivalents:
-//   BenchmarkShmRingWriteRead      → ShmRingWriteRead
-//   BenchmarkShmRingRoundtrip      → ShmRingRoundtrip
-//   BenchmarkShmRingLargePayloads  → ShmRingLargePayloads
+//   BenchmarkShmRingWriteRead      → ShmRingWriteRead      (writer+reader goroutines, 1 ring)
+//   BenchmarkShmRingRoundtrip      → ShmRingRoundtrip      (echo goroutine, 2 rings)
+//   BenchmarkShmRingLargePayloads  → ShmRingLargePayloads  (writer+reader goroutines, 1 ring)
 //   BenchmarkTCPLoopback           → TCPLoopback
 //   BenchmarkTCPLoopbackRoundtrip  → TCPLoopbackRoundtrip
 //   BenchmarkTCPLargePayloads      → TCPLargePayloads
@@ -43,7 +47,6 @@ sealed class RingBench
 
         // 4 MB ring capacity (fits in /dev/shm, large enough for 1MB messages)
         ulong ringCapacity = 4 * 1024 * 1024;
-        var segmentName = "ringbench";
 
         var cpu = GetCpuInfo();
         Console.WriteLine($"CPU: {cpu}");
@@ -51,152 +54,158 @@ sealed class RingBench
         Console.WriteLine($"Ring capacity: {ringCapacity / 1024 / 1024} MB");
         Console.WriteLine();
 
-        var segment = Segment.Create(segmentName, ringCapacity);
-        try
+        // === SHM Ring Write+Read (one-way, cross-thread) ===
+        // Go: writer goroutine + reader goroutine on SAME ring, concurrent
+        Console.WriteLine("=== SHM Ring Write+Read (= Go BenchmarkShmRingWriteRead) ===");
+        Console.WriteLine("    [cross-thread: writer thread + reader thread on same ring]");
+        PrintTableHeader();
+        foreach (var size in StreamingSizes)
         {
-            // === SHM Ring Write+Read (one-way) ===
-            Console.WriteLine("=== SHM Ring Write+Read (= Go BenchmarkShmRingWriteRead) ===");
-            PrintTableHeader();
-            foreach (var size in StreamingSizes)
-            {
-                if ((ulong)size > ringCapacity / 2) continue;
-                var r = BenchShmWriteRead(segment.RingA, size);
-                AllResults[$"ShmRingWriteRead/size={size}"] = r;
-                PrintRow(size, r);
-            }
-            Console.WriteLine();
-
-            // === SHM Ring Roundtrip ===
-            Console.WriteLine("=== SHM Ring Roundtrip (= Go BenchmarkShmRingRoundtrip) ===");
-            PrintTableHeader();
-            foreach (var size in RoundtripSizes)
-            {
-                var r = BenchShmWriteRead(segment.RingA, size);
-                AllResults[$"ShmRingRoundtrip/size={size}"] = r;
-                PrintRow(size, r);
-            }
-            Console.WriteLine();
-
-            // === SHM Large Payload ===
-            Console.WriteLine("=== SHM Large Payloads (= Go BenchmarkShmRingLargePayloads) ===");
-            PrintTableHeader();
-            foreach (var size in LargePayloadSizes)
-            {
-                if ((ulong)size > ringCapacity / 2) continue;
-                var r = BenchShmLargePayload(segment.RingA, size);
-                AllResults[$"ShmRingLargePayloads/size={size}"] = r;
-                PrintRow(size, r);
-            }
-            Console.WriteLine();
-
-            // === SHM Large Payload Roundtrip ===
-            Console.WriteLine("=== SHM Large Payloads Roundtrip (= Go BenchmarkShmRingLargePayloadsRoundtrip) ===");
-            PrintTableHeader();
-            foreach (var size in LargePayloadSizes)
-            {
-                if ((ulong)size > ringCapacity / 2) continue;
-                var r = BenchShmLargePayload(segment.RingA, size);
-                AllResults[$"ShmRingLargePayloadsRoundtrip/size={size}"] = r;
-                PrintRow(size, r);
-            }
-            Console.WriteLine();
-
-            // === TCP Loopback (one-way) ===
-            Console.WriteLine("=== TCP Loopback (= Go BenchmarkTCPLoopback) ===");
-            PrintTableHeader();
-            foreach (var size in StreamingSizes)
-            {
-                var r = BenchTcpOneWay(size);
-                AllResults[$"TCPLoopback/size={size}"] = r;
-                PrintRow(size, r);
-            }
-            Console.WriteLine();
-
-            // === TCP Roundtrip ===
-            Console.WriteLine("=== TCP Roundtrip (= Go BenchmarkTCPLoopbackRoundtrip) ===");
-            PrintTableHeader();
-            foreach (var size in RoundtripSizes)
-            {
-                var r = BenchTcpRoundtrip(size);
-                AllResults[$"TCPLoopbackRoundtrip/size={size}"] = r;
-                PrintRow(size, r);
-            }
-            Console.WriteLine();
-
-            // === TCP Large Payload ===
-            Console.WriteLine("=== TCP Large Payloads (= Go BenchmarkTCPLargePayloads) ===");
-            PrintTableHeader();
-            foreach (var size in LargePayloadSizes)
-            {
-                var r = BenchTcpOneWay(size);
-                AllResults[$"TCPLargePayloads/size={size}"] = r;
-                PrintRow(size, r);
-            }
-            Console.WriteLine();
-
-            // === TCP Large Payload Roundtrip ===
-            Console.WriteLine("=== TCP Large Payloads Roundtrip (= Go BenchmarkTCPLargePayloadsRoundtrip) ===");
-            PrintTableHeader();
-            foreach (var size in LargePayloadSizes)
-            {
-                var r = BenchTcpRoundtrip(size);
-                AllResults[$"TCPLargePayloadsRoundtrip/size={size}"] = r;
-                PrintRow(size, r);
-            }
-            Console.WriteLine();
-
-            // Write JSON results
-            var jsonObj = new
-            {
-                timestamp = DateTime.UtcNow.ToString("o"),
-                cpu,
-                runtime = RuntimeInformation.FrameworkDescription,
-                ring_capacity_mb = ringCapacity / 1024 / 1024,
-                benchmarks = AllResults.ToDictionary(
-                    kv => kv.Key,
-                    kv => new { ns_per_op = Math.Round(kv.Value.NsPerOp, 1), mb_per_s = Math.Round(kv.Value.MBps, 2), ops = kv.Value.Ops }
-                )
-            };
-
-            var dir = Path.GetDirectoryName(Path.GetFullPath(outputFile));
-            if (!string.IsNullOrEmpty(dir))
-                Directory.CreateDirectory(dir);
-            File.WriteAllText(outputFile, JsonSerializer.Serialize(jsonObj, new JsonSerializerOptions { WriteIndented = true }));
-            Console.WriteLine($"Results written to: {outputFile}");
+            if ((ulong)size > ringCapacity / 2) continue;
+            using var seg = Segment.Create($"ringbench_wr_{size}", ringCapacity);
+            var r = BenchShmWriteRead(seg.RingA, size);
+            AllResults[$"ShmRingWriteRead/size={size}"] = r;
+            PrintRow(size, r);
         }
-        finally
+        Console.WriteLine();
+
+        // === SHM Ring Roundtrip (cross-thread, 2 rings) ===
+        // Go: echo goroutine on 2 rings (clientToServer + serverToClient)
+        Console.WriteLine("=== SHM Ring Roundtrip (= Go BenchmarkShmRingRoundtrip) ===");
+        Console.WriteLine("    [cross-thread: 2 rings, echo thread, client writes→reads]");
+        PrintTableHeader();
+        foreach (var size in RoundtripSizes)
         {
-            segment.Dispose();
-            foreach (var f in Directory.GetFiles("/dev/shm/", "grpc_shm_ringbench*"))
-                File.Delete(f);
+            using var seg = Segment.Create($"ringbench_rt_{size}", ringCapacity);
+            var r = BenchShmRoundtrip(seg.RingA, seg.RingB, size);
+            AllResults[$"ShmRingRoundtrip/size={size}"] = r;
+            PrintRow(size, r);
         }
+        Console.WriteLine();
+
+        // === SHM Large Payload (cross-thread) ===
+        // Go: writer goroutine ReserveWrite + reader goroutine ReadSlices, same ring
+        Console.WriteLine("=== SHM Large Payloads (= Go BenchmarkShmRingLargePayloads) ===");
+        Console.WriteLine("    [cross-thread: writer thread + reader thread on same ring]");
+        PrintTableHeader();
+        foreach (var size in LargePayloadSizes)
+        {
+            if ((ulong)size > ringCapacity / 2) continue;
+            using var seg = Segment.Create($"ringbench_lp_{size}", ringCapacity);
+            var r = BenchShmWriteRead(seg.RingA, size);
+            AllResults[$"ShmRingLargePayloads/size={size}"] = r;
+            PrintRow(size, r);
+        }
+        Console.WriteLine();
+
+        // === SHM Large Payload Roundtrip (cross-thread, 2 rings) ===
+        // Go: echo goroutine, ReadBlockingContext + WriteAll, 2 rings
+        Console.WriteLine("=== SHM Large Payloads Roundtrip (= Go BenchmarkShmRingLargePayloadsRoundtrip) ===");
+        Console.WriteLine("    [cross-thread: 2 rings, echo thread, chunked transfer]");
+        PrintTableHeader();
+        foreach (var size in LargePayloadSizes)
+        {
+            if ((ulong)size > ringCapacity / 2) continue;
+            using var seg = Segment.Create($"ringbench_lprt_{size}", ringCapacity);
+            var r = BenchShmRoundtrip(seg.RingA, seg.RingB, size);
+            AllResults[$"ShmRingLargePayloadsRoundtrip/size={size}"] = r;
+            PrintRow(size, r);
+        }
+        Console.WriteLine();
+
+        // === TCP Loopback (one-way) ===
+        Console.WriteLine("=== TCP Loopback (= Go BenchmarkTCPLoopback) ===");
+        PrintTableHeader();
+        foreach (var size in StreamingSizes)
+        {
+            var r = BenchTcpOneWay(size);
+            AllResults[$"TCPLoopback/size={size}"] = r;
+            PrintRow(size, r);
+        }
+        Console.WriteLine();
+
+        // === TCP Roundtrip ===
+        Console.WriteLine("=== TCP Roundtrip (= Go BenchmarkTCPLoopbackRoundtrip) ===");
+        PrintTableHeader();
+        foreach (var size in RoundtripSizes)
+        {
+            var r = BenchTcpRoundtrip(size);
+            AllResults[$"TCPLoopbackRoundtrip/size={size}"] = r;
+            PrintRow(size, r);
+        }
+        Console.WriteLine();
+
+        // === TCP Large Payload ===
+        Console.WriteLine("=== TCP Large Payloads (= Go BenchmarkTCPLargePayloads) ===");
+        PrintTableHeader();
+        foreach (var size in LargePayloadSizes)
+        {
+            var r = BenchTcpOneWay(size);
+            AllResults[$"TCPLargePayloads/size={size}"] = r;
+            PrintRow(size, r);
+        }
+        Console.WriteLine();
+
+        // === TCP Large Payload Roundtrip ===
+        Console.WriteLine("=== TCP Large Payloads Roundtrip (= Go BenchmarkTCPLargePayloadsRoundtrip) ===");
+        PrintTableHeader();
+        foreach (var size in LargePayloadSizes)
+        {
+            var r = BenchTcpRoundtrip(size);
+            AllResults[$"TCPLargePayloadsRoundtrip/size={size}"] = r;
+            PrintRow(size, r);
+        }
+        Console.WriteLine();
+
+        // Write JSON results
+        var jsonObj = new
+        {
+            timestamp = DateTime.UtcNow.ToString("o"),
+            cpu,
+            runtime = RuntimeInformation.FrameworkDescription,
+            ring_capacity_mb = ringCapacity / 1024 / 1024,
+            benchmarks = AllResults.ToDictionary(
+                kv => kv.Key,
+                kv => new { ns_per_op = Math.Round(kv.Value.NsPerOp, 1), mb_per_s = Math.Round(kv.Value.MBps, 2), ops = kv.Value.Ops }
+            )
+        };
+
+        var dir = Path.GetDirectoryName(Path.GetFullPath(outputFile));
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        File.WriteAllText(outputFile, JsonSerializer.Serialize(jsonObj, new JsonSerializerOptions { WriteIndented = true }));
+        Console.WriteLine($"Results written to: {outputFile}");
+
+        // Clean up stale segments
+        foreach (var f in Directory.GetFiles("/dev/shm/", "grpc_shm_ringbench*"))
+            File.Delete(f);
     }
 
     // ========================================================================
-    // SHM Ring Benchmarks
+    // SHM Ring Benchmarks — cross-thread matching Go exactly
     // ========================================================================
 
+    /// <summary>
+    /// Cross-thread streaming benchmark matching Go BenchmarkShmRingWriteRead.
+    /// Writer thread writes N messages, reader thread reads N messages, SAME ring,
+    /// running concurrently. Measures throughput including cross-core sync overhead.
+    /// </summary>
     static BenchResult BenchShmWriteRead(ShmRing ring, int size)
     {
         var payload = new byte[size];
         Random.Shared.NextBytes(payload);
-        var readBuf = new byte[size];
 
-        // Warmup
-        for (int i = 0; i < Math.Min(1000, 100_000_000 / Math.Max(size, 1)); i++)
-        {
-            ring.Write(payload);
-            ring.Read(readBuf);
-        }
+        // Warmup with cross-thread pattern
+        int warmupCount = Math.Min(1000, 100_000_000 / Math.Max(size, 1));
+        RunCrossThreadWriteRead(ring, payload, size, warmupCount);
 
         // Calibrate iteration count (target ~2s)
         var sw = Stopwatch.StartNew();
         int calibOps = 0;
-        while (sw.ElapsedMilliseconds < 200)
+        while (sw.ElapsedMilliseconds < 300)
         {
-            ring.Write(payload);
-            ring.Read(readBuf);
-            calibOps++;
+            RunCrossThreadWriteRead(ring, payload, size, 100);
+            calibOps += 100;
         }
         sw.Stop();
         double nsPerCalib = (double)sw.ElapsedTicks / calibOps * 1_000_000_000.0 / Stopwatch.Frequency;
@@ -206,14 +215,7 @@ sealed class RingBench
         double bestNs = double.MaxValue;
         for (int run = 0; run < 3; run++)
         {
-            sw.Restart();
-            for (long i = 0; i < iterations; i++)
-            {
-                ring.Write(payload);
-                ring.Read(readBuf);
-            }
-            sw.Stop();
-            double ns = (double)sw.ElapsedTicks / iterations * 1_000_000_000.0 / Stopwatch.Frequency;
+            double ns = RunCrossThreadWriteRead(ring, payload, size, iterations);
             if (ns < bestNs) bestNs = ns;
         }
 
@@ -221,62 +223,157 @@ sealed class RingBench
         return new BenchResult(iterations, bestNs, mbps);
     }
 
-    static BenchResult BenchShmLargePayload(ShmRing ring, int size)
+    /// <summary>
+    /// Runs writer thread + reader thread on the SAME ring concurrently.
+    /// Returns ns/op (total time / ops).
+    /// Matches Go BenchmarkShmRingWriteRead: separate goroutines for write and read.
+    /// </summary>
+    static double RunCrossThreadWriteRead(ShmRing ring, byte[] payload, int size, long iterations)
+    {
+        var readBuf = new byte[size];
+        Exception? writerError = null;
+        Exception? readerError = null;
+
+        var readerReady = new ManualResetEventSlim(false);
+        var startGun = new ManualResetEventSlim(false);
+
+        // Reader thread
+        var readerThread = new Thread(() =>
+        {
+            try
+            {
+                readerReady.Set();
+                startGun.Wait();
+                for (long i = 0; i < iterations; i++)
+                {
+                    ring.Read(readBuf);
+                }
+            }
+            catch (Exception ex) { readerError = ex; }
+        });
+        readerThread.IsBackground = true;
+        readerThread.Start();
+
+        // Wait for reader to be ready
+        readerReady.Wait();
+
+        // Writer thread (this thread) — start timing when both are ready
+        var sw = Stopwatch.StartNew();
+        startGun.Set(); // release reader
+
+        try
+        {
+            for (long i = 0; i < iterations; i++)
+            {
+                ring.Write(payload);
+            }
+        }
+        catch (Exception ex) { writerError = ex; }
+
+        readerThread.Join();
+        sw.Stop();
+
+        if (writerError != null) throw writerError;
+        if (readerError != null) throw readerError;
+
+        return (double)sw.ElapsedTicks / iterations * 1_000_000_000.0 / Stopwatch.Frequency;
+    }
+
+    /// <summary>
+    /// Cross-thread roundtrip benchmark matching Go BenchmarkShmRingRoundtrip.
+    /// Uses TWO rings (clientToServer + serverToClient) with an echo thread.
+    /// Client writes to ringA, echo thread reads from ringA and writes to ringB,
+    /// client reads from ringB. Measures full cross-thread ping-pong latency.
+    /// </summary>
+    static BenchResult BenchShmRoundtrip(ShmRing clientToServer, ShmRing serverToClient, int size)
     {
         var payload = new byte[size];
         Random.Shared.NextBytes(payload);
-        var readBuf = new byte[size];
 
         // Warmup
-        for (int i = 0; i < 100; i++)
-        {
-            ring.Write(payload);
-            ring.Read(readBuf);
-        }
+        int warmupCount = Math.Min(500, 50_000_000 / Math.Max(size, 1));
+        RunCrossThreadRoundtrip(clientToServer, serverToClient, payload, size, warmupCount);
 
         // Calibrate
         var sw = Stopwatch.StartNew();
         int calibOps = 0;
-        while (sw.ElapsedMilliseconds < 200)
+        while (sw.ElapsedMilliseconds < 300)
         {
-            ring.Write(payload);
-            ring.Read(readBuf);
-            calibOps++;
+            RunCrossThreadRoundtrip(clientToServer, serverToClient, payload, size, 50);
+            calibOps += 50;
         }
         sw.Stop();
         double nsPerCalib = (double)sw.ElapsedTicks / calibOps * 1_000_000_000.0 / Stopwatch.Frequency;
-        long iterations = Math.Max(50, (long)(2_000_000_000.0 / nsPerCalib));
+        long iterations = Math.Max(100, (long)(2_000_000_000.0 / nsPerCalib));
 
-        // Batch write/read for throughput (like Go)
-        int batchSize = Math.Min(16, (int)((long)ring.Capacity / size / 2));
-        if (batchSize < 1) batchSize = 1;
-
+        // Run 3 times, take best
         double bestNs = double.MaxValue;
-        long bestOps = iterations;
         for (int run = 0; run < 3; run++)
         {
-            long totalOps = 0;
-            sw.Restart();
-            while (totalOps < iterations)
-            {
-                int batch = (int)Math.Min(batchSize, iterations - totalOps);
-                for (int i = 0; i < batch; i++)
-                    ring.Write(payload);
-                for (int i = 0; i < batch; i++)
-                    ring.Read(readBuf);
-                totalOps += batch;
-            }
-            sw.Stop();
-            double ns = (double)sw.ElapsedTicks / totalOps * 1_000_000_000.0 / Stopwatch.Frequency;
-            if (ns < bestNs)
-            {
-                bestNs = ns;
-                bestOps = totalOps;
-            }
+            double ns = RunCrossThreadRoundtrip(clientToServer, serverToClient, payload, size, iterations);
+            if (ns < bestNs) bestNs = ns;
         }
 
-        double mbps = size / bestNs * 1000.0;
-        return new BenchResult(bestOps, bestNs, mbps);
+        double mbps = (size * 2.0) / bestNs * 1000.0; // bidirectional
+        return new BenchResult(iterations, bestNs, mbps);
+    }
+
+    /// <summary>
+    /// Runs echo thread + client thread on TWO rings.
+    /// Echo: reads from clientToServer, writes to serverToClient.
+    /// Client: writes to clientToServer, reads from serverToClient.
+    /// Returns ns/op. Matches Go BenchmarkShmRingRoundtrip exactly.
+    /// </summary>
+    static double RunCrossThreadRoundtrip(ShmRing clientToServer, ShmRing serverToClient,
+        byte[] payload, int size, long iterations)
+    {
+        var readBuf = new byte[size];
+        var echoBuf = new byte[size];
+        Exception? echoError = null;
+
+        var echoReady = new ManualResetEventSlim(false);
+        var startGun = new ManualResetEventSlim(false);
+
+        // Echo server thread (matches Go echo goroutine)
+        var echoThread = new Thread(() =>
+        {
+            try
+            {
+                echoReady.Set();
+                startGun.Wait();
+                for (long i = 0; i < iterations; i++)
+                {
+                    // Read from client
+                    clientToServer.Read(echoBuf);
+                    // Echo back to client
+                    serverToClient.Write(echoBuf);
+                }
+            }
+            catch (Exception ex) { echoError = ex; }
+        });
+        echoThread.IsBackground = true;
+        echoThread.Start();
+
+        echoReady.Wait();
+
+        // Client thread — timed
+        var sw = Stopwatch.StartNew();
+        startGun.Set();
+
+        for (long i = 0; i < iterations; i++)
+        {
+            // Write to server
+            clientToServer.Write(payload);
+            // Read echo response
+            serverToClient.Read(readBuf);
+        }
+
+        sw.Stop();
+        echoThread.Join();
+
+        if (echoError != null) throw echoError;
+
+        return (double)sw.ElapsedTicks / iterations * 1_000_000_000.0 / Stopwatch.Frequency;
     }
 
     // ========================================================================

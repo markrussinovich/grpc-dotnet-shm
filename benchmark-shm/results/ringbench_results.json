@@ -1,168 +1,168 @@
 {
-  "timestamp": "2026-02-08T18:18:06.0999108Z",
+  "timestamp": "2026-02-09T06:05:07.8997130Z",
   "cpu": "AMD EPYC 7763 64-Core Processor",
   "runtime": ".NET 9.0.12",
   "ring_capacity_mb": 4,
   "benchmarks": {
     "ShmRingWriteRead/size=64": {
-      "ns_per_op": 22.9,
-      "mb_per_s": 2798.32,
-      "ops": 10982222
+      "ns_per_op": 82.9,
+      "mb_per_s": 772.34,
+      "ops": 789165
     },
     "ShmRingWriteRead/size=256": {
-      "ns_per_op": 28.7,
-      "mb_per_s": 8916.73,
-      "ops": 28602242
+      "ns_per_op": 51.1,
+      "mb_per_s": 5007.2,
+      "ops": 1302677
     },
     "ShmRingWriteRead/size=1024": {
-      "ns_per_op": 46.7,
-      "mb_per_s": 21947.65,
-      "ops": 22348276
+      "ns_per_op": 67.9,
+      "mb_per_s": 15071.16,
+      "ops": 1111674
     },
     "ShmRingWriteRead/size=4096": {
-      "ns_per_op": 196.1,
-      "mb_per_s": 20889.74,
-      "ops": 8267469
+      "ns_per_op": 163.2,
+      "mb_per_s": 25094.67,
+      "ops": 915249
     },
     "ShmRingWriteRead/size=16384": {
-      "ns_per_op": 790,
-      "mb_per_s": 20738.3,
-      "ops": 2411167
+      "ns_per_op": 786.7,
+      "mb_per_s": 20827.26,
+      "ops": 627692
     },
     "ShmRingWriteRead/size=65536": {
-      "ns_per_op": 3213.4,
-      "mb_per_s": 20394.87,
-      "ops": 612458
+      "ns_per_op": 3202.1,
+      "mb_per_s": 20466.56,
+      "ops": 374258
     },
     "ShmRingRoundtrip/size=64": {
-      "ns_per_op": 25.4,
-      "mb_per_s": 2520.74,
-      "ops": 21710805
+      "ns_per_op": 155.2,
+      "mb_per_s": 824.89,
+      "ops": 191582
     },
     "ShmRingRoundtrip/size=256": {
-      "ns_per_op": 28.4,
-      "mb_per_s": 9001.32,
-      "ops": 26033475
+      "ns_per_op": 231,
+      "mb_per_s": 2216.25,
+      "ops": 102312
     },
     "ShmRingRoundtrip/size=1024": {
-      "ns_per_op": 46.8,
-      "mb_per_s": 21867.95,
-      "ops": 23637990
+      "ns_per_op": 381.1,
+      "mb_per_s": 5373.34,
+      "ops": 381211
     },
     "ShmRingRoundtrip/size=4096": {
-      "ns_per_op": 189.2,
-      "mb_per_s": 21651.78,
-      "ops": 8413495
+      "ns_per_op": 910,
+      "mb_per_s": 9001.78,
+      "ops": 316881
     },
     "ShmRingLargePayloads/size=65536": {
-      "ns_per_op": 3371.5,
-      "mb_per_s": 19437.98,
-      "ops": 599008
+      "ns_per_op": 3266.9,
+      "mb_per_s": 20060.87,
+      "ops": 404103
     },
     "ShmRingLargePayloads/size=262144": {
-      "ns_per_op": 15681.9,
-      "mb_per_s": 16716.36,
-      "ops": 117467
+      "ns_per_op": 14148.6,
+      "mb_per_s": 18527.87,
+      "ops": 61951
     },
     "ShmRingLargePayloads/size=1048576": {
-      "ns_per_op": 73682.6,
-      "mb_per_s": 14230.99,
-      "ops": 27655
+      "ns_per_op": 56463.1,
+      "mb_per_s": 18571,
+      "ops": 30314
     },
     "ShmRingLargePayloadsRoundtrip/size=65536": {
-      "ns_per_op": 3304.3,
-      "mb_per_s": 19833.47,
-      "ops": 643511
+      "ns_per_op": 34126.1,
+      "mb_per_s": 3840.81,
+      "ops": 51962
     },
     "ShmRingLargePayloadsRoundtrip/size=262144": {
-      "ns_per_op": 15795.1,
-      "mb_per_s": 16596.59,
-      "ops": 123377
+      "ns_per_op": 59935,
+      "mb_per_s": 8747.61,
+      "ops": 23432
     },
     "ShmRingLargePayloadsRoundtrip/size=1048576": {
-      "ns_per_op": 73582.9,
-      "mb_per_s": 14250.26,
-      "ops": 27579
+      "ns_per_op": 151303.2,
+      "mb_per_s": 13860.59,
+      "ops": 12125
     },
     "TCPLoopback/size=64": {
-      "ns_per_op": 6081.2,
-      "mb_per_s": 10.52,
-      "ops": 1151061
+      "ns_per_op": 3345.7,
+      "mb_per_s": 19.13,
+      "ops": 253819
     },
     "TCPLoopback/size=256": {
-      "ns_per_op": 7276.2,
-      "mb_per_s": 35.18,
-      "ops": 366746
+      "ns_per_op": 7674.3,
+      "mb_per_s": 33.36,
+      "ops": 295168
     },
     "TCPLoopback/size=1024": {
-      "ns_per_op": 7085,
-      "mb_per_s": 144.53,
-      "ops": 261989
+      "ns_per_op": 5003.8,
+      "mb_per_s": 204.64,
+      "ops": 251117
     },
     "TCPLoopback/size=4096": {
-      "ns_per_op": 8115.9,
-      "mb_per_s": 504.69,
-      "ops": 282977
+      "ns_per_op": 7489.8,
+      "mb_per_s": 546.88,
+      "ops": 244725
     },
     "TCPLoopback/size=16384": {
-      "ns_per_op": 10906.7,
-      "mb_per_s": 1502.2,
-      "ops": 176044
+      "ns_per_op": 10811.3,
+      "mb_per_s": 1515.46,
+      "ops": 185014
     },
     "TCPLoopback/size=65536": {
-      "ns_per_op": 27338.1,
-      "mb_per_s": 2397.24,
-      "ops": 74168
+      "ns_per_op": 28738.3,
+      "mb_per_s": 2280.44,
+      "ops": 72156
     },
     "TCPLoopbackRoundtrip/size=64": {
-      "ns_per_op": 38311.5,
-      "mb_per_s": 3.34,
-      "ops": 54650
+      "ns_per_op": 38752,
+      "mb_per_s": 3.3,
+      "ops": 47976
     },
     "TCPLoopbackRoundtrip/size=256": {
-      "ns_per_op": 38600.4,
-      "mb_per_s": 13.26,
-      "ops": 51052
+      "ns_per_op": 38542.8,
+      "mb_per_s": 13.28,
+      "ops": 48573
     },
     "TCPLoopbackRoundtrip/size=1024": {
-      "ns_per_op": 39397.9,
-      "mb_per_s": 51.98,
-      "ops": 49778
+      "ns_per_op": 38654,
+      "mb_per_s": 52.98,
+      "ops": 54568
     },
     "TCPLoopbackRoundtrip/size=4096": {
-      "ns_per_op": 40994.9,
-      "mb_per_s": 199.83,
-      "ops": 49621
+      "ns_per_op": 42506,
+      "mb_per_s": 192.73,
+      "ops": 45109
     },
     "TCPLargePayloads/size=65536": {
-      "ns_per_op": 26677.9,
-      "mb_per_s": 2456.56,
-      "ops": 68872
+      "ns_per_op": 28437.3,
+      "mb_per_s": 2304.58,
+      "ops": 71169
     },
     "TCPLargePayloads/size=262144": {
-      "ns_per_op": 76810.9,
-      "mb_per_s": 3412.85,
-      "ops": 26023
+      "ns_per_op": 72935.2,
+      "mb_per_s": 3594.21,
+      "ops": 26523
     },
     "TCPLargePayloads/size=1048576": {
-      "ns_per_op": 274436.9,
-      "mb_per_s": 3820.83,
-      "ops": 7543
+      "ns_per_op": 272815.7,
+      "mb_per_s": 3843.53,
+      "ops": 7544
     },
     "TCPLargePayloadsRoundtrip/size=65536": {
-      "ns_per_op": 72491.3,
-      "mb_per_s": 1808.11,
-      "ops": 27546
+      "ns_per_op": 75798.5,
+      "mb_per_s": 1729.22,
+      "ops": 26073
     },
     "TCPLargePayloadsRoundtrip/size=262144": {
-      "ns_per_op": 160524.7,
-      "mb_per_s": 3266.09,
-      "ops": 11465
+      "ns_per_op": 155569.9,
+      "mb_per_s": 3370.11,
+      "ops": 12022
     },
     "TCPLargePayloadsRoundtrip/size=1048576": {
-      "ns_per_op": 549727.7,
-      "mb_per_s": 3814.89,
-      "ops": 3552
+      "ns_per_op": 547946.8,
+      "mb_per_s": 3827.29,
+      "ops": 3156
     }
   }
 }
