@@ -52,12 +52,12 @@ try
     {
         await foreach (var message in call.ResponseStream.ReadAllAsync())
         {
-            Console.ForegroundColor = message.Reason == MailboxMessage.Types.Reason.Received 
-                ? ConsoleColor.White 
+            Console.ForegroundColor = message.Reason == MailboxMessage.Types.Reason.Received
+                ? ConsoleColor.White
                 : ConsoleColor.Green;
             Console.WriteLine();
-            Console.WriteLine(message.Reason == MailboxMessage.Types.Reason.Received 
-                ? "Mail received" 
+            Console.WriteLine(message.Reason == MailboxMessage.Types.Reason.Received
+                ? "Mail received"
                 : "Mail forwarded");
             Console.WriteLine($"New mail: {message.New}, Forwarded mail: {message.Forwarded}");
             Console.ResetColor();

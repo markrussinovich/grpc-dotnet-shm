@@ -82,7 +82,7 @@ Console.WriteLine("Press any key to exit...");
 Console.ReadKey();
 
 static ResponseProgress<HistoryResult, int> ServerStreamingCallWithProgress(
-    Progressor.ProgressorClient client, 
+    Progressor.ProgressorClient client,
     IProgress<int> progress)
 {
     var call = client.RunHistory(new Empty());

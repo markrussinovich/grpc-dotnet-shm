@@ -123,8 +123,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="enforcementPolicy">Optional enforcement policy for server.</param>
     /// <returns>A new server connection.</returns>
     public static ShmConnection CreateAsServer(
-        string name, 
-        ulong ringCapacity = 64 * 1024 * 1024, 
+        string name,
+        ulong ringCapacity = 64 * 1024 * 1024,
         uint maxStreams = 100,
         ShmKeepaliveOptions? keepaliveOptions = null,
         ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
@@ -150,9 +150,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     }
 
     private ShmConnection(
-        string name, 
-        Segment segment, 
-        bool isClient, 
+        string name,
+        Segment segment,
+        bool isClient,
         ShmKeepaliveOptions? keepaliveOptions = null,
         ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
     {
@@ -163,7 +163,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _enforcementPolicy = enforcementPolicy;
         _streams = new ConcurrentDictionary<uint, ShmGrpcStream>();
         _disposeCts = new CancellationTokenSource();
-        
+
         // Handle MaxStreams: 0 or max uint means unlimited - use reasonable default
         var headerMaxStreams = segment.Header.MaxStreams;
         if (headerMaxStreams == 0 || headerMaxStreams == uint.MaxValue)
@@ -331,6 +331,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     {
         try
         {
+            int frameCount = 0;
             while (!_disposeCts.Token.IsCancellationRequested)
             {
                 // Read frame from receive ring
@@ -338,6 +339,16 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                     FrameProtocol.ReadFrame(RxRing, _disposeCts.Token), _disposeCts.Token);
 
                 await ProcessFrameAsync(header, payload);
+
+                // Periodically yield to unwind the stack.
+                // Task.Run continuation inlining can cause unbounded stack growth;
+                // yielding every N frames forces the state machine onto a fresh
+                // ThreadPool work-item and resets the stack depth.
+                if (++frameCount >= 200)
+                {
+                    frameCount = 0;
+                    await Task.Yield();
+                }
             }
         }
         catch (OperationCanceledException)
@@ -752,7 +763,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private void HandlePong(FrameHeader header, byte[] payload)
     {
         // Check for BDP pong
-        if ((header.Flags & PingFlags.Bdp) != 0 && payload.Length == 8 && 
+        if ((header.Flags & PingFlags.Bdp) != 0 && payload.Length == 8 &&
             payload.SequenceEqual(ShmBdpEstimator.BdpPingData))
         {
             _bdpEstimator.Calculate();

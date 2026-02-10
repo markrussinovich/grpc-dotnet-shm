@@ -161,8 +161,14 @@ public static class ShmConstants
     /// <summary>Default maximum concurrent streams.</summary>
     public const uint DefaultMaxStreams = 100;
 
-    /// <summary>HTTP/2 initial window size.</summary>
-    public const int InitialWindowSize = 65535;
+    /// <summary>
+    /// Initial flow-control window size.
+    /// HTTP/2 over TCP uses 65 535, but shared memory is a local, high-bandwidth
+    /// transport so we use 16 MiB (¼ of the default 64 MiB ring capacity).
+    /// This must be large enough that a single gRPC message can be sent without
+    /// requiring a WINDOW_UPDATE first.
+    /// </summary>
+    public const int InitialWindowSize = 16 * 1024 * 1024;
 
     /// <summary>Maximum window size.</summary>
     public const int MaxWindowSize = int.MaxValue;

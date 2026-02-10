@@ -76,13 +76,13 @@ Console.ReadKey();
 static async Task UploadDataAsync(DataChanneler.DataChannelerClient client, string threadName, int dataMultiplier)
 {
     Console.WriteLine($"[{threadName}] Starting upload...");
-    
+
     var call = client.UploadData();
 
     // Create test data with varying sizes per thread
     var testData = Encoding.UTF8.GetBytes($"Data from {threadName}: " + new string('X', 100 * dataMultiplier));
     var dataChunks = testData.Chunk(10);
-    
+
     foreach (var chunk in dataChunks)
     {
         await call.RequestStream.WriteAsync(new DataRequest { Value = ByteString.CopyFrom(chunk) });
@@ -98,7 +98,7 @@ static async Task UploadDataAsync(DataChanneler.DataChannelerClient client, stri
 static async Task DownloadResultsAsync(DataChanneler.DataChannelerClient client, string threadName)
 {
     Console.WriteLine($"[{threadName}] Starting download...");
-    
+
     var testData = Encoding.UTF8.GetBytes($"Request from {threadName}");
     var call = client.DownloadResults(new DataRequest { Value = ByteString.CopyFrom(testData) });
 
@@ -107,6 +107,6 @@ static async Task DownloadResultsAsync(DataChanneler.DataChannelerClient client,
     {
         totalBytes += result.BytesProcessed;
     }
-    
+
     Console.WriteLine($"[{threadName}] Download complete: {totalBytes} total bytes received");
 }

@@ -32,7 +32,7 @@ public class FlowControlTests
     [Platform("Win")]
     public void InitialWindowSize_IsCorrect()
     {
-        Assert.That(ShmConstants.InitialWindowSize, Is.EqualTo(65535));
+        Assert.That(ShmConstants.InitialWindowSize, Is.EqualTo(16 * 1024 * 1024));
     }
 
     [Test]
@@ -90,7 +90,7 @@ public class FlowControlTests
         
         var startTime = DateTime.UtcNow;
         
-        // Send message smaller than initial window (65535)
+        // Send message smaller than initial window (16 MiB)
         var message = new byte[10000];
         await stream.SendMessageAsync(message);
         
@@ -149,10 +149,10 @@ public class FlowControlTests
 
     [Test]
     [Platform("Win")]
-    public void FlowControl_Constants_MatchHttp2()
+    public void FlowControl_Constants_AreValid()
     {
-        // Verify constants match HTTP/2 spec
-        Assert.That(ShmConstants.InitialWindowSize, Is.EqualTo(65535), "Initial window should be HTTP/2 default");
+        // Verify constants are appropriate for shared memory transport
+        Assert.That(ShmConstants.InitialWindowSize, Is.EqualTo(16 * 1024 * 1024), "Initial window should be 16 MiB for SHM");
         Assert.That(ShmConstants.MaxWindowSize, Is.EqualTo(int.MaxValue), "Max window should be 2^31-1");
     }
 }

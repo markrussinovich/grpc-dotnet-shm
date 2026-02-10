@@ -95,7 +95,7 @@ static async Task BidirectionalStreamingRace(Racer.RacerClient client, TimeSpan 
             Console.WriteLine($"Elapsed: {sw.Elapsed.TotalSeconds:F1}s");
 
             await Task.Delay(TimeSpan.FromSeconds(1));
-            
+
             if (!complete)
             {
                 Console.SetCursorPosition(0, Console.CursorTop - 3);
