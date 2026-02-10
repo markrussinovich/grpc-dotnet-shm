@@ -1,5 +1,5 @@
 // Transport-level benchmarks matching Go's internal/transport/shm_bench_test.go
-// Compares: SHM ring buffer vs TCP loopback (raw socket)
+// Compares: SHM ring buffer vs TCP loopback vs Named Pipes (Windows) / Unix sockets (Linux)
 // Output: JSON results file + console summary
 //
 // IMPORTANT: All SHM benchmarks use CROSS-THREAD patterns matching Go exactly:
@@ -7,14 +7,19 @@
 //   - Roundtrip: two rings + echo thread (ping-pong pattern)
 //
 // Go equivalents:
-//   BenchmarkShmRingWriteRead      → ShmRingWriteRead      (writer+reader goroutines, 1 ring)
-//   BenchmarkShmRingRoundtrip      → ShmRingRoundtrip      (echo goroutine, 2 rings)
-//   BenchmarkShmRingLargePayloads  → ShmRingLargePayloads  (writer+reader goroutines, 1 ring)
-//   BenchmarkTCPLoopback           → TCPLoopback
-//   BenchmarkTCPLoopbackRoundtrip  → TCPLoopbackRoundtrip
-//   BenchmarkTCPLargePayloads      → TCPLargePayloads
+//   BenchmarkShmRingWriteRead            → ShmRingWriteRead      (writer+reader goroutines, 1 ring)
+//   BenchmarkShmRingRoundtrip            → ShmRingRoundtrip      (echo goroutine, 2 rings)
+//   BenchmarkShmRingLargePayloads        → ShmRingLargePayloads  (writer+reader goroutines, 1 ring)
+//   BenchmarkShmRingLargePayloadsRoundtrip→ ShmRingLargePayloadsRoundtrip
+//   BenchmarkTCPLoopback                 → TCPLoopback
+//   BenchmarkTCPLoopbackRoundtrip        → TCPLoopbackRoundtrip
+//   BenchmarkTCPLargePayloads            → TCPLargePayloads
+//   BenchmarkTCPLargePayloadsRoundtrip   → TCPLargePayloadsRoundtrip
+//   BenchmarkUnixSocketLoopback          → PipeLoopback (Named Pipes on Windows)
+//   BenchmarkUnixSocketRoundtrip         → PipeRoundtrip
 
 using System.Diagnostics;
+using System.IO.Pipes;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -23,10 +28,13 @@ using Grpc.Net.SharedMemory;
 
 sealed class RingBench
 {
+    const int ChunkSize = 32 * 1024 * 1024; // 32MB — matches Go's chunking for large payloads
+
     // Match Go benchmark sizes exactly
-    static readonly int[] StreamingSizes = { 64, 256, 1024, 4096, 16384, 65536 };
+    static readonly int[] StreamingSizes = { 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576 };
     static readonly int[] RoundtripSizes = { 64, 256, 1024, 4096 };
-    static readonly int[] LargePayloadSizes = { 65536, 262144, 1048576 };
+    // Go large payload sizes: 1MB, 4MB, 16MB, 64MB, 128MB, 256MB
+    static readonly int[] LargePayloadSizes = { 1048576, 4194304, 16777216, 67108864, 134217728, 268435456 };
 
     static readonly Dictionary<string, BenchResult> AllResults = new();
 
@@ -41,12 +49,15 @@ sealed class RingBench
                 outputFile = args[++i];
         }
 
-        // Clean up stale segments
-        foreach (var f in Directory.GetFiles("/dev/shm/", "grpc_shm_ringbench*"))
-            File.Delete(f);
+        // Clean up stale segments (Linux only)
+        if (OperatingSystem.IsLinux())
+        {
+            foreach (var f in Directory.GetFiles("/dev/shm/", "grpc_shm_ringbench*"))
+                File.Delete(f);
+        }
 
-        // 4 MB ring capacity (fits in /dev/shm, large enough for 1MB messages)
-        ulong ringCapacity = 4 * 1024 * 1024;
+        // 64 MB ring capacity — matches Go benchmark (64 MiB ring buffers)
+        ulong ringCapacity = 64 * 1024 * 1024;
 
         var cpu = GetCpuInfo();
         Console.WriteLine($"CPU: {cpu}");
@@ -61,7 +72,6 @@ sealed class RingBench
         PrintTableHeader();
         foreach (var size in StreamingSizes)
         {
-            if ((ulong)size > ringCapacity / 2) continue;
             using var seg = Segment.Create($"ringbench_wr_{size}", ringCapacity);
             var r = BenchShmWriteRead(seg.RingA, size);
             AllResults[$"ShmRingWriteRead/size={size}"] = r;
@@ -90,7 +100,6 @@ sealed class RingBench
         PrintTableHeader();
         foreach (var size in LargePayloadSizes)
         {
-            if ((ulong)size > ringCapacity / 2) continue;
             using var seg = Segment.Create($"ringbench_lp_{size}", ringCapacity);
             var r = BenchShmWriteRead(seg.RingA, size);
             AllResults[$"ShmRingLargePayloads/size={size}"] = r;
@@ -105,7 +114,6 @@ sealed class RingBench
         PrintTableHeader();
         foreach (var size in LargePayloadSizes)
         {
-            if ((ulong)size > ringCapacity / 2) continue;
             using var seg = Segment.Create($"ringbench_lprt_{size}", ringCapacity);
             var r = BenchShmRoundtrip(seg.RingA, seg.RingB, size);
             AllResults[$"ShmRingLargePayloadsRoundtrip/size={size}"] = r;
@@ -157,6 +165,54 @@ sealed class RingBench
         }
         Console.WriteLine();
 
+        // === Named Pipes / Unix Socket Loopback (one-way) ===
+        // Equivalent to Go's BenchmarkUnixSocketLoopback
+        Console.WriteLine("=== Pipe Loopback (= Go BenchmarkUnixSocketLoopback) ===");
+        PrintTableHeader();
+        foreach (var size in StreamingSizes)
+        {
+            var r = BenchPipeOneWay(size);
+            AllResults[$"PipeLoopback/size={size}"] = r;
+            PrintRow(size, r);
+        }
+        Console.WriteLine();
+
+        // === Named Pipes / Unix Socket Roundtrip ===
+        // Equivalent to Go's BenchmarkUnixSocketRoundtrip
+        Console.WriteLine("=== Pipe Roundtrip (= Go BenchmarkUnixSocketRoundtrip) ===");
+        PrintTableHeader();
+        foreach (var size in RoundtripSizes)
+        {
+            var r = BenchPipeRoundtrip(size);
+            AllResults[$"PipeRoundtrip/size={size}"] = r;
+            PrintRow(size, r);
+        }
+        Console.WriteLine();
+
+        // === Named Pipes / Unix Socket Large Payload ===
+        // Equivalent to Go's BenchmarkUnixLargePayloads
+        Console.WriteLine("=== Pipe Large Payloads (= Go BenchmarkUnixLargePayloads) ===");
+        PrintTableHeader();
+        foreach (var size in LargePayloadSizes)
+        {
+            var r = BenchPipeOneWay(size);
+            AllResults[$"PipeLargePayloads/size={size}"] = r;
+            PrintRow(size, r);
+        }
+        Console.WriteLine();
+
+        // === Named Pipes / Unix Socket Large Payload Roundtrip ===
+        // Equivalent to Go's BenchmarkUnixLargePayloadsRoundtrip
+        Console.WriteLine("=== Pipe Large Payloads Roundtrip (= Go BenchmarkUnixLargePayloadsRoundtrip) ===");
+        PrintTableHeader();
+        foreach (var size in LargePayloadSizes)
+        {
+            var r = BenchPipeRoundtrip(size);
+            AllResults[$"PipeLargePayloadsRoundtrip/size={size}"] = r;
+            PrintRow(size, r);
+        }
+        Console.WriteLine();
+
         // Write JSON results
         var jsonObj = new
         {
@@ -176,9 +232,12 @@ sealed class RingBench
         File.WriteAllText(outputFile, JsonSerializer.Serialize(jsonObj, new JsonSerializerOptions { WriteIndented = true }));
         Console.WriteLine($"Results written to: {outputFile}");
 
-        // Clean up stale segments
-        foreach (var f in Directory.GetFiles("/dev/shm/", "grpc_shm_ringbench*"))
-            File.Delete(f);
+        // Clean up stale segments (Linux only)
+        if (OperatingSystem.IsLinux())
+        {
+            foreach (var f in Directory.GetFiles("/dev/shm/", "grpc_shm_ringbench*"))
+                File.Delete(f);
+        }
     }
 
     // ========================================================================
@@ -227,10 +286,14 @@ sealed class RingBench
     /// Runs writer thread + reader thread on the SAME ring concurrently.
     /// Returns ns/op (total time / ops).
     /// Matches Go BenchmarkShmRingWriteRead: separate goroutines for write and read.
+    /// For payloads larger than ring capacity, chunks writes/reads (matching Go WriteAll behavior).
     /// </summary>
     static double RunCrossThreadWriteRead(ShmRing ring, byte[] payload, int size, long iterations)
     {
-        var readBuf = new byte[size];
+        ulong cap = ring.Capacity;
+        bool chunked = (ulong)size > cap;
+        int readBufSize = chunked ? ChunkSize : size;
+        var readBuf = new byte[readBufSize];
         Exception? writerError = null;
         Exception? readerError = null;
 
@@ -246,7 +309,20 @@ sealed class RingBench
                 startGun.Wait();
                 for (long i = 0; i < iterations; i++)
                 {
-                    ring.Read(readBuf);
+                    if (chunked)
+                    {
+                        int totalRead = 0;
+                        while (totalRead < size)
+                        {
+                            int len = Math.Min(ChunkSize, size - totalRead);
+                            ring.Read(readBuf.AsSpan(0, len));
+                            totalRead += len;
+                        }
+                    }
+                    else
+                    {
+                        ring.Read(readBuf);
+                    }
                 }
             }
             catch (Exception ex) { readerError = ex; }
@@ -265,7 +341,20 @@ sealed class RingBench
         {
             for (long i = 0; i < iterations; i++)
             {
-                ring.Write(payload);
+                if (chunked)
+                {
+                    int offset = 0;
+                    while (offset < size)
+                    {
+                        int len = Math.Min(ChunkSize, size - offset);
+                        ring.Write(payload.AsSpan(offset, len));
+                        offset += len;
+                    }
+                }
+                else
+                {
+                    ring.Write(payload);
+                }
             }
         }
         catch (Exception ex) { writerError = ex; }
@@ -323,12 +412,16 @@ sealed class RingBench
     /// Echo: reads from clientToServer, writes to serverToClient.
     /// Client: writes to clientToServer, reads from serverToClient.
     /// Returns ns/op. Matches Go BenchmarkShmRingRoundtrip exactly.
+    /// For payloads larger than ring capacity, chunks writes/reads.
     /// </summary>
     static double RunCrossThreadRoundtrip(ShmRing clientToServer, ShmRing serverToClient,
         byte[] payload, int size, long iterations)
     {
-        var readBuf = new byte[size];
-        var echoBuf = new byte[size];
+        ulong cap = clientToServer.Capacity;
+        bool chunked = (ulong)size > cap;
+        int bufSize = chunked ? ChunkSize : size;
+        var readBuf = new byte[bufSize];
+        var echoBuf = new byte[bufSize];
         Exception? echoError = null;
 
         var echoReady = new ManualResetEventSlim(false);
@@ -343,10 +436,22 @@ sealed class RingBench
                 startGun.Wait();
                 for (long i = 0; i < iterations; i++)
                 {
-                    // Read from client
-                    clientToServer.Read(echoBuf);
-                    // Echo back to client
-                    serverToClient.Write(echoBuf);
+                    if (chunked)
+                    {
+                        int offset = 0;
+                        while (offset < size)
+                        {
+                            int len = Math.Min(ChunkSize, size - offset);
+                            clientToServer.Read(echoBuf.AsSpan(0, len));
+                            serverToClient.Write(echoBuf.AsSpan(0, len));
+                            offset += len;
+                        }
+                    }
+                    else
+                    {
+                        clientToServer.Read(echoBuf);
+                        serverToClient.Write(echoBuf);
+                    }
                 }
             }
             catch (Exception ex) { echoError = ex; }
@@ -362,10 +467,22 @@ sealed class RingBench
 
         for (long i = 0; i < iterations; i++)
         {
-            // Write to server
-            clientToServer.Write(payload);
-            // Read echo response
-            serverToClient.Read(readBuf);
+            if (chunked)
+            {
+                int offset = 0;
+                while (offset < size)
+                {
+                    int len = Math.Min(ChunkSize, size - offset);
+                    clientToServer.Write(payload.AsSpan(offset, len));
+                    serverToClient.Read(readBuf.AsSpan(0, len));
+                    offset += len;
+                }
+            }
+            else
+            {
+                clientToServer.Write(payload);
+                serverToClient.Read(readBuf);
+            }
         }
 
         sw.Stop();
@@ -623,6 +740,251 @@ sealed class RingBench
         }
 
         listener.Stop();
+        double mbps = (size * 2.0) / bestNs * 1000.0; // bidirectional
+        return new BenchResult(iterations, bestNs, mbps);
+    }
+
+    // ========================================================================
+    // Named Pipe Benchmarks (matching Go's BenchmarkUnixSocket*)
+    // On Windows: NamedPipeServerStream / NamedPipeClientStream
+    // On Linux: these will use a Unix domain socket-backed pipe
+    // ========================================================================
+
+    static BenchResult BenchPipeOneWay(int size)
+    {
+        var pipeName = $"grpc_ringbench_{Guid.NewGuid():N}";
+        var data = new byte[size];
+        Random.Shared.NextBytes(data);
+        var recvBuf = new byte[size];
+
+        // Calibrate
+        long iterations;
+        {
+            using var server = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1,
+                PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut,
+                PipeOptions.Asynchronous);
+
+            var connectTask = Task.Run(() => server.WaitForConnection());
+            client.Connect(5000);
+            connectTask.Wait();
+
+            var serverDone = new ManualResetEventSlim(false);
+            var serverThread = new Thread(() =>
+            {
+                try
+                {
+                    while (true)
+                    {
+                        int read = 0;
+                        while (read < size)
+                        {
+                            int n = server.Read(recvBuf, read, size - read);
+                            if (n == 0) return;
+                            read += n;
+                        }
+                    }
+                }
+                catch { }
+                finally { serverDone.Set(); }
+            });
+            serverThread.IsBackground = true;
+            serverThread.Start();
+
+            var sw = Stopwatch.StartNew();
+            int calibOps = 0;
+            while (sw.ElapsedMilliseconds < 200)
+            {
+                client.Write(data, 0, size);
+                calibOps++;
+            }
+            sw.Stop();
+
+            client.Close();
+            serverDone.Wait(1000);
+
+            double nsPerCalib = (double)sw.ElapsedTicks / calibOps * 1_000_000_000.0 / Stopwatch.Frequency;
+            iterations = Math.Max(100, (long)(2_000_000_000.0 / nsPerCalib));
+        }
+
+        // Benchmark: 3 runs, take best
+        double bestNs = double.MaxValue;
+        for (int run = 0; run < 3; run++)
+        {
+            var pipeNameRun = $"grpc_ringbench_{Guid.NewGuid():N}";
+            using var server = new NamedPipeServerStream(pipeNameRun, PipeDirection.InOut, 1,
+                PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            using var client = new NamedPipeClientStream(".", pipeNameRun, PipeDirection.InOut,
+                PipeOptions.Asynchronous);
+
+            var connectTask = Task.Run(() => server.WaitForConnection());
+            client.Connect(5000);
+            connectTask.Wait();
+
+            var serverDone = new ManualResetEventSlim(false);
+            var serverThread = new Thread(() =>
+            {
+                try
+                {
+                    for (long i = 0; i < iterations; i++)
+                    {
+                        int read = 0;
+                        while (read < size)
+                        {
+                            int n = server.Read(recvBuf, read, size - read);
+                            if (n == 0) return;
+                            read += n;
+                        }
+                    }
+                }
+                catch { }
+                finally { serverDone.Set(); }
+            });
+            serverThread.IsBackground = true;
+            serverThread.Start();
+
+            Thread.Sleep(10);
+
+            var sw = Stopwatch.StartNew();
+            for (long i = 0; i < iterations; i++)
+            {
+                client.Write(data, 0, size);
+            }
+            sw.Stop();
+
+            serverDone.Wait(5000);
+
+            double ns = (double)sw.ElapsedTicks / iterations * 1_000_000_000.0 / Stopwatch.Frequency;
+            if (ns < bestNs) bestNs = ns;
+        }
+
+        double mbps = size / bestNs * 1000.0;
+        return new BenchResult(iterations, bestNs, mbps);
+    }
+
+    static BenchResult BenchPipeRoundtrip(int size)
+    {
+        var data = new byte[size];
+        Random.Shared.NextBytes(data);
+        var recvBuf = new byte[size];
+
+        // Calibrate
+        long iterations;
+        {
+            var pipeName = $"grpc_ringbench_{Guid.NewGuid():N}";
+            using var server = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1,
+                PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut,
+                PipeOptions.Asynchronous);
+
+            var connectTask = Task.Run(() => server.WaitForConnection());
+            client.Connect(5000);
+            connectTask.Wait();
+
+            var echoThread = new Thread(() =>
+            {
+                var buf = new byte[size];
+                try
+                {
+                    while (true)
+                    {
+                        int read = 0;
+                        while (read < size)
+                        {
+                            int n = server.Read(buf, read, size - read);
+                            if (n == 0) return;
+                            read += n;
+                        }
+                        server.Write(buf, 0, size);
+                    }
+                }
+                catch { }
+            });
+            echoThread.IsBackground = true;
+            echoThread.Start();
+
+            var sw = Stopwatch.StartNew();
+            int calibOps = 0;
+            while (sw.ElapsedMilliseconds < 200)
+            {
+                client.Write(data, 0, size);
+                int read = 0;
+                while (read < size)
+                {
+                    int n = client.Read(recvBuf, read, size - read);
+                    if (n == 0) break;
+                    read += n;
+                }
+                calibOps++;
+            }
+            sw.Stop();
+
+            client.Close();
+
+            double nsPerCalib = (double)sw.ElapsedTicks / calibOps * 1_000_000_000.0 / Stopwatch.Frequency;
+            iterations = Math.Max(100, (long)(2_000_000_000.0 / nsPerCalib));
+        }
+
+        // Benchmark: 3 runs, take best
+        double bestNs = double.MaxValue;
+        for (int run = 0; run < 3; run++)
+        {
+            var pipeName = $"grpc_ringbench_{Guid.NewGuid():N}";
+            using var server = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1,
+                PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut,
+                PipeOptions.Asynchronous);
+
+            var connectTask = Task.Run(() => server.WaitForConnection());
+            client.Connect(5000);
+            connectTask.Wait();
+
+            var echoErr = new ManualResetEventSlim(false);
+            var echoThread = new Thread(() =>
+            {
+                var buf = new byte[size];
+                try
+                {
+                    for (long i = 0; i < iterations; i++)
+                    {
+                        int read = 0;
+                        while (read < size)
+                        {
+                            int n = server.Read(buf, read, size - read);
+                            if (n == 0) return;
+                            read += n;
+                        }
+                        server.Write(buf, 0, size);
+                    }
+                }
+                catch { }
+                finally { echoErr.Set(); }
+            });
+            echoThread.IsBackground = true;
+            echoThread.Start();
+
+            Thread.Sleep(10);
+
+            var sw = Stopwatch.StartNew();
+            for (long i = 0; i < iterations; i++)
+            {
+                client.Write(data, 0, size);
+                int read = 0;
+                while (read < size)
+                {
+                    int n = client.Read(recvBuf, read, size - read);
+                    if (n == 0) break;
+                    read += n;
+                }
+            }
+            sw.Stop();
+
+            echoErr.Wait(5000);
+
+            double ns = (double)sw.ElapsedTicks / iterations * 1_000_000_000.0 / Stopwatch.Frequency;
+            if (ns < bestNs) bestNs = ns;
+        }
+
         double mbps = (size * 2.0) / bestNs * 1000.0; // bidirectional
         return new BenchResult(iterations, bestNs, mbps);
     }

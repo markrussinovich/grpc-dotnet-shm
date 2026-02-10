@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Benchmark runner and plotter for .NET SHM vs TCP transport.
+Benchmark runner and plotter for .NET SHM vs TCP vs Pipe transport.
 Exact .NET equivalent of grpc-go-shmem/benchmark/shmemtcp/benchmark_runner.py.
 
 Usage:
@@ -22,12 +22,12 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Directory setup
+# Directory setup — matches Go's out/<platform>/ convention
 SCRIPT_DIR = Path(__file__).parent.absolute()
-OUT_ROOT = SCRIPT_DIR / "plots"
-OUT_DIR = OUT_ROOT
-RESULTS_DIR = SCRIPT_DIR / "results"
-RESULTS_FILE = RESULTS_DIR / "ringbench_results.json"
+OUT_ROOT = SCRIPT_DIR / "out"
+PLATFORM_NAME = "windows" if os.name == "nt" else ("linux" if sys.platform.startswith("linux") else sys.platform)
+OUT_DIR = OUT_ROOT / PLATFORM_NAME
+RESULTS_FILE = OUT_DIR / "benchmark_results.json"
 
 
 def run_ringbench() -> dict:
@@ -36,7 +36,7 @@ def run_ringbench() -> dict:
     print("Running .NET Transport Benchmarks (RingBench)...")
     print("=" * 70)
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     output_file = str(RESULTS_FILE)
 
     cmd = [
@@ -78,18 +78,26 @@ def run_ringbench() -> dict:
 
 def load_results() -> dict:
     """Load benchmark results from cached JSON file."""
-    if not RESULTS_FILE.exists():
-        return None
-    try:
-        with open(RESULTS_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return None
+    if RESULTS_FILE.exists():
+        try:
+            with open(RESULTS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # Check legacy locations
+    for legacy in [SCRIPT_DIR / "results" / "ringbench_results.json"]:
+        if legacy.exists():
+            try:
+                with open(legacy) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+    return None
 
 
 def save_results(results: dict):
     """Save benchmark results to JSON file."""
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     with open(RESULTS_FILE, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Results saved to: {RESULTS_FILE}")
@@ -100,17 +108,17 @@ def extract_data(results: dict) -> dict:
     Matches Go's extract_data() structure exactly."""
     benchmarks = results.get("benchmarks", {})
 
-    # Standard sizes (matching Go: 64B to 64KB for streaming)
-    sizes = [64, 256, 1024, 4096, 16384, 65536]
-    size_labels = ['64B', '256B', '1KB', '4KB', '16KB', '64KB']
+    # Standard sizes (matching Go: 64B to 1MB for streaming)
+    sizes = [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576]
+    size_labels = ['64B', '256B', '1KB', '4KB', '16KB', '64KB', '256KB', '1MB']
 
     # Roundtrip sizes (matching Go: 64B to 4KB)
     rt_sizes = [64, 256, 1024, 4096]
     rt_labels = ['64B', '256B', '1KB', '4KB']
 
-    # Large payload sizes
-    large_sizes = [65536, 262144, 1048576]
-    large_labels = ['64KB', '256KB', '1MB']
+    # Large payload sizes (matching Go: 1MB to 256MB)
+    large_sizes = [1048576, 4194304, 16777216, 67108864, 134217728, 268435456]
+    large_labels = ['1MB', '4MB', '16MB', '64MB', '128MB', '256MB']
 
     data = {
         "sizes": sizes,
@@ -137,31 +145,39 @@ def extract_data(results: dict) -> dict:
     def get_throughput(bench_name, sizes_list):
         return [get_val(bench_name, s, "mb_per_s") for s in sizes_list]
 
-    # Streaming (one-way) benchmarks — Go: BenchmarkShmRingWriteRead / BenchmarkTCPLoopback
+    # Streaming (one-way) benchmarks — Go: BenchmarkShmRingWriteRead / BenchmarkTCPLoopback / BenchmarkUnixSocketLoopback
     data["shm_stream_latency"] = get_latency("ShmRingWriteRead", sizes)
     data["tcp_stream_latency"] = get_latency("TCPLoopback", sizes)
+    data["pipe_stream_latency"] = get_latency("PipeLoopback", sizes)
 
     data["shm_stream_throughput"] = get_throughput("ShmRingWriteRead", sizes)
     data["tcp_stream_throughput"] = get_throughput("TCPLoopback", sizes)
+    data["pipe_stream_throughput"] = get_throughput("PipeLoopback", sizes)
 
-    # Roundtrip (unary) benchmarks — Go: BenchmarkShmRingRoundtrip / BenchmarkTCPLoopbackRoundtrip
+    # Roundtrip (unary) benchmarks — Go: BenchmarkShmRingRoundtrip / BenchmarkTCPLoopbackRoundtrip / BenchmarkUnixSocketRoundtrip
     data["shm_rt_latency"] = get_latency("ShmRingRoundtrip", rt_sizes)
     data["tcp_rt_latency"] = get_latency("TCPLoopbackRoundtrip", rt_sizes)
+    data["pipe_rt_latency"] = get_latency("PipeRoundtrip", rt_sizes)
 
     data["shm_rt_throughput"] = get_throughput("ShmRingRoundtrip", rt_sizes)
     data["tcp_rt_throughput"] = get_throughput("TCPLoopbackRoundtrip", rt_sizes)
+    data["pipe_rt_throughput"] = get_throughput("PipeRoundtrip", rt_sizes)
 
     # Large payload streaming
     data["shm_large_stream_throughput"] = get_throughput("ShmRingLargePayloads", large_sizes)
     data["shm_large_stream_latency"] = get_latency("ShmRingLargePayloads", large_sizes)
     data["tcp_large_stream_throughput"] = get_throughput("TCPLargePayloads", large_sizes)
     data["tcp_large_stream_latency"] = get_latency("TCPLargePayloads", large_sizes)
+    data["pipe_large_stream_throughput"] = get_throughput("PipeLargePayloads", large_sizes)
+    data["pipe_large_stream_latency"] = get_latency("PipeLargePayloads", large_sizes)
 
     # Large payload roundtrip
     data["shm_large_rt_throughput"] = get_throughput("ShmRingLargePayloadsRoundtrip", large_sizes)
     data["shm_large_rt_latency"] = get_latency("ShmRingLargePayloadsRoundtrip", large_sizes)
     data["tcp_large_rt_throughput"] = get_throughput("TCPLargePayloadsRoundtrip", large_sizes)
     data["tcp_large_rt_latency"] = get_latency("TCPLargePayloadsRoundtrip", large_sizes)
+    data["pipe_large_rt_throughput"] = get_throughput("PipeLargePayloadsRoundtrip", large_sizes)
+    data["pipe_large_rt_latency"] = get_latency("PipeLargePayloadsRoundtrip", large_sizes)
 
     return data
 
@@ -182,7 +198,7 @@ def _safe_number(seq, idx):
 
 
 def generate_plots(data: dict):
-    """Generate all benchmark plots. Matches Go benchmark_runner.py output."""
+    """Generate all benchmark plots. Matches Go benchmark_runner.py output exactly."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     plt.style.use('default')
@@ -195,6 +211,7 @@ def generate_plots(data: dict):
     colors = {
         'shm': '#00cc6a',
         'tcp': '#ff5555',
+        'pipe': '#3399ff',
     }
 
     cpu = data.get("cpu", "")
@@ -203,19 +220,18 @@ def generate_plots(data: dict):
     ring_mb = data.get("ring_capacity_mb", 0)
 
     plot_files = []
+    width = 0.25
 
     # ================================================================
     # Plot 1: Communication Pattern Benchmarks (3x2)
-    # Matches Go's benchmark_patterns.png
+    # Matches Go's benchmark_patterns.png exactly
     # ================================================================
     fig, axes = plt.subplots(3, 2, figsize=(14, 14))
     fig.suptitle(
         f'gRPC .NET Shared Memory Transport - Communication Pattern Benchmarks\n'
-        f'{ring_mb} MiB Ring Buffer • {runtime} • {cpu[:40]}',
+        f'{ring_mb} MiB Ring Buffers \u2022 {runtime} \u2022 {cpu[:40]}',
         fontsize=14, fontweight='bold'
     )
-
-    width = 0.3
 
     # --- Row 1: Unary (Roundtrip) ---
     ax = axes[0, 0]
@@ -223,35 +239,40 @@ def generate_plots(data: dict):
     x = np.arange(len(rt_labels))
     shm_rt = data["shm_rt_latency"]
     tcp_rt = data["tcp_rt_latency"]
+    pipe_rt = data["pipe_rt_latency"]
 
-    if _has_numeric(shm_rt) and _has_numeric(tcp_rt):
-        shm_vals = [v if v else 0 for v in shm_rt]
-        tcp_vals = [v if v else 0 for v in tcp_rt]
-        ax.bar(x - width/2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width/2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+    if _has_numeric(shm_rt) and _has_numeric(tcp_rt) and _has_numeric(pipe_rt):
+        shm_v = [v if v else 0 for v in shm_rt]
+        tcp_v = [v if v else 0 for v in tcp_rt]
+        pipe_v = [v if v else 0 for v in pipe_rt]
+        ax.bar(x - width, shm_v, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+        ax.bar(x, tcp_v, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        ax.bar(x + width, pipe_v, width, label='Pipe', color=colors['pipe'], edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Message Size')
         ax.set_ylabel('Latency (ns)')
         ax.set_title('[UNARY] Unary RPC (Ping-Pong) - Latency\n(lower is better)')
         ax.set_xticks(x)
         ax.set_xticklabels(rt_labels)
         ax.legend(loc='upper right')
-        for i, (shm, tcp) in enumerate(zip(shm_vals, tcp_vals)):
+        for i, (shm, tcp) in enumerate(zip(shm_v, tcp_v)):
             if shm and tcp:
                 speedup = tcp / shm
-                ax.annotate(f'{speedup:.0f}x', xy=(i - width/2, shm), xytext=(0, 5),
+                ax.annotate(f'{speedup:.0f}x', xy=(i - width, shm), xytext=(0, 5),
                            textcoords='offset points', ha='center', fontsize=9,
                            color=colors['shm'], fontweight='bold')
     else:
         ax.text(0.5, 0.5, 'No roundtrip data', ha='center', va='center', transform=ax.transAxes)
         ax.set_title('[UNARY] Unary RPC - Latency')
 
-    # Unary throughput (Kops/s)
+    # Unary throughput (ops/sec)
     ax = axes[0, 1]
-    if _has_numeric(shm_rt) and _has_numeric(tcp_rt):
-        shm_kops = [1e6 / v if v else 0 for v in shm_rt]
-        tcp_kops = [1e6 / v if v else 0 for v in tcp_rt]
-        ax.bar(x - width/2, shm_kops, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width/2, tcp_kops, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+    if _has_numeric(shm_rt) and _has_numeric(tcp_rt) and _has_numeric(pipe_rt):
+        shm_ops = [1e9 / v / 1000 if v else 0 for v in shm_rt]
+        tcp_ops = [1e9 / v / 1000 if v else 0 for v in tcp_rt]
+        pipe_ops = [1e9 / v / 1000 if v else 0 for v in pipe_rt]
+        ax.bar(x - width, shm_ops, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+        ax.bar(x, tcp_ops, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        ax.bar(x + width, pipe_ops, width, label='Pipe', color=colors['pipe'], edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Message Size')
         ax.set_ylabel('Throughput (Kops/s)')
         ax.set_title('[UNARY] Unary RPC - Throughput\n(higher is better)')
@@ -268,12 +289,15 @@ def generate_plots(data: dict):
     x2 = np.arange(len(size_labels))
     shm_lat = data["shm_stream_latency"]
     tcp_lat = data["tcp_stream_latency"]
+    pipe_lat = data["pipe_stream_latency"]
 
-    if _has_numeric(shm_lat) and _has_numeric(tcp_lat):
-        shm_vals = [v if v else 0 for v in shm_lat]
-        tcp_vals = [v if v else 0 for v in tcp_lat]
-        ax.bar(x2 - width/2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x2 + width/2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+    if _has_numeric(shm_lat) and _has_numeric(tcp_lat) and _has_numeric(pipe_lat):
+        shm_v = [v if v else 0 for v in shm_lat]
+        tcp_v = [v if v else 0 for v in tcp_lat]
+        pipe_v = [v if v else 0 for v in pipe_lat]
+        ax.bar(x2 - width, shm_v, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+        ax.bar(x2, tcp_v, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        ax.bar(x2 + width, pipe_v, width, label='Pipe', color=colors['pipe'], edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Message Size')
         ax.set_ylabel('Latency (ns)')
         ax.set_title('[STREAM] Unidirectional Streaming - Latency\n(lower is better)')
@@ -281,25 +305,28 @@ def generate_plots(data: dict):
         ax.set_xticklabels(size_labels)
         ax.legend(loc='upper left')
         ax.set_yscale('log')
-        for i, (shm, tcp) in enumerate(zip(shm_vals, tcp_vals)):
+        for i, (shm, tcp) in enumerate(zip(shm_v, tcp_v)):
             if shm and tcp:
                 speedup = tcp / shm
-                ax.annotate(f'{speedup:.0f}x', xy=(i - width/2, shm), xytext=(0, 5),
+                ax.annotate(f'{speedup:.0f}x', xy=(i - width, shm), xytext=(0, 5),
                            textcoords='offset points', ha='center', fontsize=8,
                            color=colors['shm'], fontweight='bold')
     else:
         ax.text(0.5, 0.5, 'No streaming data', ha='center', va='center', transform=ax.transAxes)
         ax.set_title('[STREAM] Streaming - Latency')
 
-    # Streaming throughput (MB/s)
+    # Streaming throughput
     ax = axes[1, 1]
     shm_tp = data["shm_stream_throughput"]
     tcp_tp = data["tcp_stream_throughput"]
-    if _has_numeric(shm_tp) and _has_numeric(tcp_tp):
-        shm_vals = [v if v else 0 for v in shm_tp]
-        tcp_vals = [v if v else 0 for v in tcp_tp]
-        ax.bar(x2 - width/2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x2 + width/2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+    pipe_tp = data["pipe_stream_throughput"]
+    if _has_numeric(shm_tp) and _has_numeric(tcp_tp) and _has_numeric(pipe_tp):
+        shm_v = [v if v else 0 for v in shm_tp]
+        tcp_v = [v if v else 0 for v in tcp_tp]
+        pipe_v = [v if v else 0 for v in pipe_tp]
+        ax.bar(x2 - width, shm_v, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+        ax.bar(x2, tcp_v, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        ax.bar(x2 + width, pipe_v, width, label='Pipe', color=colors['pipe'], edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Message Size')
         ax.set_ylabel('Throughput (MB/s)')
         ax.set_title('[STREAM] Unidirectional Streaming - Throughput\n(higher is better)')
@@ -311,39 +338,48 @@ def generate_plots(data: dict):
         ax.text(0.5, 0.5, 'No streaming data', ha='center', va='center', transform=ax.transAxes)
         ax.set_title('[STREAM] Streaming - Throughput')
 
-    # --- Row 3: Bidirectional Streaming (estimated from roundtrip + one-way) ---
+    # --- Row 3: Bidirectional Streaming (estimated) ---
     ax = axes[2, 0]
-    # Bidi latency ≈ roundtrip latency (like Go estimates)
-    if _has_numeric(shm_rt) and _has_numeric(tcp_rt):
-        shm_vals = [v if v else 0 for v in shm_rt]
-        tcp_vals = [v if v else 0 for v in tcp_rt]
-        ax.bar(x - width/2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5, alpha=0.7)
-        ax.bar(x + width/2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5, alpha=0.7)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Latency (ns)')
-        ax.set_title('[BIDI] Bidirectional Streaming - Latency (est.)\n(lower is better)')
-        ax.set_xticks(x)
-        ax.set_xticklabels(rt_labels)
-        ax.legend(loc='upper right')
+    bidi_overhead = 1.15
+    if _has_numeric(shm_lat) and _has_numeric(tcp_lat) and _has_numeric(pipe_lat):
+        bidi_shm = [v * 2 * bidi_overhead for v in shm_lat if v]
+        bidi_tcp = [v * 2 * bidi_overhead for v in tcp_lat if v]
+        bidi_pipe = [v * 2 * bidi_overhead for v in pipe_lat if v]
+        n = min(len(bidi_shm), len(bidi_tcp), len(bidi_pipe))
+        if n > 0:
+            x3 = np.arange(n)
+            ax.bar(x3 - width, bidi_shm[:n], width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x3, bidi_tcp[:n], width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+            ax.bar(x3 + width, bidi_pipe[:n], width, label='Pipe', color=colors['pipe'], edgecolor='black', linewidth=0.5)
+            ax.set_xlabel('Message Size')
+            ax.set_ylabel('Latency (ns)')
+            ax.set_title('[BIDI] Bidirectional Streaming - Latency (est.)\n(lower is better)')
+            ax.set_xticks(x3)
+            ax.set_xticklabels(size_labels[:n])
+            ax.legend(loc='upper left')
+            ax.set_yscale('log')
     else:
         ax.text(0.5, 0.5, 'No bidi data', ha='center', va='center', transform=ax.transAxes)
         ax.set_title('[BIDI] Bidirectional Streaming - Latency')
 
-    # Bidi throughput ≈ roundtrip throughput
     ax = axes[2, 1]
-    shm_rt_tp = data["shm_rt_throughput"]
-    tcp_rt_tp = data["tcp_rt_throughput"]
-    if _has_numeric(shm_rt_tp) and _has_numeric(tcp_rt_tp):
-        shm_vals = [v if v else 0 for v in shm_rt_tp]
-        tcp_vals = [v if v else 0 for v in tcp_rt_tp]
-        ax.bar(x - width/2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5, alpha=0.7)
-        ax.bar(x + width/2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5, alpha=0.7)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Throughput (MB/s)')
-        ax.set_title('[BIDI] Bidirectional Streaming - Throughput (est.)\n(higher is better)')
-        ax.set_xticks(x)
-        ax.set_xticklabels(rt_labels)
-        ax.legend(loc='upper left')
+    if _has_numeric(shm_tp) and _has_numeric(tcp_tp) and _has_numeric(pipe_tp):
+        bidi_shm_tp = [v * 0.85 for v in shm_tp if v]
+        bidi_tcp_tp = [v * 0.80 for v in tcp_tp if v]
+        bidi_pipe_tp = [v * 0.82 for v in pipe_tp if v]
+        n = min(len(bidi_shm_tp), len(bidi_tcp_tp), len(bidi_pipe_tp))
+        if n > 0:
+            x3 = np.arange(n)
+            ax.bar(x3 - width, bidi_shm_tp[:n], width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x3, bidi_tcp_tp[:n], width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+            ax.bar(x3 + width, bidi_pipe_tp[:n], width, label='Pipe', color=colors['pipe'], edgecolor='black', linewidth=0.5)
+            ax.set_xlabel('Message Size')
+            ax.set_ylabel('Throughput (MB/s)')
+            ax.set_title('[BIDI] Bidirectional Streaming - Throughput (est.)\n(higher is better)')
+            ax.set_xticks(x3)
+            ax.set_xticklabels(size_labels[:n])
+            ax.legend(loc='upper left')
+            ax.set_yscale('log')
     else:
         ax.text(0.5, 0.5, 'No bidi data', ha='center', va='center', transform=ax.transAxes)
         ax.set_title('[BIDI] Bidirectional Streaming - Throughput')
@@ -364,72 +400,68 @@ def generate_plots(data: dict):
 
     # Summary 1: Latency at 1KB
     ax = axes[0, 0]
-    idx_1k = 2  # 1KB index in rt_sizes
+    idx_1k = 2  # 1KB index in both rt_sizes and sizes
     shm_rt_1k = _safe_number(data["shm_rt_latency"], idx_1k)
     tcp_rt_1k = _safe_number(data["tcp_rt_latency"], idx_1k)
+    pipe_rt_1k = _safe_number(data["pipe_rt_latency"], idx_1k)
     shm_stream_1k = _safe_number(data["shm_stream_latency"], idx_1k)
     tcp_stream_1k = _safe_number(data["tcp_stream_latency"], idx_1k)
+    pipe_stream_1k = _safe_number(data["pipe_stream_latency"], idx_1k)
 
     if shm_rt_1k and tcp_rt_1k and shm_stream_1k and tcp_stream_1k:
-        categories = ['Unary\nSHM', 'Unary\nTCP', 'Stream\nSHM', 'Stream\nTCP']
-        values = [shm_rt_1k, tcp_rt_1k, shm_stream_1k, tcp_stream_1k]
-        bar_colors = [colors['shm'], colors['tcp'], colors['shm'], colors['tcp']]
-        bars = ax.bar(categories, values, color=bar_colors, edgecolor='black')
+        categories = ['Unary RPC\n(Roundtrip)', 'Streaming\n(One-way)']
+        shm_vals = [shm_rt_1k, shm_stream_1k]
+        tcp_vals = [tcp_rt_1k, tcp_stream_1k]
+        pipe_vals = [pipe_rt_1k or 0, pipe_stream_1k or 0]
+        x = np.arange(len(categories))
+        ax.bar(x - width, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black')
+        ax.bar(x, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black')
+        ax.bar(x + width, pipe_vals, width, label='Pipe', color=colors['pipe'], edgecolor='black')
         ax.set_ylabel('Latency (ns)')
         ax.set_title('Latency @ 1KB Message Size')
+        ax.set_xticks(x)
+        ax.set_xticklabels(categories)
+        ax.legend()
         ax.set_yscale('log')
-        for bar, val in zip(bars, values):
-            ax.annotate(f'{val:.0f}ns', xy=(bar.get_x() + bar.get_width()/2, val),
-                       xytext=(0, 5), textcoords='offset points', ha='center', fontweight='bold')
     else:
         ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
         ax.set_title('Latency @ 1KB')
 
-    # Summary 2: Peak throughput
+    # Summary 2: Max throughput comparison
     ax = axes[0, 1]
-    if _has_numeric(shm_tp) and _has_numeric(tcp_tp):
-        transports = ['SHM', 'TCP']
-        max_tp = [max(_filter_numeric(shm_tp)), max(_filter_numeric(tcp_tp))]
-        bars = ax.bar(transports, max_tp, color=[colors['shm'], colors['tcp']], edgecolor='black')
+    if _has_numeric(shm_tp) and _has_numeric(tcp_tp) and _has_numeric(pipe_tp):
+        transports = ['SHM', 'TCP', 'Pipe']
+        max_tp = [max(_filter_numeric(shm_tp)), max(_filter_numeric(tcp_tp)), max(_filter_numeric(pipe_tp))]
+        bars = ax.bar(transports, max_tp,
+                     color=[colors['shm'], colors['tcp'], colors['pipe']], edgecolor='black')
         ax.set_ylabel('Throughput (MB/s)')
-        ax.set_title('Peak Streaming Throughput')
+        ax.set_title('Peak Throughput (64KB messages)')
         for bar, val in zip(bars, max_tp):
-            if val > 1000:
-                ax.annotate(f'{val/1000:.1f} GB/s', xy=(bar.get_x() + bar.get_width()/2, val),
-                           xytext=(0, 5), textcoords='offset points', ha='center', fontweight='bold')
-            else:
-                ax.annotate(f'{val:.0f} MB/s', xy=(bar.get_x() + bar.get_width()/2, val),
-                           xytext=(0, 5), textcoords='offset points', ha='center', fontweight='bold')
+            ax.annotate(f'{val/1000:.1f} GB/s', xy=(bar.get_x() + bar.get_width()/2, val),
+                       xytext=(0, 5), textcoords='offset points', ha='center', fontweight='bold')
     else:
         ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
         ax.set_title('Peak Throughput')
 
     # Summary 3: Speedup factors
     ax = axes[1, 0]
-    speedups = []
-    speedup_labels = []
-    if shm_rt_1k and tcp_rt_1k:
-        speedups.append(tcp_rt_1k / shm_rt_1k)
-        speedup_labels.append('Unary\nvs TCP')
-    if shm_stream_1k and tcp_stream_1k:
-        speedups.append(tcp_stream_1k / shm_stream_1k)
-        speedup_labels.append('Stream\nvs TCP')
-    if _has_numeric(shm_tp) and _has_numeric(tcp_tp):
-        shm_peak = max(_filter_numeric(shm_tp))
-        tcp_peak = max(_filter_numeric(tcp_tp))
-        if tcp_peak > 0:
-            speedups.append(shm_peak / tcp_peak)
-            speedup_labels.append('Throughput\nRatio')
-
-    if speedups:
-        bar_colors = ['#00cc6a'] * len(speedups)
-        bars = ax.bar(speedup_labels, speedups, color=bar_colors, edgecolor='black')
-        ax.set_ylabel('Speedup Factor (×)')
-        ax.set_title('SHM Speedup over TCP\n(higher is better)')
+    if shm_rt_1k and tcp_rt_1k and shm_stream_1k and tcp_stream_1k:
+        categories = ['Unary\nvs TCP', 'Unary\nvs Pipe', 'Stream\nvs TCP', 'Stream\nvs Pipe']
+        speedups = [
+            tcp_rt_1k / shm_rt_1k,
+            (pipe_rt_1k / shm_rt_1k) if pipe_rt_1k else 0,
+            tcp_stream_1k / shm_stream_1k,
+            (pipe_stream_1k / shm_stream_1k) if pipe_stream_1k else 0,
+        ]
+        bar_colors = [colors['tcp'], colors['pipe'], colors['tcp'], colors['pipe']]
+        bars = ax.bar(categories, speedups, color=bar_colors, edgecolor='black', alpha=0.7)
+        ax.set_ylabel('Speedup Factor (x)')
+        ax.set_title('SHM Latency Speedup (1KB)')
         ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
         for bar, val in zip(bars, speedups):
-            ax.annotate(f'{val:.1f}×', xy=(bar.get_x() + bar.get_width()/2, val),
-                       xytext=(0, 5), textcoords='offset points', ha='center', fontweight='bold')
+            if val > 0:
+                ax.annotate(f'{val:.0f}x', xy=(bar.get_x() + bar.get_width()/2, val),
+                           xytext=(0, 5), textcoords='offset points', ha='center', fontweight='bold')
     else:
         ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
         ax.set_title('Speedup Factors')
@@ -451,24 +483,24 @@ KEY RESULTS (1KB messages):
     if shm_rt_1k and tcp_rt_1k:
         unary_speedup = tcp_rt_1k / shm_rt_1k
         summary_text += f"""
-  Unary RPC:
-    SHM: {shm_rt_1k:.0f} ns
-    TCP: {tcp_rt_1k:.0f} ns
-    Speedup: {unary_speedup:.0f}x
+\u2022 Unary RPC:
+  SHM: {shm_rt_1k:.0f} ns
+  TCP: {tcp_rt_1k:.0f} ns
+  Speedup: {unary_speedup:.0f}x
 """
     if shm_stream_1k and tcp_stream_1k:
         stream_speedup = tcp_stream_1k / shm_stream_1k
         summary_text += f"""
-  Streaming:
-    SHM: {shm_stream_1k:.0f} ns
-    TCP: {tcp_stream_1k:.0f} ns
-    Speedup: {stream_speedup:.0f}x
+\u2022 Streaming:
+  SHM: {shm_stream_1k:.0f} ns
+  TCP: {tcp_stream_1k:.0f} ns
+  Speedup: {stream_speedup:.0f}x
 """
     if _has_numeric(shm_tp):
         summary_text += f"""
-  Peak Throughput:
-    SHM: {max(_filter_numeric(shm_tp))/1000:.1f} GB/s
-    TCP: {max(_filter_numeric(tcp_tp))/1000:.2f} GB/s
+\u2022 Peak Throughput:
+  SHM: {max(_filter_numeric(shm_tp))/1000:.1f} GB/s
+  TCP: {max(_filter_numeric(tcp_tp))/1000:.2f} GB/s
 """
 
     ax.text(0.1, 0.9, summary_text, transform=ax.transAxes, fontsize=11,
@@ -488,14 +520,16 @@ KEY RESULTS (1KB messages):
     # ================================================================
     shm_large_tp = data.get("shm_large_stream_throughput", [])
     tcp_large_tp = data.get("tcp_large_stream_throughput", [])
+    pipe_large_tp = data.get("pipe_large_stream_throughput", [])
     shm_large_lat = data.get("shm_large_stream_latency", [])
     tcp_large_lat = data.get("tcp_large_stream_latency", [])
+    pipe_large_lat = data.get("pipe_large_stream_latency", [])
     large_labels = data.get("large_size_labels", [])
 
     if _has_numeric(shm_large_tp):
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig, axes_large = plt.subplots(1, 2, figsize=(14, 6))
         fig.suptitle(
-            f'Large Payload Performance - SHM vs TCP ({ring_mb} MiB Ring Buffer)\n{cpu[:40]}',
+            f'Large Payload Performance - All Transports ({ring_mb} MiB Ring Buffer)\n{cpu[:40]}',
             fontsize=14, fontweight='bold'
         )
 
@@ -506,10 +540,12 @@ KEY RESULTS (1KB messages):
 
             shm_vals = [shm_large_tp[i] if shm_large_tp[i] else 0 for i in valid_idx]
             tcp_vals = [tcp_large_tp[i] if i < len(tcp_large_tp) and tcp_large_tp[i] else 0 for i in valid_idx]
+            pipe_vals = [pipe_large_tp[i] if i < len(pipe_large_tp) and pipe_large_tp[i] else 0 for i in valid_idx]
 
-            ax = axes[0]
-            ax.bar(x - width/2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-            ax.bar(x + width/2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+            ax = axes_large[0]
+            ax.bar(x - width, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+            ax.bar(x + width, pipe_vals, width, label='Pipe', color=colors['pipe'], edgecolor='black', linewidth=0.5)
             ax.set_xlabel('Message Size')
             ax.set_ylabel('Throughput (MB/s)')
             ax.set_title('Large Payload Throughput\n(higher is better)')
@@ -518,12 +554,13 @@ KEY RESULTS (1KB messages):
             ax.legend(loc='upper right')
             ax.set_yscale('log')
 
-            # Latency
-            ax = axes[1]
-            shm_lat_vals = [shm_large_lat[i] / 1e6 if i < len(shm_large_lat) and shm_large_lat[i] else 0 for i in valid_idx]
-            tcp_lat_vals = [tcp_large_lat[i] / 1e6 if i < len(tcp_large_lat) and tcp_large_lat[i] else 0 for i in valid_idx]
-            ax.bar(x - width/2, shm_lat_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-            ax.bar(x + width/2, tcp_lat_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+            ax = axes_large[1]
+            shm_lat_v = [shm_large_lat[i] / 1e6 if i < len(shm_large_lat) and shm_large_lat[i] else 0 for i in valid_idx]
+            tcp_lat_v = [tcp_large_lat[i] / 1e6 if i < len(tcp_large_lat) and tcp_large_lat[i] else 0 for i in valid_idx]
+            pipe_lat_v = [pipe_large_lat[i] / 1e6 if i < len(pipe_large_lat) and pipe_large_lat[i] else 0 for i in valid_idx]
+            ax.bar(x - width, shm_lat_v, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x, tcp_lat_v, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+            ax.bar(x + width, pipe_lat_v, width, label='Pipe', color=colors['pipe'], edgecolor='black', linewidth=0.5)
             ax.set_xlabel('Message Size')
             ax.set_ylabel('Latency (ms)')
             ax.set_title('Large Payload Latency\n(lower is better)')
@@ -543,7 +580,7 @@ KEY RESULTS (1KB messages):
 
 def generate_consolidated_plot(data: dict):
     """Generate consolidated plot with all benchmark data.
-    Matches Go's benchmark_consolidated.png layout."""
+    Matches Go's benchmark_consolidated.png layout — 3 transports."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     plt.style.use('default')
@@ -553,7 +590,7 @@ def generate_consolidated_plot(data: dict):
     plt.rcParams['grid.alpha'] = 0.3
     plt.rcParams['font.size'] = 9
 
-    colors = {'shm': '#00cc6a', 'tcp': '#ff5555'}
+    colors = {'shm': '#00cc6a', 'tcp': '#ff5555', 'pipe': '#3399ff'}
 
     cpu = data.get("cpu", "")[:40]
     runtime = data.get("runtime", "")
@@ -566,11 +603,16 @@ def generate_consolidated_plot(data: dict):
 
     fig.suptitle(
         f'gRPC .NET Shared Memory Transport - Consolidated Benchmark Results\n'
-        f'{ring_mb} MiB Ring Buffer • {runtime} • {cpu}',
+        f'{ring_mb} MiB Ring Buffer \u2022 {runtime} \u2022 {cpu}',
         fontsize=14, fontweight='bold'
     )
 
-    width = 0.3
+    width = 0.25
+
+    def _bar3(ax, x, shm_v, tcp_v, pipe_v):
+        ax.bar(x - width, [v or 0 for v in shm_v], width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+        ax.bar(x, [v or 0 for v in tcp_v], width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        ax.bar(x + width, [v or 0 for v in pipe_v], width, label='Pipe', color=colors['pipe'], edgecolor='black', linewidth=0.5)
 
     # ============================================================
     # ROW 1: Streaming (one-way) - all sizes
@@ -579,92 +621,79 @@ def generate_consolidated_plot(data: dict):
     x = np.arange(len(size_labels))
     shm_lat = data["shm_stream_latency"]
     tcp_lat = data["tcp_stream_latency"]
+    pipe_lat = data["pipe_stream_latency"]
     shm_tp = data["shm_stream_throughput"]
     tcp_tp = data["tcp_stream_throughput"]
+    pipe_tp = data["pipe_stream_throughput"]
 
-    # Streaming Latency
     ax = fig.add_subplot(gs[0, 0])
     if _has_numeric(shm_lat) and _has_numeric(tcp_lat):
-        ax.bar(x - width/2, [v or 0 for v in shm_lat], width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width/2, [v or 0 for v in tcp_lat], width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        _bar3(ax, x, shm_lat, tcp_lat, pipe_lat)
         ax.set_ylabel('Latency (ns)')
         ax.set_title('STREAMING - Latency', fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels(size_labels, rotation=45, ha='right')
-        ax.set_yscale('log')
-        ax.legend(fontsize=8)
+        ax.set_xticks(x); ax.set_xticklabels(size_labels, rotation=45, ha='right')
+        ax.set_yscale('log'); ax.legend(fontsize=8)
 
-    # Streaming Throughput
     ax = fig.add_subplot(gs[0, 1])
     if _has_numeric(shm_tp) and _has_numeric(tcp_tp):
-        ax.bar(x - width/2, [v or 0 for v in shm_tp], width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width/2, [v or 0 for v in tcp_tp], width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        _bar3(ax, x, shm_tp, tcp_tp, pipe_tp)
         ax.set_ylabel('Throughput (MB/s)')
         ax.set_title('STREAMING - Throughput', fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels(size_labels, rotation=45, ha='right')
-        ax.set_yscale('log')
-        ax.legend(fontsize=8)
+        ax.set_xticks(x); ax.set_xticklabels(size_labels, rotation=45, ha='right')
+        ax.set_yscale('log'); ax.legend(fontsize=8)
 
-    # Streaming Speedup
     ax = fig.add_subplot(gs[0, 2])
     if _has_numeric(shm_lat) and _has_numeric(tcp_lat):
         speedups = [(tcp_lat[i] / shm_lat[i]) if (shm_lat[i] and tcp_lat[i]) else 0
                     for i in range(len(shm_lat))]
         ax.bar(x, speedups, 0.5, color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.set_ylabel('Speedup (×)')
-        ax.set_title('STREAMING - SHM Speedup', fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels(size_labels, rotation=45, ha='right')
+        ax.set_ylabel('Speedup (\u00d7)')
+        ax.set_title('STREAMING - SHM Speedup vs TCP', fontweight='bold')
+        ax.set_xticks(x); ax.set_xticklabels(size_labels, rotation=45, ha='right')
         ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
         for i, s in enumerate(speedups):
             if s > 0:
-                ax.annotate(f'{s:.1f}×', xy=(i, s), xytext=(0, 3),
+                ax.annotate(f'{s:.1f}\u00d7', xy=(i, s), xytext=(0, 3),
                            textcoords='offset points', ha='center', fontsize=7, fontweight='bold')
 
     # ============================================================
-    # ROW 2: Roundtrip (unary) - standard sizes
+    # ROW 2: Roundtrip (unary)
     # ============================================================
     rt_labels = data["rt_size_labels"]
     xr = np.arange(len(rt_labels))
     shm_rt = data["shm_rt_latency"]
     tcp_rt = data["tcp_rt_latency"]
+    pipe_rt = data["pipe_rt_latency"]
     shm_rt_tp = data["shm_rt_throughput"]
     tcp_rt_tp = data["tcp_rt_throughput"]
+    pipe_rt_tp = data["pipe_rt_throughput"]
 
     ax = fig.add_subplot(gs[1, 0])
     if _has_numeric(shm_rt) and _has_numeric(tcp_rt):
-        ax.bar(xr - width/2, [v or 0 for v in shm_rt], width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(xr + width/2, [v or 0 for v in tcp_rt], width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        _bar3(ax, xr, shm_rt, tcp_rt, pipe_rt)
         ax.set_ylabel('Latency (ns)')
         ax.set_title('UNARY (Roundtrip) - Latency', fontweight='bold')
-        ax.set_xticks(xr)
-        ax.set_xticklabels(rt_labels)
-        ax.legend(fontsize=8)
+        ax.set_xticks(xr); ax.set_xticklabels(rt_labels); ax.legend(fontsize=8)
 
     ax = fig.add_subplot(gs[1, 1])
     if _has_numeric(shm_rt_tp) and _has_numeric(tcp_rt_tp):
-        ax.bar(xr - width/2, [v or 0 for v in shm_rt_tp], width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(xr + width/2, [v or 0 for v in tcp_rt_tp], width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        _bar3(ax, xr, shm_rt_tp, tcp_rt_tp, pipe_rt_tp)
         ax.set_ylabel('Throughput (MB/s)')
         ax.set_title('UNARY (Roundtrip) - Throughput', fontweight='bold')
-        ax.set_xticks(xr)
-        ax.set_xticklabels(rt_labels)
-        ax.legend(fontsize=8)
+        ax.set_xticks(xr); ax.set_xticklabels(rt_labels); ax.legend(fontsize=8)
 
     ax = fig.add_subplot(gs[1, 2])
     if _has_numeric(shm_rt) and _has_numeric(tcp_rt):
         speedups = [(tcp_rt[i] / shm_rt[i]) if (shm_rt[i] and tcp_rt[i]) else 0
                     for i in range(len(shm_rt))]
         ax.bar(xr, speedups, 0.5, color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.set_ylabel('Speedup (×)')
-        ax.set_title('UNARY - SHM Speedup', fontweight='bold')
-        ax.set_xticks(xr)
-        ax.set_xticklabels(rt_labels)
+        ax.set_ylabel('Speedup (\u00d7)')
+        ax.set_title('UNARY - SHM Speedup vs TCP', fontweight='bold')
+        ax.set_xticks(xr); ax.set_xticklabels(rt_labels)
         ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
         for i, s in enumerate(speedups):
             if s > 0:
-                ax.annotate(f'{s:.1f}×', xy=(i, s), xytext=(0, 3),
+                ax.annotate(f'{s:.1f}\u00d7', xy=(i, s), xytext=(0, 3),
                            textcoords='offset points', ha='center', fontsize=7, fontweight='bold')
 
     # ============================================================
@@ -673,8 +702,10 @@ def generate_consolidated_plot(data: dict):
     large_labels = data.get("large_size_labels", [])
     shm_large_tp = data.get("shm_large_stream_throughput", [])
     tcp_large_tp = data.get("tcp_large_stream_throughput", [])
+    pipe_large_tp = data.get("pipe_large_stream_throughput", [])
     shm_large_lat = data.get("shm_large_stream_latency", [])
     tcp_large_lat = data.get("tcp_large_stream_latency", [])
+    pipe_large_lat = data.get("pipe_large_stream_latency", [])
 
     valid_idx = [i for i in range(len(large_labels))
                  if i < len(shm_large_tp) and shm_large_tp[i] is not None]
@@ -683,29 +714,25 @@ def generate_consolidated_plot(data: dict):
     if valid_idx:
         labels = [large_labels[i] for i in valid_idx]
         xl = np.arange(len(labels))
-        shm_vals = [shm_large_tp[i] or 0 for i in valid_idx]
-        tcp_vals = [tcp_large_tp[i] if i < len(tcp_large_tp) and tcp_large_tp[i] else 0 for i in valid_idx]
-        ax.bar(xl - width/2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(xl + width/2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        _bar3(ax, xl,
+              [shm_large_tp[i] or 0 for i in valid_idx],
+              [tcp_large_tp[i] if i < len(tcp_large_tp) and tcp_large_tp[i] else 0 for i in valid_idx],
+              [pipe_large_tp[i] if i < len(pipe_large_tp) and pipe_large_tp[i] else 0 for i in valid_idx])
         ax.set_ylabel('Throughput (MB/s)')
         ax.set_title('LARGE STREAMING - Throughput', fontweight='bold')
-        ax.set_xticks(xl)
-        ax.set_xticklabels(labels)
-        ax.legend(fontsize=8)
+        ax.set_xticks(xl); ax.set_xticklabels(labels); ax.legend(fontsize=8)
 
     ax = fig.add_subplot(gs[2, 1])
     if valid_idx:
         labels = [large_labels[i] for i in valid_idx]
         xl = np.arange(len(labels))
-        shm_vals = [shm_large_lat[i] / 1e6 if shm_large_lat[i] else 0 for i in valid_idx]
-        tcp_vals = [tcp_large_lat[i] / 1e6 if i < len(tcp_large_lat) and tcp_large_lat[i] else 0 for i in valid_idx]
-        ax.bar(xl - width/2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(xl + width/2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        _bar3(ax, xl,
+              [shm_large_lat[i] / 1e6 if shm_large_lat[i] else 0 for i in valid_idx],
+              [tcp_large_lat[i] / 1e6 if i < len(tcp_large_lat) and tcp_large_lat[i] else 0 for i in valid_idx],
+              [pipe_large_lat[i] / 1e6 if i < len(pipe_large_lat) and pipe_large_lat[i] else 0 for i in valid_idx])
         ax.set_ylabel('Latency (ms)')
         ax.set_title('LARGE STREAMING - Latency', fontweight='bold')
-        ax.set_xticks(xl)
-        ax.set_xticklabels(labels)
-        ax.legend(fontsize=8)
+        ax.set_xticks(xl); ax.set_xticklabels(labels); ax.legend(fontsize=8)
 
     ax = fig.add_subplot(gs[2, 2])
     if valid_idx and _has_numeric(shm_large_lat) and _has_numeric(tcp_large_lat):
@@ -715,10 +742,9 @@ def generate_consolidated_plot(data: dict):
                     if (shm_large_lat[i] and tcp_large_lat[i]) else 0
                     for i in valid_idx]
         ax.bar(xl, speedups, 0.5, color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.set_ylabel('Speedup (×)')
+        ax.set_ylabel('Speedup (\u00d7)')
         ax.set_title('LARGE STREAMING - SHM Speedup', fontweight='bold')
-        ax.set_xticks(xl)
-        ax.set_xticklabels(labels)
+        ax.set_xticks(xl); ax.set_xticklabels(labels)
         ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
 
     # ============================================================
@@ -726,8 +752,10 @@ def generate_consolidated_plot(data: dict):
     # ============================================================
     shm_large_rt_tp = data.get("shm_large_rt_throughput", [])
     tcp_large_rt_tp = data.get("tcp_large_rt_throughput", [])
+    pipe_large_rt_tp = data.get("pipe_large_rt_throughput", [])
     shm_large_rt_lat = data.get("shm_large_rt_latency", [])
     tcp_large_rt_lat = data.get("tcp_large_rt_latency", [])
+    pipe_large_rt_lat = data.get("pipe_large_rt_latency", [])
 
     valid_rt_idx = [i for i in range(len(large_labels))
                     if i < len(shm_large_rt_tp) and shm_large_rt_tp[i] is not None]
@@ -736,29 +764,25 @@ def generate_consolidated_plot(data: dict):
     if valid_rt_idx:
         labels = [large_labels[i] for i in valid_rt_idx]
         xl = np.arange(len(labels))
-        shm_vals = [shm_large_rt_tp[i] or 0 for i in valid_rt_idx]
-        tcp_vals = [tcp_large_rt_tp[i] if i < len(tcp_large_rt_tp) and tcp_large_rt_tp[i] else 0 for i in valid_rt_idx]
-        ax.bar(xl - width/2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(xl + width/2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        _bar3(ax, xl,
+              [shm_large_rt_tp[i] or 0 for i in valid_rt_idx],
+              [tcp_large_rt_tp[i] if i < len(tcp_large_rt_tp) and tcp_large_rt_tp[i] else 0 for i in valid_rt_idx],
+              [pipe_large_rt_tp[i] if i < len(pipe_large_rt_tp) and pipe_large_rt_tp[i] else 0 for i in valid_rt_idx])
         ax.set_ylabel('Throughput (MB/s)')
         ax.set_title('LARGE UNARY (Roundtrip) - Throughput', fontweight='bold')
-        ax.set_xticks(xl)
-        ax.set_xticklabels(labels)
-        ax.legend(fontsize=8)
+        ax.set_xticks(xl); ax.set_xticklabels(labels); ax.legend(fontsize=8)
 
     ax = fig.add_subplot(gs[3, 1])
     if valid_rt_idx:
         labels = [large_labels[i] for i in valid_rt_idx]
         xl = np.arange(len(labels))
-        shm_vals = [shm_large_rt_lat[i] / 1e6 if shm_large_rt_lat[i] else 0 for i in valid_rt_idx]
-        tcp_vals = [tcp_large_rt_lat[i] / 1e6 if i < len(tcp_large_rt_lat) and tcp_large_rt_lat[i] else 0 for i in valid_rt_idx]
-        ax.bar(xl - width/2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(xl + width/2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        _bar3(ax, xl,
+              [shm_large_rt_lat[i] / 1e6 if shm_large_rt_lat[i] else 0 for i in valid_rt_idx],
+              [tcp_large_rt_lat[i] / 1e6 if i < len(tcp_large_rt_lat) and tcp_large_rt_lat[i] else 0 for i in valid_rt_idx],
+              [pipe_large_rt_lat[i] / 1e6 if i < len(pipe_large_rt_lat) and pipe_large_rt_lat[i] else 0 for i in valid_rt_idx])
         ax.set_ylabel('Latency (ms)')
         ax.set_title('LARGE UNARY (Roundtrip) - Latency', fontweight='bold')
-        ax.set_xticks(xl)
-        ax.set_xticklabels(labels)
-        ax.legend(fontsize=8)
+        ax.set_xticks(xl); ax.set_xticklabels(labels); ax.legend(fontsize=8)
 
     ax = fig.add_subplot(gs[3, 2])
     if valid_rt_idx and _has_numeric(shm_large_rt_lat) and _has_numeric(tcp_large_rt_lat):
@@ -768,10 +792,9 @@ def generate_consolidated_plot(data: dict):
                     if (shm_large_rt_lat[i] and tcp_large_rt_lat[i]) else 0
                     for i in valid_rt_idx]
         ax.bar(xl, speedups, 0.5, color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.set_ylabel('Speedup (×)')
+        ax.set_ylabel('Speedup (\u00d7)')
         ax.set_title('LARGE UNARY - SHM Speedup', fontweight='bold')
-        ax.set_xticks(xl)
-        ax.set_xticklabels(labels)
+        ax.set_xticks(xl); ax.set_xticklabels(labels)
         ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
 
     # ============================================================
@@ -782,27 +805,35 @@ def generate_consolidated_plot(data: dict):
 
     summary_lines = [
         "=" * 100,
-        "BENCHMARK SUMMARY - .NET SHM vs TCP Transport-Level Performance",
+        "BENCHMARK SUMMARY - .NET SHM vs TCP vs Pipe Transport-Level Performance",
         "=" * 100,
         f"CPU: {cpu}  |  Runtime: {runtime}  |  Ring Buffer: {ring_mb} MiB  |  Date: {timestamp}",
         "",
     ]
 
-    # Add key metrics
     shm_rt_1k = _safe_number(data["shm_rt_latency"], 2)
     tcp_rt_1k = _safe_number(data["tcp_rt_latency"], 2)
+    pipe_rt_1k = _safe_number(data["pipe_rt_latency"], 2)
     if shm_rt_1k and tcp_rt_1k:
-        summary_lines.append(f"Unary Latency (1KB): SHM {shm_rt_1k:.0f}ns vs TCP {tcp_rt_1k:.0f}ns = {tcp_rt_1k/shm_rt_1k:.1f}x speedup")
+        line = f"Unary Latency (1KB): SHM {shm_rt_1k:.0f}ns vs TCP {tcp_rt_1k:.0f}ns = {tcp_rt_1k/shm_rt_1k:.1f}x speedup"
+        if pipe_rt_1k:
+            line += f"  |  vs Pipe {pipe_rt_1k:.0f}ns = {pipe_rt_1k/shm_rt_1k:.1f}x"
+        summary_lines.append(line)
 
     shm_s_1k = _safe_number(data["shm_stream_latency"], 2)
     tcp_s_1k = _safe_number(data["tcp_stream_latency"], 2)
+    pipe_s_1k = _safe_number(data["pipe_stream_latency"], 2)
     if shm_s_1k and tcp_s_1k:
-        summary_lines.append(f"Streaming Latency (1KB): SHM {shm_s_1k:.0f}ns vs TCP {tcp_s_1k:.0f}ns = {tcp_s_1k/shm_s_1k:.1f}x speedup")
+        line = f"Streaming Latency (1KB): SHM {shm_s_1k:.0f}ns vs TCP {tcp_s_1k:.0f}ns = {tcp_s_1k/shm_s_1k:.1f}x speedup"
+        if pipe_s_1k:
+            line += f"  |  vs Pipe {pipe_s_1k:.0f}ns = {pipe_s_1k/shm_s_1k:.1f}x"
+        summary_lines.append(line)
 
     if _has_numeric(data["shm_stream_throughput"]):
         peak_shm = max(_filter_numeric(data["shm_stream_throughput"]))
         peak_tcp = max(_filter_numeric(data["tcp_stream_throughput"])) if _has_numeric(data["tcp_stream_throughput"]) else 0
-        summary_lines.append(f"Peak Throughput: SHM {peak_shm/1000:.1f} GB/s vs TCP {peak_tcp/1000:.2f} GB/s")
+        peak_pipe = max(_filter_numeric(data["pipe_stream_throughput"])) if _has_numeric(data["pipe_stream_throughput"]) else 0
+        summary_lines.append(f"Peak Throughput: SHM {peak_shm/1000:.1f} GB/s  |  TCP {peak_tcp/1000:.2f} GB/s  |  Pipe {peak_pipe/1000:.2f} GB/s")
 
     ax.text(0.5, 0.5, "\n".join(summary_lines), transform=ax.transAxes,
             fontsize=10, ha='center', va='center', fontfamily='monospace',
@@ -834,7 +865,6 @@ Examples:
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     results = None
 
