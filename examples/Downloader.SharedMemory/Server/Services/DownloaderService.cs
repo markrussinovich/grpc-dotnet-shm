@@ -18,26 +18,30 @@
 
 using Download;
 using Google.Protobuf;
-using Grpc.Core;
+using Grpc.Net.SharedMemory;
 
 namespace Server.Services;
 
 /// <summary>
 /// Downloader service that streams file content over shared memory.
 /// </summary>
-public class DownloaderService : Downloader.DownloaderBase
+public class DownloaderService
 {
     private const int ChunkSize = 32 * 1024; // 32KB chunks
 
-    public override async Task DownloadFile(DownloadFileRequest request, IServerStreamWriter<DownloadFileResponse> responseStream, ServerCallContext context)
+    /// <summary>
+    /// Downloads a file by streaming its contents to the client.
+    /// </summary>
+    public async Task DownloadFileAsync(ShmGrpcStream stream, CancellationToken cancellationToken)
     {
         var filename = "sample.txt";
 
         // Send metadata first
-        await responseStream.WriteAsync(new DownloadFileResponse
+        var metadataMessage = new DownloadFileResponse
         {
             Metadata = new FileMetadata { FileName = filename }
-        });
+        };
+        await stream.SendMessageAsync(metadataMessage.ToByteArray());
         Console.WriteLine($"Sent metadata for file: {filename}");
 
         // Stream file content in chunks
@@ -45,20 +49,21 @@ public class DownloaderService : Downloader.DownloaderBase
         await using var fileStream = File.OpenRead(filename);
         long totalBytesSent = 0;
 
-        while (!context.CancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested)
         {
-            var numBytesRead = await fileStream.ReadAsync(buffer, context.CancellationToken);
+            var numBytesRead = await fileStream.ReadAsync(buffer, cancellationToken);
             if (numBytesRead == 0)
             {
                 break;
             }
 
             Console.WriteLine($"Sending data chunk of {numBytesRead} bytes");
-
-            await responseStream.WriteAsync(new DownloadFileResponse
+            
+            var dataMessage = new DownloadFileResponse
             {
                 Data = UnsafeByteOperations.UnsafeWrap(buffer.AsMemory(0, numBytesRead))
-            });
+            };
+            await stream.SendMessageAsync(dataMessage.ToByteArray());
             totalBytesSent += numBytesRead;
         }
 

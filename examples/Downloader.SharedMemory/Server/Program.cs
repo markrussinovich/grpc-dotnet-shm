@@ -16,14 +16,72 @@
 
 #endregion
 
-using Grpc.AspNetCore.Server.SharedMemory;
+using Grpc.Core;
+using Grpc.Net.SharedMemory;
 using Server.Services;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddGrpc();
-builder.WebHost.UseSharedMemory("downloader_shm_example");
+const string SegmentName = "downloader_shm_example";
 
-var app = builder.Build();
-app.MapGrpcService<DownloaderService>();
+Console.WriteLine("File Downloader - Shared Memory Server");
+Console.WriteLine("=======================================");
+Console.WriteLine($"Segment name: {SegmentName}");
 
-await app.RunAsync();
+// Create the downloader service
+var downloaderService = new DownloaderService();
+
+// Create the shared memory listener
+using var listener = new ShmConnectionListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
+Console.WriteLine("Press Ctrl+C to stop the server.");
+
+var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;
+    cts.Cancel();
+};
+
+try
+{
+    while (!cts.Token.IsCancellationRequested)
+    {
+        var serverStream = listener.Connection.CreateStream();
+
+        if (serverStream.RequestHeaders is { Method: var method } && method != null)
+        {
+            try
+            {
+                Console.WriteLine($"Received request for method: {method}");
+
+                if (method == "/download.Downloader/DownloadFile")
+                {
+                    await serverStream.SendResponseHeadersAsync();
+                    await downloaderService.DownloadFileAsync(serverStream, cts.Token);
+                    await serverStream.SendTrailersAsync(StatusCode.OK);
+                }
+                else
+                {
+                    throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
+                }
+            }
+            catch (RpcException ex)
+            {
+                Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+                await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+            }
+        }
+
+        await Task.Delay(10, cts.Token);
+    }
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("Server shutting down...");
+}
+
+Console.WriteLine("Server stopped.");

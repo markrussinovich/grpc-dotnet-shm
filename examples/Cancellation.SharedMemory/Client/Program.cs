@@ -16,67 +16,63 @@
 
 #endregion
 
-using Echo;
+using System.Net;
+using System.Text;
 using Grpc.Core;
-using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
 
+const string SegmentName = "cancellation_shm";
+
 Console.WriteLine("Cancellation Example - Shared Memory Client");
-Console.WriteLine("============================================");
+Console.WriteLine($"Connecting to shm://{SegmentName}");
 Console.WriteLine();
 
-const string SegmentName = "cancellation_shm_example";
-
-Console.WriteLine($"Connecting to shared memory segment: {SegmentName}");
-Console.WriteLine("(Make sure the server is running first!)");
+using var connection = ShmConnection.ConnectAsClient(SegmentName);
+Console.WriteLine("Connected to server");
 Console.WriteLine();
+
+// Create a stream for bidirectional communication
+var stream = connection.CreateStream();
 
 try
 {
-    // Create channel using shared memory handler
-    using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
-    {
-        HttpHandler = new ShmHttpHandler(SegmentName),
-        DisposeHttpClient = true
-    });
-
-    var client = new Echo.Echo.EchoClient(channel);
-
-    // Demonstrate cancellation with bidirectional streaming
-    using var cts = new CancellationTokenSource();
-
-    using var call = client.BidirectionalStreamingEcho(cancellationToken: cts.Token);
+    // Send request headers
+    await stream.SendRequestHeadersAsync("/echo.Echo/BidirectionalStreamingEcho", SegmentName);
 
     // Send a few messages
-    for (var i = 1; i <= 3; i++)
+    for (int i = 1; i <= 3; i++)
     {
         var message = $"message {i}";
-        Console.WriteLine($"Sending: {message}");
-        await call.RequestStream.WriteAsync(new EchoRequest { Message = message });
-        await Task.Delay(200);
+        Console.WriteLine($"Sending {message}");
+
+        var messageBytes = Encoding.UTF8.GetBytes(message);
+        var framedMessage = new byte[5 + messageBytes.Length];
+        framedMessage[0] = 0;
+        var lengthBytes = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(messageBytes.Length));
+        Buffer.BlockCopy(lengthBytes, 0, framedMessage, 1, 4);
+        Buffer.BlockCopy(messageBytes, 0, framedMessage, 5, messageBytes.Length);
+
+        await stream.SendMessageAsync(framedMessage);
+        await Task.Delay(200); // Small delay between messages
     }
 
     // Cancel the stream
     Console.WriteLine("cancelling context");
-    cts.Cancel();
+    await stream.CancelAsync();
 
     Console.WriteLine("Stream cancelled successfully");
 }
-catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
-{
-    Console.WriteLine("Stream was cancelled as expected");
-}
 catch (OperationCanceledException)
 {
-    Console.WriteLine("Stream was cancelled as expected");
+    Console.WriteLine("Stream was cancelled");
 }
 catch (Exception ex)
 {
     Console.WriteLine($"Error: {ex.Message}");
-    Console.WriteLine();
-    Console.WriteLine("Make sure the server is running first:");
-    Console.WriteLine("  cd examples/Cancellation.SharedMemory/Server");
-    Console.WriteLine("  dotnet run");
+}
+finally
+{
+    stream.Dispose();
 }
 
 Console.WriteLine();

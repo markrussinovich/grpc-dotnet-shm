@@ -16,8 +16,11 @@
 
 #endregion
 
-using Grpc.AspNetCore.Server.SharedMemory;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Google.Protobuf;
+using Grpc.Core;
+using Grpc.Health.V1;
+using Grpc.Net.SharedMemory;
+using Server.Services;
 
 const string SegmentName = "vigor_shm_example";
 
@@ -25,28 +28,86 @@ Console.WriteLine("Health Check - Shared Memory Server");
 Console.WriteLine("====================================");
 Console.WriteLine($"Segment name: {SegmentName}");
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddGrpc();
-builder.Services.AddGrpcHealthChecks()
-    .AddAsyncCheck("", () =>
-    {
-        var result = Random.Shared.Next() % 5 == 0
-            ? HealthCheckResult.Unhealthy()
-            : HealthCheckResult.Healthy();
+// Create the health service
+var healthService = new HealthService();
 
-        return Task.FromResult(result);
-    }, Array.Empty<string>());
-builder.Services.Configure<HealthCheckPublisherOptions>(options =>
-{
-    options.Delay = TimeSpan.Zero;
-    options.Period = TimeSpan.FromSeconds(5);
-});
-builder.WebHost.UseSharedMemory(SegmentName);
-
-var app = builder.Build();
-app.MapGrpcHealthChecksService();
-
+// Create the shared memory listener
+using var listener = new ShmConnectionListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
 Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
 Console.WriteLine("Press Ctrl+C to stop the server.");
 
-await app.RunAsync();
+var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;
+    cts.Cancel();
+};
+
+// Start health status updater
+_ = Task.Run(async () =>
+{
+    while (!cts.Token.IsCancellationRequested)
+    {
+        await Task.Delay(5000, cts.Token);
+        
+        // Randomly change health status
+        var isHealthy = Random.Shared.Next() % 5 != 0;
+        healthService.SetStatus("", isHealthy 
+            ? HealthCheckResponse.Types.ServingStatus.Serving 
+            : HealthCheckResponse.Types.ServingStatus.NotServing);
+    }
+});
+
+try
+{
+    while (!cts.Token.IsCancellationRequested)
+    {
+        var serverStream = listener.Connection.CreateStream();
+
+        if (serverStream.RequestHeaders is { Method: var method } && method != null)
+        {
+            try
+            {
+                Console.WriteLine($"Received request for method: {method}");
+
+                if (method == "/grpc.health.v1.Health/Check")
+                {
+                    await serverStream.SendResponseHeadersAsync();
+
+                    var response = healthService.Check();
+                    await serverStream.SendMessageAsync(response.ToByteArray());
+                    await serverStream.SendTrailersAsync(StatusCode.OK);
+                }
+                else if (method == "/grpc.health.v1.Health/Watch")
+                {
+                    await serverStream.SendResponseHeadersAsync();
+
+                    // Stream health updates
+                    await healthService.WatchAsync(serverStream, cts.Token);
+                }
+                else
+                {
+                    throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
+                }
+            }
+            catch (RpcException ex)
+            {
+                Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+                await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+            }
+        }
+
+        await Task.Delay(10, cts.Token);
+    }
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("Server shutting down...");
+}
+
+Console.WriteLine("Server stopped.");

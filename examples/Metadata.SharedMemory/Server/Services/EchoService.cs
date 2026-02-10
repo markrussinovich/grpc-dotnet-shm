@@ -18,14 +18,11 @@
 
 using Echo;
 using Grpc.Core;
-using System.Globalization;
 
 namespace Server;
 
 public class EchoService : Echo.Echo.EchoBase
 {
-    private const string TimestampFormat = "MMM dd HH:mm:ss.fffffff";
-
     private readonly ILogger<EchoService> _logger;
 
     public EchoService(ILogger<EchoService> logger)
@@ -33,29 +30,10 @@ public class EchoService : Echo.Echo.EchoBase
         _logger = logger;
     }
 
-    public override async Task<EchoResponse> UnaryEcho(EchoRequest request, ServerCallContext context)
+    public override Task<EchoResponse> UnaryEcho(EchoRequest request, ServerCallContext context)
     {
-        // Log incoming request metadata
-        _logger.LogInformation("Received request metadata:");
-        foreach (var entry in context.RequestHeaders)
-        {
-            _logger.LogInformation("  {Key} = {Value}", entry.Key, entry.Value);
-        }
-
         _logger.LogInformation("UnaryEcho: {Message}", request.Message);
-
-        // Send response headers with custom metadata
-        var responseHeaders = new Metadata
-        {
-            { "timestamp", DateTime.UtcNow.ToString(TimestampFormat, CultureInfo.InvariantCulture) },
-            { "server-location", "shared-memory" }
-        };
-        await context.WriteResponseHeadersAsync(responseHeaders);
-
-        // Set trailer metadata
-        context.ResponseTrailers.Add("trailer-timestamp", DateTime.UtcNow.ToString(TimestampFormat, CultureInfo.InvariantCulture));
-
-        return new EchoResponse { Message = request.Message };
+        return Task.FromResult(new EchoResponse { Message = request.Message });
     }
 
     public override async Task BidirectionalStreamingEcho(

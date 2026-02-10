@@ -16,8 +16,9 @@
 
 #endregion
 
-using Echo;
-using Grpc.Net.Client;
+using System.Net;
+using System.Text;
+using Grpc.Core;
 using Grpc.Net.SharedMemory;
 
 const string SegmentName = "keepalive_shm";
@@ -26,41 +27,83 @@ Console.WriteLine("Keepalive Example - Shared Memory Client");
 Console.WriteLine($"Connecting to shm://{SegmentName}");
 Console.WriteLine();
 
-// Create a shared memory channel. The ShmHttpHandler manages transport-level
-// keepalive automatically as part of the shared memory connection lifecycle.
-using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
+// Configure client keepalive parameters matching the Go example
+var keepaliveOptions = new ShmKeepaliveOptions
 {
-    HttpHandler = new ShmHttpHandler(SegmentName),
-    DisposeHttpClient = true
-});
+    Time = TimeSpan.FromSeconds(10),           // Send pings every 10 seconds if no activity
+    PingTimeout = TimeSpan.FromSeconds(1),     // Wait 1 second for ping ack
+    PermitWithoutStream = true                 // Send pings even without active streams
+};
 
-var client = new Echo.Echo.EchoClient(channel);
+Console.WriteLine("Client configured with keepalive parameters:");
+Console.WriteLine($"  Time: {keepaliveOptions.Time.TotalSeconds}s");
+Console.WriteLine($"  PingTimeout: {keepaliveOptions.PingTimeout.TotalSeconds}s");
+Console.WriteLine($"  PermitWithoutStream: {keepaliveOptions.PermitWithoutStream}");
+Console.WriteLine();
+
+using var connection = ShmConnection.ConnectAsClient(SegmentName, keepaliveOptions: keepaliveOptions);
+Console.WriteLine("Connected to server");
+Console.WriteLine();
 
 // Perform a unary echo request
-Console.WriteLine("Performing unary request...");
-var reply = await client.UnaryEchoAsync(new EchoRequest { Message = "keepalive demo" });
-Console.WriteLine($"RPC response: {reply.Message}");
+Console.WriteLine("Performing unary request");
+var stream = connection.CreateStream();
 
-// Wait to observe keepalive behavior.
-// In a production scenario, the underlying shared memory transport maintains
-// the connection and handles keepalive pings transparently.
-Console.WriteLine();
-Console.WriteLine("Waiting to observe keepalive behavior...");
-Console.WriteLine("(The shared memory transport maintains connection health automatically)");
-Console.WriteLine();
-
-for (int i = 0; i < 5; i++)
+try
 {
-    await Task.Delay(TimeSpan.FromSeconds(5));
-    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Still connected... ({(i + 1) * 5}s elapsed)");
+    // Send request headers
+    await stream.SendRequestHeadersAsync("/echo.Echo/UnaryEcho", SegmentName);
 
-    // Periodically send a request to demonstrate the connection is alive
-    if (i == 2)
+    // Send message
+    var message = "keepalive demo";
+    var messageBytes = Encoding.UTF8.GetBytes(message);
+    var framedMessage = new byte[5 + messageBytes.Length];
+    framedMessage[0] = 0;
+    var lengthBytes = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(messageBytes.Length));
+    Buffer.BlockCopy(lengthBytes, 0, framedMessage, 1, 4);
+    Buffer.BlockCopy(messageBytes, 0, framedMessage, 5, messageBytes.Length);
+
+    await stream.SendMessageAsync(framedMessage);
+    await stream.SendHalfCloseAsync();
+
+    // Read response
+    await stream.ReceiveResponseHeadersAsync();
+    var frame = await stream.ReceiveFrameAsync();
+
+    if (frame?.Type == FrameType.Message && frame.Value.Payload.Length > 5)
     {
-        var midReply = await client.UnaryEchoAsync(new EchoRequest { Message = "keepalive check" });
-        Console.WriteLine($"  Mid-wait RPC response: {midReply.Message}");
+        var responseMessage = Encoding.UTF8.GetString(frame.Value.Payload.AsSpan(5));
+        Console.WriteLine($"RPC response: {responseMessage}");
     }
-}
 
-Console.WriteLine();
-Console.WriteLine("Keepalive example completed!");
+    stream.Dispose();
+
+    // Wait to observe keepalive behavior
+    Console.WriteLine();
+    Console.WriteLine("Waiting to observe keepalive pings...");
+    Console.WriteLine("(In a real scenario, the client would send pings and");
+    Console.WriteLine(" the server would eventually close the connection due to max age)");
+    Console.WriteLine();
+
+    // Simulate waiting for keepalive activity
+    for (int i = 0; i < 5; i++)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(5));
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Still connected... ({(i + 1) * 5}s elapsed)");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("Keepalive example completed!");
+}
+catch (RpcException ex) when (ex.StatusCode == StatusCode.Unavailable)
+{
+    Console.WriteLine($"Connection closed by server (likely due to MaxConnectionAge): {ex.Status.Detail}");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Error: {ex.Message}");
+}
+finally
+{
+    stream.Dispose();
+}

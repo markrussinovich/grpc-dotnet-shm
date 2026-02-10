@@ -34,11 +34,10 @@ Console.WriteLine();
 
 try
 {
-    // Create channel using shared memory HTTP handler (Kestrel-based dialer)
-    using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
+    using var handler = new ShmHandler(SegmentName);
+    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
     {
-        HttpHandler = new ShmHttpHandler(SegmentName),
-        DisposeHttpClient = true
+        HttpHandler = handler
     });
 
     var client = new Uploader.UploaderClient(channel);

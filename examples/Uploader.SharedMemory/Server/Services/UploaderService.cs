@@ -16,54 +16,82 @@
 
 #endregion
 
-using Grpc.Core;
+using Google.Protobuf;
+using Grpc.Net.SharedMemory;
 using Upload;
 
-namespace Server;
+namespace Server.Services;
 
 /// <summary>
 /// Uploader service that receives streamed file content over shared memory.
 /// </summary>
-public class UploaderService : Uploader.UploaderBase
+public class UploaderService
 {
-    private readonly ILogger _logger;
-    private readonly IConfiguration _config;
+    private readonly string _uploadsPath;
 
-    public UploaderService(ILoggerFactory loggerFactory, IConfiguration config)
+    public UploaderService(string uploadsPath)
     {
-        _logger = loggerFactory.CreateLogger<UploaderService>();
-        _config = config;
+        _uploadsPath = uploadsPath;
     }
 
-    public override async Task<UploadFileResponse> UploadFile(
-        IAsyncStreamReader<UploadFileRequest> requestStream,
-        ServerCallContext context)
+    /// <summary>
+    /// Receives a file upload from the client via streaming.
+    /// </summary>
+    public async Task<string> UploadFileAsync(ShmGrpcStream stream, CancellationToken cancellationToken)
     {
         var uploadId = Path.GetRandomFileName();
-        var uploadPath = Path.Combine(_config["StoredFilesPath"]!, uploadId);
+        var uploadPath = Path.Combine(_uploadsPath, uploadId);
         Directory.CreateDirectory(uploadPath);
 
-        _logger.LogInformation("Starting upload: {UploadId}", uploadId);
+        Console.WriteLine($"Starting upload: {uploadId}");
 
         await using var writeStream = File.Create(Path.Combine(uploadPath, "data.bin"));
+        long totalBytesReceived = 0;
 
-        await foreach (var message in requestStream.ReadAllAsync())
+        // Read messages from the client stream using ReceiveFrameAsync
+        while (!cancellationToken.IsCancellationRequested)
         {
+            var frame = await stream.ReceiveFrameAsync(cancellationToken);
+            if (frame == null)
+            {
+                break; // End of stream
+            }
+
+            var (frameType, payload) = frame.Value;
+            
+            // Only process MESSAGE frames (DATA frames in HTTP/2 terminology)
+            if (frameType != FrameType.Message || payload.Length == 0)
+            {
+                // HALF_CLOSE or other frame types indicate end of client stream
+                if (frameType == FrameType.HalfClose)
+                {
+                    break;
+                }
+                continue;
+            }
+
+            var message = UploadFileRequest.Parser.ParseFrom(payload);
+
             if (message.Metadata != null)
             {
-                _logger.LogInformation("Received metadata: {FileName}", message.Metadata.FileName);
+                Console.WriteLine($"Received metadata: {message.Metadata.FileName}");
                 await File.WriteAllTextAsync(
-                    Path.Combine(uploadPath, "metadata.json"),
-                    message.Metadata.ToString());
+                    Path.Combine(uploadPath, "metadata.json"), 
+                    message.Metadata.ToString(),
+                    cancellationToken);
             }
-            if (message.Data != null)
+
+            if (message.Data != null && !message.Data.IsEmpty)
             {
-                _logger.LogInformation("Received data chunk of {Length} bytes", message.Data.Length);
-                await writeStream.WriteAsync(message.Data.Memory);
+                Console.WriteLine($"Received data chunk of {message.Data.Length} bytes");
+                await writeStream.WriteAsync(message.Data.Memory, cancellationToken);
+                totalBytesReceived += message.Data.Length;
             }
         }
 
-        _logger.LogInformation("Upload complete: {UploadId}", uploadId);
-        return new UploadFileResponse { Id = uploadId };
+        Console.WriteLine($"Upload complete: {uploadId}, total bytes: {totalBytesReceived}");
+        Console.WriteLine($"Files saved to: {uploadPath}");
+
+        return uploadId;
     }
 }

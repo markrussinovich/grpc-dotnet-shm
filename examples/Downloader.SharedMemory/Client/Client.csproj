@@ -7,6 +7,8 @@
     <Nullable>enable</Nullable>
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
     <SignAssembly>false</SignAssembly>
+    <!-- Shared memory transport is Windows-only for now -->
+    <SupportedOSPlatformVersion>windows</SupportedOSPlatformVersion>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 

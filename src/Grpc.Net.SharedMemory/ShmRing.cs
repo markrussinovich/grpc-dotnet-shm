@@ -85,6 +85,7 @@ public sealed class ShmRing : IDisposable
     private readonly int _headerOffset;
     private readonly int _dataOffset;
     private readonly IRingSync? _sync;
+    private readonly bool _isOwner;
 
     private volatile bool _localClosed;
     private ulong _pendingReadIdx;
@@ -100,7 +101,8 @@ public sealed class ShmRing : IDisposable
     /// <param name="headerOffset">Offset to the ring header within the memory.</param>
     /// <param name="capacity">The data area capacity (must be power of 2).</param>
     /// <param name="sync">Optional synchronization primitive for cross-process signaling.</param>
-    public ShmRing(Memory<byte> memory, int headerOffset, ulong capacity, IRingSync? sync = null)
+    /// <param name="isOwner">If true, this instance owns the ring and will set the Closed flag in shared memory on dispose.</param>
+    public ShmRing(Memory<byte> memory, int headerOffset, ulong capacity, IRingSync? sync = null, bool isOwner = true)
     {
         if (capacity == 0 || !IsPowerOfTwo(capacity))
         {
@@ -119,6 +121,7 @@ public sealed class ShmRing : IDisposable
         _capacity = capacity;
         _capMask = capacity - 1;
         _sync = sync;
+        _isOwner = isOwner;
 
         // Initialize pending read index from current shared read index
         ref var header = ref GetHeader();
@@ -532,6 +535,7 @@ public sealed class ShmRing : IDisposable
 
     /// <summary>
     /// Closes the ring buffer. Readers can still drain remaining data.
+    /// Only the owner (server) sets the Closed flag in shared memory.
     /// </summary>
     public void Close()
     {
@@ -542,32 +546,27 @@ public sealed class ShmRing : IDisposable
 
         _localClosed = true;
 
-        ref var header = ref GetHeader();
-        Volatile.Write(ref header.Closed, 1);
+        // Only the owner (server) should set the Closed flag in shared memory
+        // Clients just close locally to stop their own read/write operations
+        if (_isOwner)
+        {
+            ref var header = ref GetHeader();
+            Volatile.Write(ref header.Closed, 1);
 
-        // Wake all waiters
-        Interlocked.Increment(ref header.DataSeq);
-        Interlocked.Increment(ref header.SpaceSeq);
-        Interlocked.Increment(ref header.ContigSeq);
+            // Wake all waiters
+            Interlocked.Increment(ref header.DataSeq);
+            Interlocked.Increment(ref header.SpaceSeq);
+            Interlocked.Increment(ref header.ContigSeq);
 
-        _sync?.SignalData();
-        _sync?.SignalSpace();
-        _sync?.SignalContig();
+            _sync?.SignalData();
+            _sync?.SignalSpace();
+            _sync?.SignalContig();
+        }
     }
 
     public void Dispose()
     {
         Close();
-        _sync?.Dispose();
-    }
-
-    /// <summary>
-    /// Disposes sync resources without closing the ring.
-    /// Use for control segments where we don't want to affect server state.
-    /// </summary>
-    public void DisposeWithoutClose()
-    {
-        _localClosed = true;  // Mark as closed locally to prevent further operations
         _sync?.Dispose();
     }
 

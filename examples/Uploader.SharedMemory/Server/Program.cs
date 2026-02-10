@@ -16,8 +16,11 @@
 
 #endregion
 
-using Grpc.AspNetCore.Server.SharedMemory;
-using Server;
+using Google.Protobuf;
+using Grpc.Core;
+using Grpc.Net.SharedMemory;
+using Server.Services;
+using Upload;
 
 const string SegmentName = "uploader_shm_example";
 
@@ -29,16 +32,76 @@ Console.WriteLine($"Segment name: {SegmentName}");
 var uploadsPath = Path.Combine(Environment.CurrentDirectory, "uploads");
 Directory.CreateDirectory(uploadsPath);
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddGrpc();
-builder.Configuration["StoredFilesPath"] = uploadsPath;
-builder.WebHost.UseSharedMemory(SegmentName);
+// Create the uploader service
+var uploaderService = new UploaderService(uploadsPath);
 
-var app = builder.Build();
-app.MapGrpcService<UploaderService>();
-
+// Create the shared memory listener using ShmControlListener for grpc-go-shmem compatibility
+using var listener = new ShmControlListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
 Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
 Console.WriteLine($"Uploads will be saved to: {uploadsPath}");
 Console.WriteLine("Press Ctrl+C to stop the server.");
 
-await app.RunAsync();
+var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;
+    cts.Cancel();
+};
+
+try
+{
+    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
+    {
+        Console.WriteLine($"New connection accepted: {connection.Name}");
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
+                {
+                    try
+                    {
+                        var headers = stream.RequestHeaders;
+                        if (headers?.Method is { } method)
+                        {
+                            Console.WriteLine($"Received request for method: {method}");
+
+                            if (method == "/upload.Uploader/UploadFile")
+                            {
+                                await stream.SendResponseHeadersAsync();
+                                var uploadId = await uploaderService.UploadFileAsync(stream, cts.Token);
+                                
+                                // Send response
+                                var response = new Upload.UploadFileResponse { Id = uploadId };
+                                await stream.SendMessageAsync(response.ToByteArray());
+                                await stream.SendTrailersAsync(StatusCode.OK);
+                            }
+                            else
+                            {
+                                throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
+                            }
+                        }
+                    }
+                    catch (RpcException ex)
+                    {
+                        Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+                        await stream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error: {ex.Message}");
+                        await stream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+        });
+    }
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("Server shutting down...");
+}
+
+Console.WriteLine("Server stopped.");

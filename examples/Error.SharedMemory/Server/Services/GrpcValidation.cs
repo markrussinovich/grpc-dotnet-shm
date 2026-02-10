@@ -21,7 +21,7 @@ using Google.Protobuf.WellKnownTypes;
 using Google.Rpc;
 using Grpc.Core;
 
-namespace Server;
+namespace Server.Services;
 
 /// <summary>
 /// Validation helper that throws RpcException with rich error details.

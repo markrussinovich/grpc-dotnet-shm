@@ -33,10 +33,10 @@ Console.WriteLine();
 
 try
 {
-    using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
+    using var handler = new ShmHandler(SegmentName);
+    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
     {
-        HttpHandler = new ShmHttpHandler(SegmentName),
-        DisposeHttpClient = true
+        HttpHandler = handler
     });
 
     var client = new Downloader.DownloaderClient(channel);
