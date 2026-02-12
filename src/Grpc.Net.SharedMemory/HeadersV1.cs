@@ -41,7 +41,12 @@ public readonly struct MetadataKV
     public MetadataKV(string key, params string[] values)
     {
         Key = key;
-        Values = values.Select(v => Encoding.UTF8.GetBytes(v)).ToArray();
+        var encodedValues = new byte[values.Length][];
+        for (var i = 0; i < values.Length; i++)
+        {
+            encodedValues[i] = Encoding.UTF8.GetBytes(values[i]);
+        }
+        Values = encodedValues;
     }
 }
 
@@ -75,19 +80,19 @@ public sealed class HeadersV1
     public byte[] Encode()
     {
         // Calculate size
-        var methodBytes = HeaderType == 0 && Method != null ? Encoding.UTF8.GetBytes(Method) : Array.Empty<byte>();
-        var authorityBytes = Authority != null ? Encoding.UTF8.GetBytes(Authority) : Array.Empty<byte>();
+        var methodLength = HeaderType == 0 && Method != null ? Encoding.UTF8.GetByteCount(Method) : 0;
+        var authorityLength = Authority != null ? Encoding.UTF8.GetByteCount(Authority) : 0;
 
         var size = 1 + 1 + 4; // version + hdrType + methodLen
-        size += methodBytes.Length;
-        size += 4 + authorityBytes.Length; // authorityLen + authority
+        size += methodLength;
+        size += 4 + authorityLength; // authorityLen + authority
         size += 8; // deadline
         size += 2; // metadata count
 
         foreach (var kv in Metadata)
         {
-            var keyBytes = Encoding.UTF8.GetBytes(kv.Key);
-            size += 2 + keyBytes.Length; // keyLen + key
+            var keyLength = Encoding.UTF8.GetByteCount(kv.Key);
+            size += 2 + keyLength; // keyLen + key
             size += 2; // valueCount
             foreach (var v in kv.Values)
             {
@@ -107,10 +112,13 @@ public sealed class HeadersV1
         // Method length and bytes (only for client-initial)
         if (HeaderType == 0)
         {
-            BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(offset, 4), (uint)methodBytes.Length);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(offset, 4), (uint)methodLength);
             offset += 4;
-            methodBytes.CopyTo(buffer.AsSpan(offset));
-            offset += methodBytes.Length;
+            if (methodLength > 0)
+            {
+                Encoding.UTF8.GetBytes(Method!, buffer.AsSpan(offset, methodLength));
+                offset += methodLength;
+            }
         }
         else
         {
@@ -119,10 +127,13 @@ public sealed class HeadersV1
         }
 
         // Authority
-        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(offset, 4), (uint)authorityBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(offset, 4), (uint)authorityLength);
         offset += 4;
-        authorityBytes.CopyTo(buffer.AsSpan(offset));
-        offset += authorityBytes.Length;
+        if (authorityLength > 0)
+        {
+            Encoding.UTF8.GetBytes(Authority!, buffer.AsSpan(offset, authorityLength));
+            offset += authorityLength;
+        }
 
         // Deadline
         BinaryPrimitives.WriteUInt64LittleEndian(buffer.AsSpan(offset, 8), DeadlineUnixNano);
@@ -135,11 +146,14 @@ public sealed class HeadersV1
         // Metadata entries
         foreach (var kv in Metadata)
         {
-            var keyBytes = Encoding.UTF8.GetBytes(kv.Key);
-            BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(offset, 2), (ushort)keyBytes.Length);
+            var keyLength = Encoding.UTF8.GetByteCount(kv.Key);
+            BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(offset, 2), (ushort)keyLength);
             offset += 2;
-            keyBytes.CopyTo(buffer.AsSpan(offset));
-            offset += keyBytes.Length;
+            if (keyLength > 0)
+            {
+                Encoding.UTF8.GetBytes(kv.Key, buffer.AsSpan(offset, keyLength));
+                offset += keyLength;
+            }
 
             BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(offset, 2), (ushort)kv.Values.Count);
             offset += 2;

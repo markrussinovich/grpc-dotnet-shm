@@ -45,14 +45,14 @@ public sealed class TrailersV1
     /// </summary>
     public byte[] Encode()
     {
-        var statusMsgBytes = GrpcStatusMessage != null ? Encoding.UTF8.GetBytes(GrpcStatusMessage) : Array.Empty<byte>();
+        var statusMsgLength = GrpcStatusMessage != null ? Encoding.UTF8.GetByteCount(GrpcStatusMessage) : 0;
 
-        var size = 1 + 4 + 4 + statusMsgBytes.Length + 2; // version + statusCode + msgLen + msg + metadataCount
+        var size = 1 + 4 + 4 + statusMsgLength + 2; // version + statusCode + msgLen + msg + metadataCount
 
         foreach (var kv in Metadata)
         {
-            var keyBytes = Encoding.UTF8.GetBytes(kv.Key);
-            size += 2 + keyBytes.Length; // keyLen + key
+            var keyLength = Encoding.UTF8.GetByteCount(kv.Key);
+            size += 2 + keyLength; // keyLen + key
             size += 2; // valueCount
             foreach (var v in kv.Values)
             {
@@ -71,10 +71,13 @@ public sealed class TrailersV1
         offset += 4;
 
         // Status message length and bytes
-        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(offset, 4), (uint)statusMsgBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(offset, 4), (uint)statusMsgLength);
         offset += 4;
-        statusMsgBytes.CopyTo(buffer.AsSpan(offset));
-        offset += statusMsgBytes.Length;
+        if (statusMsgLength > 0)
+        {
+            Encoding.UTF8.GetBytes(GrpcStatusMessage!, buffer.AsSpan(offset, statusMsgLength));
+            offset += statusMsgLength;
+        }
 
         // Metadata count
         BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(offset, 2), (ushort)Metadata.Count);
@@ -83,11 +86,14 @@ public sealed class TrailersV1
         // Metadata entries
         foreach (var kv in Metadata)
         {
-            var keyBytes = Encoding.UTF8.GetBytes(kv.Key);
-            BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(offset, 2), (ushort)keyBytes.Length);
+            var keyLength = Encoding.UTF8.GetByteCount(kv.Key);
+            BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(offset, 2), (ushort)keyLength);
             offset += 2;
-            keyBytes.CopyTo(buffer.AsSpan(offset));
-            offset += keyBytes.Length;
+            if (keyLength > 0)
+            {
+                Encoding.UTF8.GetBytes(kv.Key, buffer.AsSpan(offset, keyLength));
+                offset += keyLength;
+            }
 
             BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(offset, 2), (ushort)kv.Values.Count);
             offset += 2;

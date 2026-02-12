@@ -49,11 +49,11 @@ public readonly struct InboundFrame
         _payload.Release();
     }
 
-    /// <summary>Backward-compatible tuple deconstruction.</summary>
-    public void Deconstruct(out FrameType type, out byte[] payload)
+    /// <summary>Tuple deconstruction without copying payload data.</summary>
+    public void Deconstruct(out FrameType type, out ReadOnlyMemory<byte> payload)
     {
         type = Type;
-        payload = Memory.ToArray();
+        payload = Memory;
     }
 }
 
@@ -556,9 +556,16 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (metadata == null || metadata.Count == 0)
             return Array.Empty<MetadataKV>();
 
-        return metadata.Select(e => e.IsBinary
-            ? new MetadataKV(e.Key, e.ValueBytes)
-            : new MetadataKV(e.Key, e.Value)).ToArray();
+        var items = new MetadataKV[metadata.Count];
+        var index = 0;
+        foreach (var entry in metadata)
+        {
+            items[index++] = entry.IsBinary
+                ? new MetadataKV(entry.Key, entry.ValueBytes)
+                : new MetadataKV(entry.Key, entry.Value);
+        }
+
+        return items;
     }
 
     private void ThrowIfDisposed()

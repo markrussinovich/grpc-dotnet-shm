@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-02-12T06:07:48.2094608Z",
+  "timestamp": "2026-02-12T06:40:09.4759212Z",
   "cpu": "ARMv8 (64-bit) Family 8 Model 1 Revision 201, Qualcomm Technologies Inc",
   "runtime": ".NET 9.0.10",
   "sizes_bytes": [
@@ -19,141 +19,141 @@
       "transport": "tcp",
       "size_bytes": 0,
       "iterations": 2000,
-      "avg_latency_us": 120.17,
+      "avg_latency_us": 114.863,
       "throughput_mb_per_s": 0
     },
     {
       "transport": "tcp",
       "size_bytes": 1,
       "iterations": 2000,
-      "avg_latency_us": 142.215,
+      "avg_latency_us": 145.227,
       "throughput_mb_per_s": 0.013
     },
     {
       "transport": "tcp",
       "size_bytes": 1024,
       "iterations": 2000,
-      "avg_latency_us": 142.953,
-      "throughput_mb_per_s": 13.663
+      "avg_latency_us": 129.416,
+      "throughput_mb_per_s": 15.092
     },
     {
       "transport": "tcp",
       "size_bytes": 4096,
       "iterations": 1200,
-      "avg_latency_us": 134.93,
-      "throughput_mb_per_s": 57.9
+      "avg_latency_us": 135.809,
+      "throughput_mb_per_s": 57.526
     },
     {
       "transport": "tcp",
       "size_bytes": 16384,
       "iterations": 1200,
-      "avg_latency_us": 176.447,
-      "throughput_mb_per_s": 177.107
+      "avg_latency_us": 179.11,
+      "throughput_mb_per_s": 174.474
     },
     {
       "transport": "tcp",
       "size_bytes": 65536,
       "iterations": 800,
-      "avg_latency_us": 415.622,
-      "throughput_mb_per_s": 300.754
+      "avg_latency_us": 399.596,
+      "throughput_mb_per_s": 312.816
     },
     {
       "transport": "tcp",
       "size_bytes": 262144,
       "iterations": 400,
-      "avg_latency_us": 2363.442,
-      "throughput_mb_per_s": 211.556
+      "avg_latency_us": 2597.206,
+      "throughput_mb_per_s": 192.515
     },
     {
       "transport": "tcp",
       "size_bytes": 524288,
       "iterations": 250,
-      "avg_latency_us": 4006.961,
-      "throughput_mb_per_s": 249.566
+      "avg_latency_us": 4078.005,
+      "throughput_mb_per_s": 245.218
     },
     {
       "transport": "tcp",
       "size_bytes": 1048576,
       "iterations": 150,
-      "avg_latency_us": 7807.19,
-      "throughput_mb_per_s": 256.174
+      "avg_latency_us": 6668.108,
+      "throughput_mb_per_s": 299.935
     },
     {
       "transport": "tcp",
       "size_bytes": 2097152,
       "iterations": 80,
-      "avg_latency_us": 13997.104,
-      "throughput_mb_per_s": 285.773
+      "avg_latency_us": 11929.282,
+      "throughput_mb_per_s": 335.309
     },
     {
       "transport": "shm",
       "size_bytes": 0,
       "iterations": 2000,
-      "avg_latency_us": 58.049,
+      "avg_latency_us": 54.088,
       "throughput_mb_per_s": 0
     },
     {
       "transport": "shm",
       "size_bytes": 1,
       "iterations": 2000,
-      "avg_latency_us": 47.64,
+      "avg_latency_us": 47.205,
       "throughput_mb_per_s": 0.04
     },
     {
       "transport": "shm",
       "size_bytes": 1024,
       "iterations": 2000,
-      "avg_latency_us": 51.673,
-      "throughput_mb_per_s": 37.798
+      "avg_latency_us": 52.794,
+      "throughput_mb_per_s": 36.995
     },
     {
       "transport": "shm",
       "size_bytes": 4096,
       "iterations": 1200,
-      "avg_latency_us": 68.308,
-      "throughput_mb_per_s": 114.372
+      "avg_latency_us": 69.085,
+      "throughput_mb_per_s": 113.086
     },
     {
       "transport": "shm",
       "size_bytes": 16384,
       "iterations": 1200,
-      "avg_latency_us": 138.475,
-      "throughput_mb_per_s": 225.673
+      "avg_latency_us": 128.687,
+      "throughput_mb_per_s": 242.837
     },
     {
       "transport": "shm",
       "size_bytes": 65536,
       "iterations": 800,
-      "avg_latency_us": 290.687,
-      "throughput_mb_per_s": 430.016
+      "avg_latency_us": 298.255,
+      "throughput_mb_per_s": 419.105
     },
     {
       "transport": "shm",
       "size_bytes": 262144,
       "iterations": 400,
-      "avg_latency_us": 1915.271,
-      "throughput_mb_per_s": 261.06
+      "avg_latency_us": 1829.416,
+      "throughput_mb_per_s": 273.311
     },
     {
       "transport": "shm",
       "size_bytes": 524288,
       "iterations": 250,
-      "avg_latency_us": 3477.907,
-      "throughput_mb_per_s": 287.529
+      "avg_latency_us": 3212.016,
+      "throughput_mb_per_s": 311.331
     },
     {
       "transport": "shm",
       "size_bytes": 1048576,
       "iterations": 150,
-      "avg_latency_us": 6763.521,
-      "throughput_mb_per_s": 295.704
+      "avg_latency_us": 5955.679,
+      "throughput_mb_per_s": 335.814
     },
     {
       "transport": "shm",
       "size_bytes": 2097152,
       "iterations": 80,
-      "avg_latency_us": 9470.672,
-      "throughput_mb_per_s": 422.356
+      "avg_latency_us": 9662.306,
+      "throughput_mb_per_s": 413.98
     }
   ],
   "streaming": [
@@ -161,141 +161,141 @@
       "transport": "tcp",
       "size_bytes": 0,
       "iterations": 2000,
-      "avg_latency_us": 46.264,
+      "avg_latency_us": 46.235,
       "throughput_mb_per_s": 0
     },
     {
       "transport": "tcp",
       "size_bytes": 1,
       "iterations": 2000,
-      "avg_latency_us": 52.942,
-      "throughput_mb_per_s": 0.036
+      "avg_latency_us": 48.098,
+      "throughput_mb_per_s": 0.04
     },
     {
       "transport": "tcp",
       "size_bytes": 1024,
       "iterations": 2000,
-      "avg_latency_us": 56.069,
-      "throughput_mb_per_s": 34.834
+      "avg_latency_us": 49.45,
+      "throughput_mb_per_s": 39.497
     },
     {
       "transport": "tcp",
       "size_bytes": 4096,
       "iterations": 1200,
-      "avg_latency_us": 70.652,
-      "throughput_mb_per_s": 110.577
+      "avg_latency_us": 59.668,
+      "throughput_mb_per_s": 130.933
     },
     {
       "transport": "tcp",
       "size_bytes": 16384,
       "iterations": 1200,
-      "avg_latency_us": 97.349,
-      "throughput_mb_per_s": 321.011
+      "avg_latency_us": 93.459,
+      "throughput_mb_per_s": 334.37
     },
     {
       "transport": "tcp",
       "size_bytes": 65536,
       "iterations": 800,
-      "avg_latency_us": 211.538,
-      "throughput_mb_per_s": 590.909
+      "avg_latency_us": 202.349,
+      "throughput_mb_per_s": 617.745
     },
     {
       "transport": "tcp",
       "size_bytes": 262144,
       "iterations": 400,
-      "avg_latency_us": 2648.29,
-      "throughput_mb_per_s": 188.801
+      "avg_latency_us": 2269.775,
+      "throughput_mb_per_s": 220.286
     },
     {
       "transport": "tcp",
       "size_bytes": 524288,
       "iterations": 250,
-      "avg_latency_us": 4410.615,
-      "throughput_mb_per_s": 226.726
+      "avg_latency_us": 4691.212,
+      "throughput_mb_per_s": 213.165
     },
     {
       "transport": "tcp",
       "size_bytes": 1048576,
       "iterations": 150,
-      "avg_latency_us": 7369.009,
-      "throughput_mb_per_s": 271.407
+      "avg_latency_us": 6159.437,
+      "throughput_mb_per_s": 324.705
     },
     {
       "transport": "tcp",
       "size_bytes": 2097152,
       "iterations": 80,
-      "avg_latency_us": 12989.309,
-      "throughput_mb_per_s": 307.946
+      "avg_latency_us": 12472.39,
+      "throughput_mb_per_s": 320.708
     },
     {
       "transport": "shm",
       "size_bytes": 0,
       "iterations": 2000,
-      "avg_latency_us": 17.172,
+      "avg_latency_us": 15.101,
       "throughput_mb_per_s": 0
     },
     {
       "transport": "shm",
       "size_bytes": 1,
       "iterations": 2000,
-      "avg_latency_us": 16.455,
-      "throughput_mb_per_s": 0.116
+      "avg_latency_us": 14.622,
+      "throughput_mb_per_s": 0.13
     },
     {
       "transport": "shm",
       "size_bytes": 1024,
       "iterations": 2000,
-      "avg_latency_us": 23.325,
-      "throughput_mb_per_s": 83.734
+      "avg_latency_us": 18.964,
+      "throughput_mb_per_s": 102.99
     },
     {
       "transport": "shm",
       "size_bytes": 4096,
       "iterations": 1200,
-      "avg_latency_us": 20.981,
-      "throughput_mb_per_s": 372.367
+      "avg_latency_us": 18.766,
+      "throughput_mb_per_s": 416.306
     },
     {
       "transport": "shm",
       "size_bytes": 16384,
       "iterations": 1200,
-      "avg_latency_us": 36.643,
-      "throughput_mb_per_s": 852.829
+      "avg_latency_us": 37.319,
+      "throughput_mb_per_s": 837.368
     },
     {
       "transport": "shm",
       "size_bytes": 65536,
       "iterations": 800,
-      "avg_latency_us": 101.853,
-      "throughput_mb_per_s": 1227.256
+      "avg_latency_us": 84.667,
+      "throughput_mb_per_s": 1476.376
     },
     {
       "transport": "shm",
       "size_bytes": 262144,
       "iterations": 400,
-      "avg_latency_us": 1665.432,
-      "throughput_mb_per_s": 300.222
+      "avg_latency_us": 1654.41,
+      "throughput_mb_per_s": 302.222
     },
     {
       "transport": "shm",
       "size_bytes": 524288,
       "iterations": 250,
-      "avg_latency_us": 2928.4,
-      "throughput_mb_per_s": 341.483
+      "avg_latency_us": 3185.816,
+      "throughput_mb_per_s": 313.891
     },
     {
       "transport": "shm",
       "size_bytes": 1048576,
       "iterations": 150,
-      "avg_latency_us": 5204.069,
-      "throughput_mb_per_s": 384.315
+      "avg_latency_us": 5436.704,
+      "throughput_mb_per_s": 367.87
     },
     {
       "transport": "shm",
       "size_bytes": 2097152,
       "iterations": 80,
-      "avg_latency_us": 9569.306,
-      "throughput_mb_per_s": 418.003
+      "avg_latency_us": 8799.421,
+      "throughput_mb_per_s": 454.575
     }
   ],
   "notes": "BenchmarkService protobuf payloads; client and server in same process"
