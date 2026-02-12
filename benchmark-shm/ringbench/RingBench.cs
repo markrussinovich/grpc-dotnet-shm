@@ -52,7 +52,7 @@ string? platformOverride = null;
 for (int i = 0; i < args.Length; i++)
 {
     if (args[i] == "--output" || args[i] == "--out")
-        outDir = args[++i];
+        outDir = Path.GetFullPath(args[++i]);
     if (args[i] == "--platform")
         platformOverride = args[++i];
 }
@@ -180,7 +180,7 @@ async Task<BenchEnv> StartTcpEnv()
     });
     builder.WebHost.ConfigureKestrel(k =>
     {
-        k.Limits.MaxRequestBodySize = 64 * 1024 * 1024;
+        k.Limits.MaxRequestBodySize = 256 * 1024 * 1024;
         k.Listen(IPAddress.Loopback, 0, lo =>
         {
             lo.Protocols = HttpProtocols.Http2;
