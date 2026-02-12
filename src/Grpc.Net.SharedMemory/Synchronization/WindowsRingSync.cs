@@ -41,6 +41,9 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
     private readonly EventWaitHandle _dataWaitHandle;
     private readonly EventWaitHandle _spaceWaitHandle;
     private readonly EventWaitHandle _contigWaitHandle;
+    private readonly EventWaitHandle? _dataWaitHandleFallback;
+    private readonly EventWaitHandle? _spaceWaitHandleFallback;
+    private readonly EventWaitHandle? _contigWaitHandleFallback;
     private readonly uint* _dataSeqPtr;
     private readonly uint* _spaceSeqPtr;
     private readonly uint* _contigSeqPtr;
@@ -54,23 +57,33 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
         _spaceSeqPtr = null;
         _contigSeqPtr = null;
 
-        var dataEventName = $"Global\\grpc_shm_{segmentName}_{ringId}_data";
-        var spaceEventName = $"Global\\grpc_shm_{segmentName}_{ringId}_space";
-        var contigEventName = $"Global\\grpc_shm_{segmentName}_{ringId}_contig";
+        var localDataEventName = $"Local\\grpc_shm_{segmentName}_{ringId}_data";
+        var localSpaceEventName = $"Local\\grpc_shm_{segmentName}_{ringId}_space";
+        var localContigEventName = $"Local\\grpc_shm_{segmentName}_{ringId}_contig";
+        var globalDataEventName = $"Global\\grpc_shm_{segmentName}_{ringId}_data";
+        var globalSpaceEventName = $"Global\\grpc_shm_{segmentName}_{ringId}_space";
+        var globalContigEventName = $"Global\\grpc_shm_{segmentName}_{ringId}_contig";
 
         if (isServer)
         {
-            // Server creates the events
-            _dataWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset, dataEventName);
-            _spaceWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset, spaceEventName);
-            _contigWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset, contigEventName);
+            // Server creates Local events and, when allowed, also creates Global events for cross-session clients.
+            _dataWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset, localDataEventName);
+            _spaceWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset, localSpaceEventName);
+            _contigWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset, localContigEventName);
+
+            _dataWaitHandleFallback = TryCreateEvent(globalDataEventName);
+            _spaceWaitHandleFallback = TryCreateEvent(globalSpaceEventName);
+            _contigWaitHandleFallback = TryCreateEvent(globalContigEventName);
         }
         else
         {
-            // Client opens existing events
-            _dataWaitHandle = EventWaitHandle.OpenExisting(dataEventName);
-            _spaceWaitHandle = EventWaitHandle.OpenExisting(spaceEventName);
-            _contigWaitHandle = EventWaitHandle.OpenExisting(contigEventName);
+            // Client opens Local first, then Global if Local is not available.
+            _dataWaitHandle = OpenExistingWithFallback(localDataEventName, globalDataEventName);
+            _spaceWaitHandle = OpenExistingWithFallback(localSpaceEventName, globalSpaceEventName);
+            _contigWaitHandle = OpenExistingWithFallback(localContigEventName, globalContigEventName);
+            _dataWaitHandleFallback = null;
+            _spaceWaitHandleFallback = null;
+            _contigWaitHandleFallback = null;
         }
 
         _dataEvent = _dataWaitHandle.SafeWaitHandle;
@@ -103,7 +116,7 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
             return WaitOnAddressLoop(_dataSeqPtr, expectedSeq, timeout, cancellationToken);
         }
 
-        return WaitForEvent(_dataWaitHandle, timeout, cancellationToken);
+        return WaitForEvent(_dataWaitHandle, _dataWaitHandleFallback, timeout, cancellationToken);
     }
 
     public bool WaitForSpace(uint expectedSeq, TimeSpan? timeout, CancellationToken cancellationToken)
@@ -113,7 +126,7 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
             return WaitOnAddressLoop(_spaceSeqPtr, expectedSeq, timeout, cancellationToken);
         }
 
-        return WaitForEvent(_spaceWaitHandle, timeout, cancellationToken);
+        return WaitForEvent(_spaceWaitHandle, _spaceWaitHandleFallback, timeout, cancellationToken);
     }
 
     public bool WaitForContig(uint expectedSeq, TimeSpan? timeout, CancellationToken cancellationToken)
@@ -123,10 +136,10 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
             return WaitOnAddressLoop(_contigSeqPtr, expectedSeq, timeout, cancellationToken);
         }
 
-        return WaitForEvent(_contigWaitHandle, timeout, cancellationToken);
+        return WaitForEvent(_contigWaitHandle, _contigWaitHandleFallback, timeout, cancellationToken);
     }
 
-    private static bool WaitForEvent(EventWaitHandle handle, TimeSpan? timeout, CancellationToken cancellationToken)
+    private static bool WaitForEvent(EventWaitHandle handle, EventWaitHandle? fallbackHandle, TimeSpan? timeout, CancellationToken cancellationToken)
     {
         if (cancellationToken.IsCancellationRequested)
         {
@@ -138,17 +151,34 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
         if (cancellationToken.CanBeCanceled)
         {
             // Wait with cancellation support
-            var waitHandles = new WaitHandle[] { handle, cancellationToken.WaitHandle };
+            var waitHandles = fallbackHandle == null
+                ? new WaitHandle[] { handle, cancellationToken.WaitHandle }
+                : new WaitHandle[] { handle, fallbackHandle, cancellationToken.WaitHandle };
             var result = WaitHandle.WaitAny(waitHandles, timeoutMs);
 
             // result == 0 means the event was signaled
             // result == 1 means cancellation was requested
             // result == WaitHandle.WaitTimeout means timeout
-            return result == 0;
+            if (result == 0)
+            {
+                return true;
+            }
+
+            if (fallbackHandle != null && result == 1)
+            {
+                return true;
+            }
+
+            return false;
         }
         else
         {
-            return handle.WaitOne(timeoutMs);
+            if (fallbackHandle == null)
+            {
+                return handle.WaitOne(timeoutMs);
+            }
+
+            return WaitHandle.WaitAny(new WaitHandle[] { handle, fallbackHandle }, timeoutMs) != WaitHandle.WaitTimeout;
         }
     }
 
@@ -161,6 +191,7 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
         }
 
         _dataWaitHandle.Set();
+        _dataWaitHandleFallback?.Set();
     }
 
     public void SignalSpace()
@@ -172,6 +203,7 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
         }
 
         _spaceWaitHandle.Set();
+        _spaceWaitHandleFallback?.Set();
     }
 
     public void SignalContig()
@@ -183,6 +215,7 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
         }
 
         _contigWaitHandle.Set();
+        _contigWaitHandleFallback?.Set();
     }
 
     public void Dispose()
@@ -196,6 +229,37 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
         _dataWaitHandle?.Dispose();
         _spaceWaitHandle?.Dispose();
         _contigWaitHandle?.Dispose();
+        _dataWaitHandleFallback?.Dispose();
+        _spaceWaitHandleFallback?.Dispose();
+        _contigWaitHandleFallback?.Dispose();
+    }
+
+    private static EventWaitHandle OpenExistingWithFallback(string localName, string globalName)
+    {
+        try
+        {
+            return EventWaitHandle.OpenExisting(localName);
+        }
+        catch (WaitHandleCannotBeOpenedException)
+        {
+            return EventWaitHandle.OpenExisting(globalName);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return EventWaitHandle.OpenExisting(globalName);
+        }
+    }
+
+    private static EventWaitHandle? TryCreateEvent(string name)
+    {
+        try
+        {
+            return new EventWaitHandle(false, EventResetMode.AutoReset, name);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     private static unsafe bool WaitOnAddressLoop(uint* address, uint expectedValue, TimeSpan? timeout, CancellationToken cancellationToken)

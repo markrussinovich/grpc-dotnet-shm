@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers.Binary;
 using System.Threading.Channels;
 using Grpc.Core;
 
@@ -371,8 +372,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     var increment = (uint)f.Length;
                     if (increment > 0)
                     {
-                        _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0,
-                            BitConverter.GetBytes(increment));
+                        Span<byte> windowUpdate = stackalloc byte[4];
+                        BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, increment);
+                        _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
                     }
 
                     // Yield an owned copy so payload buffers can be released safely.
@@ -438,8 +440,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         var increment = (uint)f.Length;
                         if (increment > 0)
                         {
-                            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0,
-                                BitConverter.GetBytes(increment));
+                            Span<byte> windowUpdate = stackalloc byte[4];
+                            BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, increment);
+                            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
                         }
 
                         previousFrame = f;

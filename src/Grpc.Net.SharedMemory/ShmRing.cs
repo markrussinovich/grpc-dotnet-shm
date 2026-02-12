@@ -651,7 +651,7 @@ public sealed class ShmRing : IDisposable
                     return;
                 }
 
-                _sync?.WaitForSpace(seq, TimeSpan.FromMilliseconds(100), cancellationToken);
+                _sync?.WaitForSpace(seq, timeout: null, cancellationToken);
             }
             finally
             {
@@ -675,7 +675,7 @@ public sealed class ShmRing : IDisposable
                     return;
                 }
 
-                _sync?.WaitForContig(seq, TimeSpan.FromMilliseconds(100), cancellationToken);
+                _sync?.WaitForContig(seq, timeout: null, cancellationToken);
             }
             finally
             {
@@ -739,7 +739,7 @@ public sealed class ShmRing : IDisposable
                 throw new RingClosedException();
             }
 
-            _sync?.WaitForData(seq, TimeSpan.FromMilliseconds(100), cancellationToken);
+            _sync?.WaitForData(seq, timeout: null, cancellationToken);
         }
         finally
         {

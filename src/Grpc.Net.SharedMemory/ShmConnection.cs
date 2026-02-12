@@ -205,7 +205,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _nextStreamId = isClient ? 1u : 2u;
 
         // Start background frame reader
-        _frameReaderTask = Task.Run(FrameReaderLoopAsync);
+        _frameReaderTask = FrameReaderLoopAsync();
 
         // Start keepalive task if enabled
         if (_keepaliveOptions.IsEnabled)
@@ -358,66 +358,36 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task FrameReaderLoopAsync()
+    private Task FrameReaderLoopAsync()
     {
-        // Run blocking ReadFramePayload on a dedicated thread to avoid
-        // async state-machine stack accumulation that causes StackOverflow.
-        var frameChannel = Channel.CreateBounded<(FrameHeader, FramePayload)>(
-            new BoundedChannelOptions(32)
-            {
-                SingleReader = true,
-                SingleWriter = true,
-                FullMode = BoundedChannelFullMode.Wait
-            });
-
-        var readerThread = new Thread(() =>
+        // Run blocking ReadFramePayload on a dedicated thread.
+        return Task.Factory.StartNew(async () =>
         {
             try
             {
                 while (!_disposeCts.Token.IsCancellationRequested)
                 {
-                    var result = FrameProtocol.ReadFramePayload(RxRing, _zeroCopyReads, _disposeCts.Token);
-                    // Block until the processing side catches up.
-                    while (!frameChannel.Writer.TryWrite(result))
-                    {
-                        if (_disposeCts.Token.IsCancellationRequested) return;
-                        Thread.Yield();
-                    }
+                    var (header, payload) = FrameProtocol.ReadFramePayload(RxRing, _zeroCopyReads, _disposeCts.Token);
+                    await ProcessFrameAsync(header, payload).ConfigureAwait(false);
                 }
             }
-            catch (OperationCanceledException) { }
-            catch (RingClosedException) { }
+            catch (OperationCanceledException)
+            {
+                // Normal shutdown
+            }
+            catch (ObjectDisposedException ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Frame reader disposed: {ex.Message}");
+            }
+            catch (RingClosedException)
+            {
+                // Normal shutdown
+            }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Frame reader thread error: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"Frame reader error: {ex.Message}");
             }
-            finally
-            {
-                frameChannel.Writer.TryComplete();
-            }
-        })
-        {
-            IsBackground = true,
-            Name = $"ShmFrameReader-{(_isClient ? "C" : "S")}"
-        };
-        readerThread.Start();
-
-        try
-        {
-            await foreach (var (header, payload) in
-                frameChannel.Reader.ReadAllAsync(_disposeCts.Token).ConfigureAwait(false))
-            {
-                await ProcessFrameAsync(header, payload).ConfigureAwait(false);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Normal shutdown
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"Frame processor error: {ex.Message}");
-        }
+        }, _disposeCts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
     }
 
     private async Task ProcessFrameAsync(FrameHeader header, FramePayload payload)
@@ -695,7 +665,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     {
         if (increment > 0)
         {
-            var payload = new byte[4];
+            Span<byte> payload = stackalloc byte[4];
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, increment);
             SendFrame(FrameType.WindowUpdate, 0, 0, payload);
         }
