@@ -38,12 +38,15 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/ok", "localhost");
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.OK, null);
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/ok", "localhost");
+
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.OK, null);
         
-        Assert.That(stream.Trailers, Is.Not.Null);
-        Assert.That(stream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.OK));
+        Assert.That(serverStream.Trailers, Is.Not.Null);
+        Assert.That(serverStream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.OK));
     }
 
     [Test]
@@ -56,12 +59,15 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/notfound", "localhost");
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.NotFound, "Resource not found");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/notfound", "localhost");
+
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.NotFound, "Resource not found");
         
-        Assert.That(stream.Trailers, Is.Not.Null);
-        Assert.That(stream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.NotFound));
+        Assert.That(serverStream.Trailers, Is.Not.Null);
+        Assert.That(serverStream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.NotFound));
     }
 
     [Test]
@@ -74,14 +80,17 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/message", "localhost");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/message", "localhost");
         
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+
         const string message = "Detailed error description";
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.InvalidArgument, message);
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.InvalidArgument, message);
         
-        Assert.That(stream.Trailers, Is.Not.Null);
-        Assert.That(stream.Trailers!.GrpcStatusMessage, Is.EqualTo(message));
+        Assert.That(serverStream.Trailers, Is.Not.Null);
+        Assert.That(serverStream.Trailers!.GrpcStatusMessage, Is.EqualTo(message));
     }
 
     [Test]
@@ -141,11 +150,13 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/resource-exhausted", "localhost");
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.ResourceExhausted, "Rate limit exceeded");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/resource-exhausted", "localhost");
+
+        var serverStream = await server.AcceptStreamAsync();
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.ResourceExhausted, "Rate limit exceeded");
         
-        Assert.That(stream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.ResourceExhausted));
+        Assert.That(serverStream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.ResourceExhausted));
     }
 
     [Test]
@@ -158,11 +169,13 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/internal", "localhost");
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.Internal, "Internal server error");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/internal", "localhost");
+
+        var serverStream = await server.AcceptStreamAsync();
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.Internal, "Internal server error");
         
-        Assert.That(stream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.Internal));
+        Assert.That(serverStream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.Internal));
     }
 
     [Test]
@@ -175,11 +188,13 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/unavailable", "localhost");
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.Unavailable, "Service temporarily unavailable");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/unavailable", "localhost");
+
+        var serverStream = await server.AcceptStreamAsync();
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.Unavailable, "Service temporarily unavailable");
         
-        Assert.That(stream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.Unavailable));
+        Assert.That(serverStream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.Unavailable));
     }
 
     [Test]
@@ -192,11 +207,13 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/permission-denied", "localhost");
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.PermissionDenied, "Access denied");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/permission-denied", "localhost");
+
+        var serverStream = await server.AcceptStreamAsync();
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.PermissionDenied, "Access denied");
         
-        Assert.That(stream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.PermissionDenied));
+        Assert.That(serverStream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.PermissionDenied));
     }
 
     [Test]
@@ -209,11 +226,13 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/unauthenticated", "localhost");
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.Unauthenticated, "Invalid credentials");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/unauthenticated", "localhost");
+
+        var serverStream = await server.AcceptStreamAsync();
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.Unauthenticated, "Invalid credentials");
         
-        Assert.That(stream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.Unauthenticated));
+        Assert.That(serverStream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.Unauthenticated));
     }
 
     [Test]
@@ -226,11 +245,13 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/empty-message", "localhost");
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.NotFound, "");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/empty-message", "localhost");
+
+        var serverStream = await server.AcceptStreamAsync();
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.NotFound, "");
         
-        Assert.That(stream.Trailers!.GrpcStatusMessage, Is.Empty);
+        Assert.That(serverStream.Trailers!.GrpcStatusMessage, Is.Empty);
     }
 
     [Test]
@@ -243,11 +264,13 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/null-message", "localhost");
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.OK, null);
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/null-message", "localhost");
+
+        var serverStream = await server.AcceptStreamAsync();
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.OK, null);
         
-        Assert.That(stream.Trailers!.GrpcStatusMessage, Is.Null.Or.Empty);
+        Assert.That(serverStream.Trailers!.GrpcStatusMessage, Is.Null.Or.Empty);
     }
 
     [Test]
@@ -260,13 +283,16 @@ public class StatusCodeTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/unicode-message", "localhost");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/unicode-message", "localhost");
         
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+
         const string unicodeMessage = "Error: 错误 🔥";
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.Internal, unicodeMessage);
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.Internal, unicodeMessage);
         
-        Assert.That(stream.Trailers!.GrpcStatusMessage, Is.EqualTo(unicodeMessage));
+        Assert.That(serverStream.Trailers!.GrpcStatusMessage, Is.EqualTo(unicodeMessage));
     }
 
     [Test]

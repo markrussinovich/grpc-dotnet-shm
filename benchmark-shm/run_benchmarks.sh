@@ -213,18 +213,18 @@ if [ "$GENERATE_PLOTS" = true ]; then
     
     # Check if matplotlib is available
     if python3 -c "import matplotlib" 2>/dev/null; then
-        python3 plot_results.py "$RESULTS_FILE" "$PLOTS_DIR"
-        echo -e "${GREEN}Plots saved to: $PLOTS_DIR/${NC}"
+        python3 benchmark_runner.py --plot-only
+        echo -e "${GREEN}Plots saved to: out/${NC}"
     else
         echo -e "${YELLOW}matplotlib not found. Installing...${NC}"
         pip3 install matplotlib numpy --quiet 2>/dev/null || pip install matplotlib numpy --quiet 2>/dev/null || {
             echo -e "${RED}Failed to install matplotlib. Skipping plot generation.${NC}"
-            echo "Run manually: pip install matplotlib numpy && python3 plot_results.py $RESULTS_FILE $PLOTS_DIR"
+            echo "Run manually: pip install matplotlib numpy && python3 benchmark_runner.py --plot-only"
         }
         
         if python3 -c "import matplotlib" 2>/dev/null; then
-            python3 plot_results.py "$RESULTS_FILE" "$PLOTS_DIR"
-            echo -e "${GREEN}Plots saved to: $PLOTS_DIR/${NC}"
+            python3 benchmark_runner.py --plot-only
+            echo -e "${GREEN}Plots saved to: out/${NC}"
         fi
     fi
 fi
@@ -244,4 +244,4 @@ echo "Results: $RESULTS_FILE"
 echo "Plots: $PLOTS_DIR/"
 echo ""
 echo "To regenerate plots:"
-echo "  python3 plot_results.py $RESULTS_FILE $PLOTS_DIR"
+echo "  python3 benchmark_runner.py --plot-only"

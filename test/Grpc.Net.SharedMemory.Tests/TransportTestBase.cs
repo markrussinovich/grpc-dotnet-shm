@@ -89,8 +89,7 @@ public abstract class TransportTestBase
     /// <returns>A tuple of (server, client) connections.</returns>
     protected (ShmConnection Server, ShmConnection Client) CreateConnectionPair(
         ulong ringCapacity = 4096,
-        uint maxStreams = 100,
-        ShmCompressionOptions? compressionOptions = null)
+        uint maxStreams = 100)
     {
         if (Transport == TransportKind.Tcp)
         {
@@ -100,10 +99,10 @@ public abstract class TransportTestBase
         }
 
         var segmentName = $"test_{Guid.NewGuid():N}";
-        var server = ShmConnection.CreateAsServer(segmentName, ringCapacity, maxStreams, compressionOptions: compressionOptions);
+        var server = ShmConnection.CreateAsServer(segmentName, ringCapacity, maxStreams);
         _disposables.Add(server);
 
-        var client = ShmConnection.ConnectAsClient(segmentName, compressionOptions: compressionOptions);
+        var client = ShmConnection.ConnectAsClient(segmentName);
         _disposables.Add(client);
 
         return (server, client);

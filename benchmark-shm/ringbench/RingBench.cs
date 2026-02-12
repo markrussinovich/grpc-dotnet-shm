@@ -62,8 +62,9 @@ string platform = platformOverride
 outDir = Path.Combine(outDir, platform);
 Directory.CreateDirectory(outDir);
 
-// Go benchmark sizes: 0, 1, 1K, 4K, 16K, 64K, 256K, 512K, 1M, 2M
-int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152 };
+// Go benchmark sizes + extended: 0, 1, 1K, 4K, 16K, 64K, 256K, 512K, 1M, 2M, 4M, 16M, 32M, 128M
+int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288,
+                1048576, 2097152, 4194304, 16777216, 33554432, 134217728 };
 
 string cpu = GetCpuInfo();
 string runtime = RuntimeInformation.FrameworkDescription;
@@ -95,33 +96,27 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv }
     Console.WriteLine($"=== {env.Transport.ToUpper()} Transport ===");
     Console.WriteLine();
 
-    Console.WriteLine("  Unary ping-pong:");
-    Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
-    Console.WriteLine("  " + new string('-', 76));
+    // Interleave unary + streaming per payload size — matches Go benchmark loop order
+    Console.WriteLine($"  {"Type",-12} {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
+    Console.WriteLine("  " + new string('-', 88));
 
     foreach (var size in sizes)
     {
         int iters = IterationsForSize(size);
-        int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
-        var (avgUs, throughputMBps) = await MeasureUnary(env.Client, size, iters);
-        int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
-        unaryResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
-        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
-    }
-    Console.WriteLine();
 
-    Console.WriteLine("  Streaming ping-pong:");
-    Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
-    Console.WriteLine("  " + new string('-', 76));
-
-    foreach (var size in sizes)
-    {
-        int iters = IterationsForSize(size);
+        // Unary
         int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
-        var (avgUs, throughputMBps) = await MeasureStreaming(env.Client, size, iters);
+        var (uAvgUs, uThroughput) = await MeasureUnary(env.Client, size, iters);
         int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
-        streamingResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
-        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+        unaryResults.Add(new BenchResult(env.Transport, size, iters, uAvgUs, uThroughput));
+        Console.WriteLine($"  {"unary",-12} {FormatSize(size),-12} {iters,-8} {uAvgUs,-14:F3} {uThroughput,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+
+        // Streaming
+        gc0Before = GC.CollectionCount(0); gc1Before = GC.CollectionCount(1); gc2Before = GC.CollectionCount(2);
+        var (sAvgUs, sThroughput) = await MeasureStreaming(env.Client, size, iters);
+        gc0 = GC.CollectionCount(0) - gc0Before; gc1 = GC.CollectionCount(1) - gc1Before; gc2 = GC.CollectionCount(2) - gc2Before;
+        streamingResults.Add(new BenchResult(env.Transport, size, iters, sAvgUs, sThroughput));
+        Console.WriteLine($"  {"streaming",-12} {FormatSize(size),-12} {iters,-8} {sAvgUs,-14:F3} {sThroughput,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
     }
     Console.WriteLine();
 }
@@ -160,24 +155,6 @@ var csvPath = Path.Combine(outDir, "results.csv");
 WriteCsv(csvPath, unaryResults, streamingResults);
 Console.WriteLine($"CSV written to: {csvPath}");
 
-// Generate SVG plots (matching Go's output)
-WriteSvgPlot(
-    Path.Combine(outDir, "unary_latency.svg"),
-    "Unary ping-pong latency", "Payload size", "Avg latency (µs)",
-    GroupByTransport(unaryResults, r => r.AvgLatencyUs));
-
-WriteSvgPlot(
-    Path.Combine(outDir, "streaming_latency.svg"),
-    "Streaming ping-pong latency", "Payload size", "Avg latency (µs)",
-    GroupByTransport(streamingResults, r => r.AvgLatencyUs));
-
-WriteSvgPlot(
-    Path.Combine(outDir, "streaming_throughput.svg"),
-    "Streaming throughput", "Payload size", "Throughput (MiB/s)",
-    GroupByTransport(streamingResults, r => r.ThroughputMBps));
-
-Console.WriteLine($"Plots written to: {outDir}");
-
 // ============================================================================
 // Benchmark Service Implementation (server side)
 // ============================================================================
@@ -196,10 +173,18 @@ async Task<BenchEnv> StartTcpEnv()
 {
     var builder = WebApplication.CreateBuilder(Array.Empty<string>());
     builder.Logging.ClearProviders();
-    builder.Services.AddGrpc();
+    builder.Services.AddGrpc(o =>
+    {
+        o.MaxReceiveMessageSize = 256 * 1024 * 1024;
+        o.MaxSendMessageSize = 256 * 1024 * 1024;
+    });
     builder.WebHost.ConfigureKestrel(k =>
     {
-        k.Listen(IPAddress.Loopback, 0, lo => lo.Protocols = HttpProtocols.Http2);
+        k.Limits.MaxRequestBodySize = 512 * 1024 * 1024;
+        k.Listen(IPAddress.Loopback, 0, lo =>
+        {
+            lo.Protocols = HttpProtocols.Http2;
+        });
     });
 
     var app = builder.Build();
@@ -208,7 +193,11 @@ async Task<BenchEnv> StartTcpEnv()
     await app.StartAsync();
 
     var address = app.Urls.First();
-    var channel = GrpcChannel.ForAddress(address);
+    var channel = GrpcChannel.ForAddress(address, new GrpcChannelOptions
+    {
+        MaxReceiveMessageSize = 256 * 1024 * 1024,
+        MaxSendMessageSize = 256 * 1024 * 1024
+    });
     var client = new BenchmarkService.BenchmarkServiceClient(channel);
 
     return new BenchEnv("tcp", client, channel, async () =>
@@ -227,7 +216,7 @@ async Task<BenchEnv> StartShmEnv()
     Segment.TryRemoveSegment(segmentName);
     Segment.TryRemoveSegment(segmentName + "_ctl");
 
-    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024);
+    var server = new ShmGrpcServer(segmentName, ringCapacity: 512 * 1024 * 1024);
 
     server.MapUnary<SimpleRequest, SimpleResponse>(
         "/grpc.testing.BenchmarkService/UnaryCall",
@@ -274,7 +263,9 @@ async Task<BenchEnv> StartShmEnv()
     var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
     {
         HttpHandler = new ShmControlHandler(segmentName),
-        DisposeHttpClient = true
+        DisposeHttpClient = true,
+        MaxReceiveMessageSize = 256 * 1024 * 1024,
+        MaxSendMessageSize = 256 * 1024 * 1024
     });
 
     var client = new BenchmarkService.BenchmarkServiceClient(channel);
@@ -320,13 +311,12 @@ static async Task<(double avgUs, double throughputMBps)> MeasureUnary(
     var payload = MakePayload(payloadSize);
     var req = new SimpleRequest { ResponseSize = payloadSize, Payload = payload };
 
-    // Warmup
-    for (int i = 0; i < Math.Min(10, iterations / 10 + 1); i++)
-        await client.UnaryCallAsync(req);
+    // Safety timeout: 5 minutes per measurement to prevent hangs
+    using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
 
     var sw = Stopwatch.StartNew();
     for (int i = 0; i < iterations; i++)
-        await client.UnaryCallAsync(req);
+        await client.UnaryCallAsync(req, cancellationToken: cts.Token);
     sw.Stop();
 
     double totalUs = sw.Elapsed.TotalMicroseconds;
@@ -345,20 +335,16 @@ static async Task<(double avgUs, double throughputMBps)> MeasureStreaming(
     var payload = MakePayload(payloadSize);
     var req = new SimpleRequest { ResponseSize = payloadSize, Payload = payload };
 
-    using var call = client.StreamingCall();
+    // Safety timeout: 5 minutes per measurement to prevent hangs
+    using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
 
-    // Warmup
-    for (int i = 0; i < Math.Min(10, iterations / 10 + 1); i++)
-    {
-        await call.RequestStream.WriteAsync(req);
-        await call.ResponseStream.MoveNext(CancellationToken.None);
-    }
+    using var call = client.StreamingCall(cancellationToken: cts.Token);
 
     var sw = Stopwatch.StartNew();
     for (int i = 0; i < iterations; i++)
     {
         await call.RequestStream.WriteAsync(req);
-        await call.ResponseStream.MoveNext(CancellationToken.None);
+        await call.ResponseStream.MoveNext(cts.Token);
     }
     sw.Stop();
 
@@ -387,7 +373,11 @@ static int IterationsForSize(int size) => size switch
     <= 262144 => 400,
     <= 524288 => 250,
     <= 1048576 => 150,
-    _ => 80
+    <= 2097152 => 80,       // 2 MB
+    <= 4194304 => 40,       // 4 MB
+    <= 16777216 => 20,      // 16 MB
+    <= 33554432 => 10,      // 32 MB
+    _ => 5                  // 128 MB+
 };
 
 // ============================================================================
@@ -424,162 +414,12 @@ static string GetCpuInfo()
     return Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER") ?? "Unknown";
 }
 
-// ============================================================================
-// SVG Plotting — matches Go's writeSVGPlot
-// ============================================================================
-
-static List<PlotSeries> GroupByTransport(List<BenchResult> results, Func<BenchResult, double> valueSelector)
-{
-    return results
-        .GroupBy(r => r.Transport)
-        .OrderBy(g => g.Key)
-        .Select(g => new PlotSeries(
-            g.Key,
-            g.Key == "shm" ? "#d62728" : "#1f77b4",
-            g.OrderBy(r => r.SizeBytes)
-             .Select(r => new PlotPoint(r.SizeBytes, valueSelector(r)))
-             .ToList()))
-        .ToList();
-}
-
-static void WriteSvgPlot(string path, string title, string xLabel, string yLabel, List<PlotSeries> series)
-{
-    if (series.Count == 0) return;
-
-    const double width = 960, height = 560;
-    const double ml = 80, mr = 40, mt = 60, mb = 70;
-
-    double xMax = series.SelectMany(s => s.Points).Max(p => p.X);
-    double yMax = series.SelectMany(s => s.Points).Max(p => p.Y);
-    if (xMax == 0) xMax = 1;
-    if (yMax == 0) yMax = 1;
-
-    double chartW = width - ml - mr;
-    double chartH = height - mt - mb;
-    double scaleX = chartW / xMax;
-    double scaleY = chartH / yMax;
-
-    var xTicks = NiceTicks(0, xMax, 6);
-    var yTicks = NiceTicks(0, yMax, 6);
-    double x0 = ml, y0 = height - mb;
-
-    using var w = new StreamWriter(path);
-    w.Write($"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width:F0}\" height=\"{height:F0}\" viewBox=\"0 0 {width:F0} {height:F0}\">");
-    w.Write("<style>text{font-family:Arial,sans-serif;font-size:12px;} .title{font-size:16px;font-weight:bold;}</style>");
-    w.Write("<rect width=\"100%\" height=\"100%\" fill=\"white\"/>");
-
-    // Title + labels
-    w.Write($"<text x=\"{width / 2:F1}\" y=\"{mt / 2:F1}\" class=\"title\" text-anchor=\"middle\">{title}</text>");
-    w.Write($"<text x=\"{width / 2:F1}\" y=\"{height - 20:F1}\" text-anchor=\"middle\">{xLabel}</text>");
-    w.Write($"<text x=\"15\" y=\"{height / 2:F1}\" transform=\"rotate(-90 15,{height / 2:F1})\" text-anchor=\"middle\">{yLabel}</text>");
-
-    // Axes
-    w.Write($"<line x1=\"{x0:F1}\" y1=\"{y0:F1}\" x2=\"{width - mr:F1}\" y2=\"{y0:F1}\" stroke=\"black\"/>");
-    w.Write($"<line x1=\"{x0:F1}\" y1=\"{y0:F1}\" x2=\"{x0:F1}\" y2=\"{mt:F1}\" stroke=\"black\"/>");
-
-    // Ticks + grid
-    foreach (var t in xTicks)
-    {
-        double px = x0 + t * scaleX;
-        w.Write($"<line x1=\"{px:F1}\" y1=\"{y0:F1}\" x2=\"{px:F1}\" y2=\"{y0 + 6:F1}\" stroke=\"black\"/>");
-        w.Write($"<text x=\"{px:F1}\" y=\"{y0 + 20:F1}\" text-anchor=\"middle\">{FormatSizeForPlot((int)t)}</text>");
-        w.Write($"<line x1=\"{px:F1}\" y1=\"{y0:F1}\" x2=\"{px:F1}\" y2=\"{mt:F1}\" stroke=\"#dddddd\"/>");
-    }
-    foreach (var t in yTicks)
-    {
-        double py = y0 - t * scaleY;
-        w.Write($"<line x1=\"{x0 - 6:F1}\" y1=\"{py:F1}\" x2=\"{x0:F1}\" y2=\"{py:F1}\" stroke=\"black\"/>");
-        w.Write($"<text x=\"{x0 - 8:F1}\" y=\"{py + 4:F1}\" text-anchor=\"end\">{FormatNumber(t)}</text>");
-        w.Write($"<line x1=\"{x0:F1}\" y1=\"{py:F1}\" x2=\"{width - mr:F1}\" y2=\"{py:F1}\" stroke=\"#ededed\"/>");
-    }
-
-    // Data series
-    foreach (var s in series)
-    {
-        w.Write($"<polyline fill=\"none\" stroke=\"{s.Color}\" stroke-width=\"2\" points=\"");
-        foreach (var p in s.Points)
-        {
-            double px = x0 + p.X * scaleX;
-            double py = y0 - p.Y * scaleY;
-            w.Write($"{px:F1},{py:F1} ");
-        }
-        w.Write("\"/>");
-
-        foreach (var p in s.Points)
-        {
-            double px = x0 + p.X * scaleX;
-            double py = y0 - p.Y * scaleY;
-            w.Write($"<circle cx=\"{px:F1}\" cy=\"{py:F1}\" r=\"3\" fill=\"{s.Color}\"/>");
-        }
-    }
-
-    // Legend
-    double lx = width - mr - 150, ly = mt + 10;
-    w.Write($"<rect x=\"{lx:F1}\" y=\"{ly:F1}\" width=\"140\" height=\"{series.Count * 22 + 10:F1}\" fill=\"white\" stroke=\"#ccc\"/>");
-    for (int si = 0; si < series.Count; si++)
-    {
-        double ey = ly + 20 + si * 22;
-        w.Write($"<line x1=\"{lx + 10:F1}\" y1=\"{ey - 5:F1}\" x2=\"{lx + 30:F1}\" y2=\"{ey - 5:F1}\" stroke=\"{series[si].Color}\" stroke-width=\"3\"/>");
-        w.Write($"<text x=\"{lx + 40:F1}\" y=\"{ey - 2:F1}\">{series[si].Label}</text>");
-    }
-
-    w.Write("</svg>");
-}
-
-static string FormatSizeForPlot(int n) => n switch
-{
-    0 => "0 B",
-    >= 1048576 => $"{n / 1048576.0:F1} MiB",
-    >= 1024 => $"{n / 1024.0:F1} KiB",
-    _ => $"{n} B"
-};
-
-static string FormatNumber(double v) => v switch
-{
-    >= 1_000_000 => $"{v / 1_000_000:F1}M",
-    >= 1_000 => $"{v / 1_000:F1}k",
-    >= 10 => $"{v:F0}",
-    _ => $"{v:F2}"
-};
-
-static List<double> NiceTicks(double min, double max, int count)
-{
-    if (max <= min) max = min + 1;
-    double rawStep = (max - min) / count;
-    double step = NiceStep(rawStep);
-    double start = Math.Floor(min / step) * step;
-    double end = Math.Ceiling(max / step) * step;
-    var ticks = new List<double>();
-    for (double v = start; v <= end + step / 2; v += step)
-    {
-        if (v < 0 && min >= 0) continue;
-        ticks.Add(v);
-    }
-    return ticks;
-}
-
-static double NiceStep(double step)
-{
-    if (step == 0) return 1;
-    double pow = Math.Pow(10, Math.Floor(Math.Log10(step)));
-    double scaled = step / pow;
-    double nice = scaled switch
-    {
-        < 1.5 => 1,
-        < 3 => 2,
-        < 7 => 5,
-        _ => 10
-    };
-    return nice * pow;
-}
 
 // ============================================================================
 // Types
 // ============================================================================
 
 sealed record BenchResult(string Transport, int SizeBytes, int Iterations, double AvgLatencyUs, double ThroughputMBps);
-sealed record PlotPoint(double X, double Y);
-sealed record PlotSeries(string Label, string Color, List<PlotPoint> Points);
 
 /// <summary>
 /// Benchmark gRPC service implementation.

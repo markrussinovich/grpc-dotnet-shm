@@ -74,11 +74,11 @@ public enum FrameType : byte
     /// <summary>Handshake response frame.</summary>
     HandshakeResp = 0x21,
 
-    /// <summary>Handshake failure frame.</summary>
-    HandshakeFail = 0x22,
-
     /// <summary>Handshake acknowledgement frame.</summary>
-    HandshakeAck = 0x23
+    HandshakeAck = 0x22,
+
+    /// <summary>Handshake failure frame.</summary>
+    HandshakeFail = 0x23
 }
 
 /// <summary>
@@ -164,9 +164,9 @@ public static class ShmConstants
     /// <summary>
     /// Initial flow-control window size.
     /// HTTP/2 over TCP uses 65 535, but shared memory is a local, high-bandwidth
-    /// transport so we use 16 MiB (¼ of the default 64 MiB ring capacity).
-    /// This must be large enough that a single gRPC message can be sent without
-    /// requiring a WINDOW_UPDATE first.
+    /// transport so we use 16 MiB. Messages larger than the window are
+    /// automatically chunked by the flow-control layer in ShmGrpcStream,
+    /// so the window does not limit the maximum message size.
     /// </summary>
     public const int InitialWindowSize = 16 * 1024 * 1024;
 

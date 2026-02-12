@@ -408,7 +408,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 // Route to stream — transfer pooled buffer ownership
                 if (_streams.TryGetValue(header.StreamId, out var stream))
                 {
-                    var frame = new InboundFrame(header.Type, payload);
+                    var frame = new InboundFrame(header.Type, payload, header.Flags);
                     stream.OnFrameReceived(frame);
 
                     // BDP estimation: track bytes received
@@ -478,7 +478,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         if (_streams.TryGetValue(streamId, out var existingStream))
         {
             // Route to existing stream (e.g., response headers for client)
-            var frame = new InboundFrame(header.Type, payload);
+            var frame = new InboundFrame(header.Type, payload, header.Flags);
             existingStream.OnFrameReceived(frame);
             return;
         }

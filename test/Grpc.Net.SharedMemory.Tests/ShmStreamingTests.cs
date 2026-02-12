@@ -100,11 +100,15 @@ public class ShmStreamingTests
         // Server task - counts received bytes
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = server.CreateStream();
-            await serverStream.SendResponseHeadersAsync();
+            var serverStream = await server.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            await serverStream!.SendResponseHeadersAsync();
             
-            // Simulate receiving data
-            await Task.Delay(500);
+            // Drain all incoming messages so WINDOW_UPDATE frames replenish the sender
+            await foreach (var msg in serverStream.ReceiveMessagesAsync())
+            {
+                receivedTotal += msg.Length;
+            }
             
             await serverStream.SendTrailersAsync(StatusCode.OK, $"Received {receivedTotal} bytes");
         });

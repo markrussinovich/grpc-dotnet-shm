@@ -48,9 +48,9 @@ public class FlowControlTests
     public void Connection_InitialSendQuota_IsInitialWindowSize()
     {
         var segmentName = $"flow_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
-        
+
         Assert.That(server.ConnectionSendQuota, Is.EqualTo(ShmConstants.InitialWindowSize));
     }
 
@@ -59,18 +59,18 @@ public class FlowControlTests
     public async Task Stream_InitialSendWindow_IsCorrect()
     {
         var segmentName = $"flow_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
-        
+
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/flow", "localhost");
-        
+
         // Stream should have initial window size available
         // We can verify by sending a message that's smaller than initial window
         var smallMessage = new byte[1000];
         await stream.SendMessageAsync(smallMessage);
-        
+
         // Should complete without blocking
         Assert.Pass();
     }
@@ -81,21 +81,21 @@ public class FlowControlTests
     public async Task SendMessage_WithinWindow_CompletesImmediately()
     {
         var segmentName = $"flow_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 65536, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
-        
+
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/flow", "localhost");
-        
+
         var startTime = DateTime.UtcNow;
-        
+
         // Send message smaller than initial window (16 MiB)
         var message = new byte[10000];
         await stream.SendMessageAsync(message);
-        
+
         var elapsed = DateTime.UtcNow - startTime;
-        
+
         // Should complete quickly (within 100ms), not block on flow control
         Assert.That(elapsed.TotalMilliseconds, Is.LessThan(100));
     }
@@ -105,20 +105,20 @@ public class FlowControlTests
     public async Task MultipleSmallMessages_ConsumeWindow()
     {
         var segmentName = $"flow_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 2 * 1024 * 1024, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
-        
+
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/flow", "localhost");
-        
+
         // Send multiple small messages
         var message = new byte[1000];
         for (int i = 0; i < 10; i++)
         {
             await stream.SendMessageAsync(message);
         }
-        
+
         // All should complete (10KB < 65KB initial window)
         Assert.Pass();
     }
@@ -136,7 +136,7 @@ public class FlowControlTests
     public void BdpEstimator_InitialBdp_IsInitialWindow()
     {
         var estimator = new ShmBdpEstimator((uint)ShmConstants.InitialWindowSize);
-        
+
         Assert.That(estimator.CurrentBdp, Is.EqualTo(ShmConstants.InitialWindowSize));
     }
 
@@ -168,14 +168,14 @@ public class ConcurrentStreamTests
     public void CreateMultipleStreams_HaveUniqueIds()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
-        
+
         var stream1 = client.CreateStream();
         var stream2 = client.CreateStream();
         var stream3 = client.CreateStream();
-        
+
         Assert.That(stream1.StreamId, Is.Not.EqualTo(stream2.StreamId));
         Assert.That(stream2.StreamId, Is.Not.EqualTo(stream3.StreamId));
         Assert.That(stream1.StreamId, Is.Not.EqualTo(stream3.StreamId));
@@ -186,14 +186,14 @@ public class ConcurrentStreamTests
     public void ClientStreams_UseOddIds()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
-        
+
         var stream1 = client.CreateStream();
         var stream2 = client.CreateStream();
         var stream3 = client.CreateStream();
-        
+
         Assert.That(stream1.StreamId % 2, Is.EqualTo(1), "Client stream IDs should be odd");
         Assert.That(stream2.StreamId % 2, Is.EqualTo(1), "Client stream IDs should be odd");
         Assert.That(stream3.StreamId % 2, Is.EqualTo(1), "Client stream IDs should be odd");
@@ -204,12 +204,12 @@ public class ConcurrentStreamTests
     public void ServerStreams_UseEvenIds()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
-        
+
         var stream1 = server.CreateStream();
         var stream2 = server.CreateStream();
-        
+
         Assert.That(stream1.StreamId % 2, Is.EqualTo(0), "Server stream IDs should be even");
         Assert.That(stream2.StreamId % 2, Is.EqualTo(0), "Server stream IDs should be even");
     }
@@ -219,14 +219,14 @@ public class ConcurrentStreamTests
     public void StreamIds_AreSequential()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
-        
+
         var stream1 = client.CreateStream();
         var stream2 = client.CreateStream();
         var stream3 = client.CreateStream();
-        
+
         // Client uses odd IDs: 1, 3, 5, ...
         Assert.That(stream1.StreamId, Is.EqualTo(1));
         Assert.That(stream2.StreamId, Is.EqualTo(3));
@@ -239,22 +239,22 @@ public class ConcurrentStreamTests
     public async Task ConcurrentStreams_CanSendIndependently()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 65536, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
-        
+
         var stream1 = client.CreateStream();
         var stream2 = client.CreateStream();
-        
+
         await stream1.SendRequestHeadersAsync("/test/1", "localhost");
         await stream2.SendRequestHeadersAsync("/test/2", "localhost");
-        
+
         // Send messages on both streams concurrently
         var task1 = stream1.SendMessageAsync(Encoding.UTF8.GetBytes("message on stream 1"));
         var task2 = stream2.SendMessageAsync(Encoding.UTF8.GetBytes("message on stream 2"));
-        
+
         await Task.WhenAll(task1, task2);
-        
+
         Assert.Pass();
     }
 
@@ -264,23 +264,23 @@ public class ConcurrentStreamTests
     public async Task ManyStreams_Created_InParallel()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 65536, 100);
         using var client = ShmConnection.ConnectAsClient(segmentName);
-        
+
         const int streamCount = 50;
         var streams = new List<ShmGrpcStream>();
         var tasks = new List<Task>();
-        
+
         for (int i = 0; i < streamCount; i++)
         {
             var stream = client.CreateStream();
             streams.Add(stream);
             tasks.Add(stream.SendRequestHeadersAsync($"/test/{i}", "localhost"));
         }
-        
+
         await Task.WhenAll(tasks);
-        
+
         Assert.That(streams.Count, Is.EqualTo(streamCount));
         Assert.That(streams.Select(s => s.StreamId).Distinct().Count(), Is.EqualTo(streamCount));
     }
@@ -290,13 +290,13 @@ public class ConcurrentStreamTests
     public void StreamIsClientStream_ReflectsConnection()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";
-        
+
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
-        
+
         var clientStream = client.CreateStream();
         var serverStream = server.CreateStream();
-        
+
         Assert.That(clientStream.IsClientStream, Is.True);
         Assert.That(serverStream.IsClientStream, Is.False);
     }

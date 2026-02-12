@@ -43,7 +43,7 @@ public class ShmCompressionE2ETests : TransportTestBase
             AcceptedCompressors = new List<string> { "gzip", "identity" }
         };
 
-        var (server, client) = CreateConnectionPair(ringCapacity: 65536, compressionOptions: compressionOptions);
+        var (server, client) = CreateConnectionPair(ringCapacity: 65536);
 
         // Create a large, compressible message
         var sb = new StringBuilder();
@@ -150,7 +150,7 @@ public class ShmCompressionE2ETests : TransportTestBase
             MinSizeForCompression = 10_000 // Only compress messages >= 10KB
         };
 
-        var (server, client) = CreateConnectionPair(ringCapacity: 65536, compressionOptions: compressionOptions);
+        var (server, client) = CreateConnectionPair(ringCapacity: 65536);
 
         // Small message below threshold
         var originalMessage = Encoding.UTF8.GetBytes("Small message");
@@ -199,7 +199,7 @@ public class ShmCompressionE2ETests : TransportTestBase
             AcceptedCompressors = new List<string> { "gzip", "identity" }
         };
 
-        var (server, client) = CreateConnectionPair(ringCapacity: 65536, compressionOptions: compressionOptions);
+        var (server, client) = CreateConnectionPair(ringCapacity: 65536);
 
         var messages = new List<byte[]>();
         for (int i = 0; i < 5; i++)
@@ -274,7 +274,7 @@ public class ShmCompressionE2ETests : TransportTestBase
             AcceptedCompressors = new List<string> { "deflate", "gzip", "identity" }
         };
 
-        var (server, client) = CreateConnectionPair(ringCapacity: 65536, compressionOptions: compressionOptions);
+        var (server, client) = CreateConnectionPair(ringCapacity: 65536);
 
         // Create a compressible message
         var originalMessage = Encoding.UTF8.GetBytes(new string('A', 5000));

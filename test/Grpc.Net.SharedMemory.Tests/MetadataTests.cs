@@ -304,17 +304,20 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/trailers", "localhost");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/trailers", "localhost");
         
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+
         var trailers = new Grpc.Core.Metadata
         {
             { "trailer-key", "trailer-value" }
         };
         
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.OK, "success", trailers);
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.OK, "success", trailers);
         
-        Assert.That(stream.Trailers, Is.Not.Null);
+        Assert.That(serverStream.Trailers, Is.Not.Null);
     }
 
     [Test]
@@ -327,12 +330,14 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
-        await stream.SendRequestHeadersAsync("/test/status-trailers", "localhost");
+        var clientStream = client.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/status-trailers", "localhost");
         
-        await stream.SendTrailersAsync(Grpc.Core.StatusCode.NotFound, "resource not found");
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        await serverStream!.SendTrailersAsync(Grpc.Core.StatusCode.NotFound, "resource not found");
         
-        Assert.That(stream.Trailers, Is.Not.Null);
-        Assert.That(stream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.NotFound));
+        Assert.That(serverStream.Trailers, Is.Not.Null);
+        Assert.That(serverStream.Trailers!.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.NotFound));
     }
 }
