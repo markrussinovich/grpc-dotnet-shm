@@ -109,7 +109,7 @@ public static class RingSyncFactory
     {
         if (OperatingSystem.IsWindows())
         {
-            return CreateWindowsSync(segmentName, ringId, isServer);
+            return CreateWindowsSync(segmentName, ringId, isServer, memoryManager, ringHeaderOffset);
         }
         else if (OperatingSystem.IsLinux())
         {
@@ -127,8 +127,19 @@ public static class RingSyncFactory
     {
         return new WindowsRingSync(segmentName, ringId, isServer);
     }
+
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    private static IRingSync CreateWindowsSync(string segmentName, string ringId, bool isServer, MappedMemoryManager memoryManager, int ringHeaderOffset)
+    {
+        return new WindowsRingSync(segmentName, ringId, isServer, memoryManager, ringHeaderOffset);
+    }
 #else
     private static IRingSync CreateWindowsSync(string segmentName, string ringId, bool isServer)
+    {
+        throw new PlatformNotSupportedException("Windows sync not available on this platform.");
+    }
+
+    private static IRingSync CreateWindowsSync(string segmentName, string ringId, bool isServer, MappedMemoryManager memoryManager, int ringHeaderOffset)
     {
         throw new PlatformNotSupportedException("Windows sync not available on this platform.");
     }
