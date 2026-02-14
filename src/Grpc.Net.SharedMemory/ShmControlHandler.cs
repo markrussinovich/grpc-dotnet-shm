@@ -433,7 +433,7 @@ internal sealed class ShmGrpcRequestStream : Stream
 /// HttpContent implementation that reads response messages from a ShmGrpcStream.
 /// grpc-dotnet calls ReadAsStreamAsync (→ CreateContentReadStreamAsync) to get a
 /// stream it can incrementally read gRPC-framed messages from.  We return a
-/// lightweight wrapper that reads from ShmGrpcStream.ReceiveMessagesAsync()
+/// lightweight wrapper that reads from ShmGrpcStream.ReceiveMessageBuffersAsync()
 /// directly on the caller's thread — no Pipe, no Task.Run, no resource
 /// accumulation across thousands of calls.
 /// </summary>
@@ -465,10 +465,11 @@ internal sealed class ShmControlResponseContent : HttpContent
 
     protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
     {
-        await foreach (var message in _stream.ReceiveMessagesAsync(cancellationToken))
+        var header = new byte[5];
+        header[0] = 0;
+
+        await foreach (var message in _stream.ReceiveMessageBuffersAsync(cancellationToken))
         {
-            var header = new byte[5];
-            header[0] = 0;
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(1), (uint)message.Length);
             await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
             await stream.WriteAsync(message, cancellationToken).ConfigureAwait(false);

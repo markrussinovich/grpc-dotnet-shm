@@ -373,12 +373,14 @@ internal sealed class ShmResponseContent : HttpContent
 
     protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
     {
+        var header = new byte[5];
+        header[0] = 0;
+
         // Write gRPC-format messages to the output stream
-        await foreach (var message in _stream.ReceiveMessagesAsync(cancellationToken))
+        await foreach (var message in _stream.ReceiveMessageBuffersAsync(cancellationToken))
         {
             // gRPC message format: [compressed:1][length:4][data]
-            var header = new byte[5];
-            header[0] = 0; // Not compressed (SHM-level compression is transparent)
+            // Not compressed (SHM-level compression is transparent)
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(1), (uint)message.Length);
 
             await stream.WriteAsync(header, cancellationToken);

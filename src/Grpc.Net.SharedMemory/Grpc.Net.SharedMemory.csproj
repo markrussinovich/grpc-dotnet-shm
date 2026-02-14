@@ -23,6 +23,7 @@
   <PropertyGroup>
     <DefineConstants Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(DefineConstants);WINDOWS</DefineConstants>
     <DefineConstants Condition="$([MSBuild]::IsOSPlatform('Linux'))">$(DefineConstants);LINUX</DefineConstants>
+    <NoWarn>$(NoWarn);CA1305;CA1822;CA1836;CA2007;CA2014;CA1416</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

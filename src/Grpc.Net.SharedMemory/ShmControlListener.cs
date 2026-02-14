@@ -210,10 +210,10 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
 
         var headerBytes = header.ToBytes();
         // Write header and payload (ring.Write blocks until space is available)
-        _controlTx.Write(headerBytes);
+        _controlTx.Write(headerBytes, ct);
         if (payload.Length > 0)
         {
-            _controlTx.Write(payload);
+            _controlTx.Write(payload, ct);
         }
 
         return Task.CompletedTask;

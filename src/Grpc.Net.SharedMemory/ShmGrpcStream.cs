@@ -75,7 +75,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private HeadersV1? _responseHeaders;
     private TrailersV1? _trailers;
     private long _sendWindow;
-    private uint _pendingWindowUpdate;
     private bool _halfCloseSent;
     private bool _halfCloseReceived;
     private bool _cancelled;
@@ -201,11 +200,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Sends a message payload.
-    /// Chunks the data across the flow-control send window so that messages
-    /// larger than InitialWindowSize can be sent without deadlock.
-    /// Each chunk is sent as a MESSAGE frame with the MORE flag set on all
-    /// but the last chunk, allowing the receiver to send WINDOW_UPDATE frames
-    /// that replenish the sender's window between chunks.
     /// </summary>
     public async Task SendMessageAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
@@ -213,40 +207,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (_halfCloseSent)
             throw new InvalidOperationException("Cannot send after half-close");
 
-        // Fast path: zero-length message (e.g. empty protobuf) — send a single
-        // empty MESSAGE frame so the receiver sees the message boundary.
-        if (data.Length == 0)
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+
+        // Wait for send window
+        while (Interlocked.Read(ref _sendWindow) < data.Length)
         {
-            await SendFrameAsync(FrameType.Message, 0, data, cancellationToken);
-            return;
+            linkedCts.Token.ThrowIfCancellationRequested();
+            await _sendWindowSignal.WaitAsync(linkedCts.Token);
         }
 
-        var remaining = data;
-        while (remaining.Length > 0)
-        {
-            // Wait until at least 1 byte of send window is available
-            long window;
-            while ((window = Interlocked.Read(ref _sendWindow)) <= 0)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (_disposed) throw new ObjectDisposedException(nameof(ShmGrpcStream));
-                // Defer LinkedCTS creation to this slow path (flow-control block).
-                // The common case (window > 0) avoids the allocation entirely.
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-                await _sendWindowSignal.WaitAsync(linkedCts.Token);
-            }
-
-            // Send as much as the window allows (capped at remaining data)
-            var chunkSize = (int)Math.Min(window, remaining.Length);
-            Interlocked.Add(ref _sendWindow, -chunkSize);
-
-            var chunk = remaining.Slice(0, chunkSize);
-            remaining = remaining.Slice(chunkSize);
-
-            // Set MORE flag on all chunks except the final one
-            byte flags = remaining.Length > 0 ? MessageFlags.More : (byte)0;
-            await SendFrameAsync(FrameType.Message, flags, chunk, cancellationToken);
-        }
+        Interlocked.Add(ref _sendWindow, -data.Length);
+        // Pass ReadOnlyMemory<byte> directly — no .ToArray() copy.
+        // The previous .ToArray() allocated a new byte[] (LOH at ≥85KB) on every send.
+        await SendFrameAsync(FrameType.Message, 0, data, linkedCts.Token);
     }
 
     /// <summary>
@@ -386,83 +359,70 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public async IAsyncEnumerable<byte[]> ReceiveMessagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        // Accumulator for reassembling MORE-flagged MESSAGE chunks into complete messages.
-        MemoryStream? accumulator = null;
-        try
+        MemoryStream? messageAccumulator = null;
+        while (true)
         {
-            while (true)
+            if (_cancelled) yield break;
+
+            var frame = await ReceiveFrameAsync(cancellationToken);
+            if (frame == null) yield break;
+
+            var f = frame.Value;
+            switch (f.Type)
             {
-                if (_cancelled) yield break;
+                case FrameType.Message:
+                    // Send window update
+                    var increment = (uint)f.Length;
+                    if (increment > 0)
+                    {
+                        Span<byte> windowUpdate = stackalloc byte[4];
+                        BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, increment);
+                        _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
+                    }
 
-                var frame = await ReceiveFrameAsync(cancellationToken);
-                if (frame == null) yield break;
-
-                var f = frame.Value;
-                switch (f.Type)
-                {
-                    case FrameType.Message:
-                        // Batch stream-level window updates to reduce lock
-                        // acquisitions on the TX ring.  Flushed when the
-                        // accumulated increment exceeds the threshold or
-                        // the stream completes.
-                        _pendingWindowUpdate += (uint)f.Length;
-                        if (_pendingWindowUpdate >= ShmConstants.WindowUpdateBatchThreshold)
-                        {
-                            FlushWindowUpdate();
-                        }
-
-                        if ((f.Flags & MessageFlags.More) != 0)
-                        {
-                            // Intermediate chunk — accumulate and continue
-                            accumulator ??= new MemoryStream();
-                            accumulator.Write(f.Memory.Span);
-                            f.ReturnToPool();
-                        }
-                        else if (accumulator != null)
-                        {
-                            // Final chunk — append, yield complete message, reset
-                            accumulator.Write(f.Memory.Span);
-                            f.ReturnToPool();
-                            var owned = accumulator.ToArray();
-                            accumulator.SetLength(0);
-                            yield return owned;
-                        }
-                        else
-                        {
-                            // Single-frame message (no chunking)
-                            var owned = f.Memory.ToArray();
-                            f.ReturnToPool();
-                            yield return owned;
-                        }
-                        break;
-
-                    case FrameType.HalfClose:
-                        FlushWindowUpdate();
-                        f.ReturnToPool();
-                        _halfCloseReceived = true;
-                        yield break;
-
-                    case FrameType.Trailers:
-                        FlushWindowUpdate();
-                        _trailers = TrailersV1.Decode(f.Memory.Span);
-                        f.ReturnToPool();
-                        _halfCloseReceived = true;
-                        yield break;
-
-                    case FrameType.Cancel:
-                        f.ReturnToPool();
-                        _cancelled = true;
-                        yield break;
-
-                    default:
+                    if ((f.Flags & MessageFlags.More) != 0)
+                    {
+                        messageAccumulator ??= new MemoryStream();
+                        messageAccumulator.Write(f.Memory.Span);
                         f.ReturnToPool();
                         break;
-                }
+                    }
+
+                    if (messageAccumulator != null)
+                    {
+                        messageAccumulator.Write(f.Memory.Span);
+                        f.ReturnToPool();
+                        yield return messageAccumulator.ToArray();
+                        messageAccumulator.SetLength(0);
+                        break;
+                    }
+
+                    // Yield an owned copy so payload buffers can be released safely.
+                    var owned = f.Memory.ToArray();
+                    f.ReturnToPool();
+                    yield return owned;
+                    break;
+
+                case FrameType.HalfClose:
+                    f.ReturnToPool();
+                    _halfCloseReceived = true;
+                    yield break;
+
+                case FrameType.Trailers:
+                    _trailers = TrailersV1.Decode(f.Memory.Span);
+                    f.ReturnToPool();
+                    _halfCloseReceived = true;
+                    yield break;
+
+                case FrameType.Cancel:
+                    f.ReturnToPool();
+                    _cancelled = true;
+                    yield break;
+
+                default:
+                    f.ReturnToPool();
+                    break;
             }
-        }
-        finally
-        {
-            accumulator?.Dispose();
         }
     }
 
@@ -476,11 +436,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal async IAsyncEnumerable<ReadOnlyMemory<byte>> ReceiveMessageBuffersAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         InboundFrame previousFrame = default;
-        // Accumulator for reassembling MORE-flagged chunks. When chunked,
-        // we must copy into a contiguous buffer so we lose zero-copy for
-        // messages that were flow-control or ring-level chunked.
-        MemoryStream? accumulator = null;
-        byte[]? assembledBuffer = null;
+        MemoryStream? messageAccumulator = null;
         try
         {
             while (true)
@@ -497,51 +453,50 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 switch (f.Type)
                 {
                     case FrameType.Message:
-                        // Batch stream-level window updates (same as ReceiveMessagesAsync)
-                        _pendingWindowUpdate += (uint)f.Length;
-                        if (_pendingWindowUpdate >= ShmConstants.WindowUpdateBatchThreshold)
+                        // Send window update
+                        var increment = (uint)f.Length;
+                        if (increment > 0)
                         {
-                            FlushWindowUpdate();
+                            Span<byte> windowUpdate = stackalloc byte[4];
+                            BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, increment);
+                            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
                         }
 
                         if ((f.Flags & MessageFlags.More) != 0)
                         {
-                            // Intermediate chunk — accumulate and continue
-                            accumulator ??= new MemoryStream();
-                            accumulator.Write(f.Memory.Span);
+                            messageAccumulator ??= new MemoryStream();
+                            messageAccumulator.Write(f.Memory.Span);
                             f.ReturnToPool();
+                            break;
                         }
-                        else if (accumulator != null)
+
+                        if (messageAccumulator != null)
                         {
-                            // Final chunk — append, yield assembled buffer, reset
-                            accumulator.Write(f.Memory.Span);
+                            messageAccumulator.Write(f.Memory.Span);
                             f.ReturnToPool();
 
-                            // Release previous yield's buffer
+                            // Returning accumulated payload as owned memory avoids
+                            // lifetime issues while still preventing many intermediate copies.
                             previousFrame.ReturnToPool();
-                            previousFrame = default;
+                            yield return messageAccumulator.ToArray();
+                            messageAccumulator.SetLength(0);
+                            break;
+                        }
 
-                            assembledBuffer = accumulator.ToArray();
-                            accumulator.SetLength(0);
-                            yield return assembledBuffer;
-                        }
-                        else
-                        {
-                            // Single-frame message — zero-copy path
-                            previousFrame.ReturnToPool();
-                            previousFrame = f;
-                            yield return f.Memory;
-                        }
+                        // Return the PREVIOUS payload now that the consumer
+                        // has advanced past it.
+                        previousFrame.ReturnToPool();
+
+                        previousFrame = f;
+                        yield return f.Memory;
                         break;
 
                     case FrameType.HalfClose:
-                        FlushWindowUpdate();
                         f.ReturnToPool();
                         _halfCloseReceived = true;
                         yield break;
 
                     case FrameType.Trailers:
-                        FlushWindowUpdate();
                         _trailers = TrailersV1.Decode(f.Memory.Span);
                         f.ReturnToPool();
                         _halfCloseReceived = true;
@@ -561,7 +516,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         finally
         {
             previousFrame.ReturnToPool();
-            accumulator?.Dispose();
         }
     }
 
@@ -654,24 +608,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
 
         return items;
-    }
-
-    /// <summary>
-    /// Flushes any pending stream-level WINDOW_UPDATE to the connection.
-    /// Called when the batched increment exceeds the threshold, and on
-    /// stream completion (HalfClose / Trailers) so the sender is never
-    /// permanently stalled.
-    /// </summary>
-    private void FlushWindowUpdate()
-    {
-        var pending = _pendingWindowUpdate;
-        if (pending > 0)
-        {
-            _pendingWindowUpdate = 0;
-            Span<byte> buf = stackalloc byte[4];
-            BinaryPrimitives.WriteUInt32LittleEndian(buf, pending);
-            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, buf);
-        }
     }
 
     private void ThrowIfDisposed()

@@ -40,7 +40,7 @@ public sealed class ShmCompressionOptions
     /// Gets or sets the minimum message size for compression (in bytes).
     /// Messages smaller than this are not compressed. Default is 0 (always compress).
     /// </summary>
-    public int MinSizeForCompression { get; set; } = 0;
+    public int MinSizeForCompression { get; set; }
 
     /// <summary>
     /// Gets or sets whether compression is enabled. Default is true.

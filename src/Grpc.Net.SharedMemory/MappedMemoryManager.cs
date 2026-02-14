@@ -167,7 +167,6 @@ public sealed unsafe class MappedMemoryManager : MemoryManager<byte>
                 // Adjust pointer back to original before releasing
                 _pointer -= _accessor.PointerOffset + _offset;
                 _accessor.SafeMemoryMappedViewHandle.ReleasePointer();
-                _pointer = null;
             }
         }
     }
@@ -183,10 +182,7 @@ public sealed unsafe class MappedMemoryManager : MemoryManager<byte>
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (offset < 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(offset));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
 
         if (length < 0 || offset + length > _length)
         {
