@@ -1,0 +1,74 @@
+CPU: AMD EPYC 7763 64-Core Processor
+Runtime: .NET 9.0.12
+
+[SRV] [SERVER] TCP ready on 127.0.0.1:36463
+=== TCP Transport ===
+
+  Unary ping-pong:
+  Payload      Iters    Avg µs         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  -> running 0B       (6000 iters)...
+  0B           6000     346.104        0.000              13     1      0     
+  -> running 1B       (6000 iters)...
+  1B           6000     177.257        0.011              6      0      0     
+  -> running 1KB      (6000 iters)...
+  1KB          6000     128.413        15.210             3      0      0     
+  -> running 4KB      (3600 iters)...
+  4KB          3600     154.800        50.468             4      1      1     
+  -> running 16KB     (3600 iters)...
+  16KB         3600     197.898        157.909            10     0      0     
+  -> running 64KB     (2400 iters)...
+  64KB         2400     522.222        239.362            25     0      0     
+  -> running 256KB    (1200 iters)...
+  256KB        1200     2049.624       243.947            51     49     49    
+  -> running 512KB    (500 iters)...
+  512KB        500      3591.602       278.427            33     31     31    
+  -> running 1MB      (300 iters)...
+  1MB          300      6538.600       305.876            28     27     27    
+  -> running 2MB      (160 iters)...
+  2MB          160      12030.306      332.494            17     15     15    
+
+  Streaming ping-pong:
+  Payload      Iters    Avg µs         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  -> running 0B       (6000 iters)...
+  0B           6000     96.864         0.000              4      0      0     
+  -> running 1B       (6000 iters)...
+  1B           6000     82.524         0.023              4      0      0     
+  -> running 1KB      (6000 iters)...
+  1KB          6000     94.881         20.585             6      0      0     
+  -> running 4KB      (3600 iters)...
+  4KB          3600     120.175        65.009             7      0      0     
+  -> running 16KB     (3600 iters)...
+  16KB         3600     179.327        174.263            14     0      0     
+  -> running 64KB     (2400 iters)...
+  64KB         2400     392.494        318.476            58     0      0     
+  -> running 256KB    (1200 iters)...
+  256KB        1200     1826.408       273.761            17     13     13    
+  -> running 512KB    (500 iters)...
+  512KB        500      3173.882       315.072            15     12     12    
+  -> running 1MB      (300 iters)...
+  1MB          300      6160.042       324.673            16     13     13    
+  -> running 2MB      (160 iters)...
+  2MB          160      11421.757      350.209            16     13     13    
+
+[SRV] [SERVER] SHM ready on segment: bench_shm_4092_665779df82534709801c672f340af263
+[SRV] SHM gRPC server listening on segment: bench_shm_4092_665779df82534709801c672f340af263
+=== SHM Transport ===
+
+  Unary ping-pong:
+  Payload      Iters    Avg µs         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  -> running 0B       (6000 iters)...
+[DIAG] UNHANDLED EXCEPTION (IsTerminating=True): System.TimeoutException: Unary gRPC call exceeded timeout of 120s.
+   at Program.<<Main>$>g__UnaryCallWithHardTimeoutAsync|0_17(BenchmarkServiceClient client, SimpleRequest request, TimeSpan timeout) in /home/runner/work/grpc-dotnet-shm/grpc-dotnet-shm/benchmark-shm/ringbench/RingBench.cs:line 623
+   at Program.<<Main>$>g__MeasureUnary|0_15(BenchmarkServiceClient client, Int32 payloadSize, Int32 iterations, TimeSpan timeout) in /home/runner/work/grpc-dotnet-shm/grpc-dotnet-shm/benchmark-shm/ringbench/RingBench.cs:line 557
+   at Program.<Main>$(String[] args) in /home/runner/work/grpc-dotnet-shm/grpc-dotnet-shm/benchmark-shm/ringbench/RingBench.cs:line 137
+   at Program.<Main>$(String[] args) in /home/runner/work/grpc-dotnet-shm/grpc-dotnet-shm/benchmark-shm/ringbench/RingBench.cs:line 158
+   at Program.<Main>(String[] args)
+Unhandled exception. System.TimeoutException: Unary gRPC call exceeded timeout of 120s.
+   at Program.<<Main>$>g__UnaryCallWithHardTimeoutAsync|0_17(BenchmarkServiceClient client, SimpleRequest request, TimeSpan timeout) in /home/runner/work/grpc-dotnet-shm/grpc-dotnet-shm/benchmark-shm/ringbench/RingBench.cs:line 623
+   at Program.<<Main>$>g__MeasureUnary|0_15(BenchmarkServiceClient client, Int32 payloadSize, Int32 iterations, TimeSpan timeout) in /home/runner/work/grpc-dotnet-shm/grpc-dotnet-shm/benchmark-shm/ringbench/RingBench.cs:line 557
+   at Program.<Main>$(String[] args) in /home/runner/work/grpc-dotnet-shm/grpc-dotnet-shm/benchmark-shm/ringbench/RingBench.cs:line 137
+   at Program.<Main>$(String[] args) in /home/runner/work/grpc-dotnet-shm/grpc-dotnet-shm/benchmark-shm/ringbench/RingBench.cs:line 158
+   at Program.<Main>(String[] args)
