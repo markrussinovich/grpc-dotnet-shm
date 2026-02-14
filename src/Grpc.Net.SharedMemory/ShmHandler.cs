@@ -157,8 +157,7 @@ public sealed class ShmHandler : HttpMessageHandler
             // Send request body if present
             if (requestBody != null)
             {
-                using var bodyStream = new MemoryStream(requestBody);
-                await SendMessagesAsync(stream, bodyStream, cancellationToken);
+                await SendMessagesAsync(stream, requestBody, cancellationToken);
             }
             else if (request.Content != null)
             {
@@ -235,6 +234,36 @@ public sealed class ShmHandler : HttpMessageHandler
             {
                 ArrayPool<byte>.Shared.Return(messageBuffer);
             }
+        }
+    }
+
+    private static async Task SendMessagesAsync(ShmGrpcStream stream, byte[] bodyBuffer, CancellationToken cancellationToken)
+    {
+        var offset = 0;
+        while (offset < bodyBuffer.Length)
+        {
+            var remaining = bodyBuffer.Length - offset;
+            if (remaining < 5)
+            {
+                throw new InvalidDataException("Incomplete gRPC message header");
+            }
+
+            var header = bodyBuffer.AsSpan(offset, 5);
+            var compressed = header[0] != 0;
+            var length = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(header[1..5]);
+            offset += 5;
+
+            // Preserve existing behavior: pass payload bytes through as-is even
+            // if the gRPC frame marks them as compressed.
+            _ = compressed;
+
+            if ((long)offset + length > bodyBuffer.Length)
+            {
+                throw new InvalidDataException("Incomplete gRPC message body");
+            }
+
+            await stream.SendMessageAsync(bodyBuffer.AsMemory(offset, (int)length), cancellationToken);
+            offset += (int)length;
         }
     }
 
