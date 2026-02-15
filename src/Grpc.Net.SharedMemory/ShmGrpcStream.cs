@@ -68,13 +68,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private readonly ShmConnection _connection;
     private readonly Channel<InboundFrame> _inboundFrames;
     private readonly CancellationTokenSource _disposeCts;
-    private readonly SemaphoreSlim _sendLock;
     private readonly SemaphoreSlim _sendWindowSignal;
 
     private HeadersV1? _requestHeaders;
     private HeadersV1? _responseHeaders;
     private TrailersV1? _trailers;
     private long _sendWindow;
+    private uint _inFlowUnacked;
     private bool _halfCloseSent;
     private bool _halfCloseReceived;
     private bool _cancelled;
@@ -136,7 +136,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             SingleWriter = true
         });
         _disposeCts = new CancellationTokenSource();
-        _sendLock = new SemaphoreSlim(1, 1);
         _sendWindowSignal = new SemaphoreSlim(0, int.MaxValue);
         _sendWindow = ShmConstants.InitialWindowSize;
     }
@@ -177,6 +176,39 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Client-side fast path for unary RPCs: sends request headers + message +
+    /// half-close in a single lock acquisition.
+    /// </summary>
+    internal void SendUnaryRequestBatch(string method, string authority, ReadOnlySpan<byte> messagePayload, Metadata? metadata = null, DateTime? deadline = null)
+    {
+        ThrowIfDisposed();
+        if (!IsClientStream)
+            throw new InvalidOperationException("Only client can send request headers");
+
+        _requestHeaders = new HeadersV1
+        {
+            Version = 1,
+            HeaderType = 0,
+            Method = method,
+            Authority = authority,
+            DeadlineUnixNano = deadline.HasValue
+                ? (ulong)new DateTimeOffset(deadline.Value).ToUnixTimeMilliseconds() * 1_000_000
+                : 0,
+            Metadata = ConvertMetadata(metadata)
+        };
+
+        var headersPayload = _requestHeaders.Encode();
+
+        _connection.SendFramesBatch(
+            StreamId,
+            FrameType.Headers, HeadersFlags.Initial, headersPayload,
+            messagePayload,
+            FrameType.HalfClose, 0, ReadOnlySpan<byte>.Empty);
+
+        _halfCloseSent = true;
+    }
+
+    /// <summary>
     /// Sends response headers (server-side, before first message).
     /// </summary>
     public async Task SendResponseHeadersAsync(Metadata? metadata = null)
@@ -204,22 +236,22 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     public async Task SendMessageAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
         if (_halfCloseSent)
             throw new InvalidOperationException("Cannot send after half-close");
 
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-
-        // Wait for send window
+        // Wait for send window — avoid per-call CancellationTokenSource allocation.
+        // _disposeCts cancellation will surface as ObjectDisposedException from the
+        // SemaphoreSlim, which is fine (stream is being torn down).
         while (Interlocked.Read(ref _sendWindow) < data.Length)
         {
-            linkedCts.Token.ThrowIfCancellationRequested();
-            await _sendWindowSignal.WaitAsync(linkedCts.Token);
+            cancellationToken.ThrowIfCancellationRequested();
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            await _sendWindowSignal.WaitAsync(cancellationToken);
         }
 
         Interlocked.Add(ref _sendWindow, -data.Length);
-        // Pass ReadOnlyMemory<byte> directly — no .ToArray() copy.
-        // The previous .ToArray() allocated a new byte[] (LOH at ≥85KB) on every send.
-        await SendFrameAsync(FrameType.Message, 0, data, linkedCts.Token);
+        await SendFrameAsync(FrameType.Message, 0, data, cancellationToken);
     }
 
     /// <summary>
@@ -245,6 +277,41 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         // Auto-remove from connection so the stream slot is freed.
         // Mirrors the client-side cleanup in OnFrameReceived(Trailers).
+        _connection.RemoveStream(StreamId);
+    }
+
+    /// <summary>
+    /// Server-side fast path for unary RPCs: sends response headers + message +
+    /// trailers in a single lock acquisition, reducing per-RPC lock overhead
+    /// from 3 to 1 and minimizing reader wakeups.
+    /// </summary>
+    internal void SendUnaryResponseBatch(
+        ReadOnlySpan<byte> responseHeadersPayload,
+        ReadOnlySpan<byte> messagePayload,
+        StatusCode statusCode,
+        string? statusMessage = null,
+        Metadata? metadata = null)
+    {
+        ThrowIfDisposed();
+
+        _responseHeaders = new HeadersV1 { Version = 1, HeaderType = 1 };
+
+        _trailers = new TrailersV1
+        {
+            Version = 1,
+            GrpcStatusCode = statusCode,
+            GrpcStatusMessage = statusMessage,
+            Metadata = ConvertMetadata(metadata)
+        };
+        var trailersPayload = _trailers.Encode();
+
+        _connection.SendFramesBatch(
+            StreamId,
+            FrameType.Headers, HeadersFlags.Initial, responseHeadersPayload,
+            messagePayload,
+            FrameType.Trailers, TrailersFlags.EndStream, trailersPayload);
+
+        _halfCloseSent = true;
         _connection.RemoveStream(StreamId);
     }
 
@@ -284,11 +351,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     public async Task<InboundFrame?> ReceiveFrameAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
 
         try
         {
-            if (await _inboundFrames.Reader.WaitToReadAsync(linkedCts.Token))
+            if (await _inboundFrames.Reader.WaitToReadAsync(cancellationToken))
             {
                 if (_inboundFrames.Reader.TryRead(out var frame))
                 {
@@ -299,6 +365,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
+        }
+        catch (OperationCanceledException)
+        {
+            // _disposeCts cancelled — stream disposed, treat as closed
         }
         catch (ChannelClosedException)
         {
@@ -375,13 +445,16 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             switch (f.Type)
             {
                 case FrameType.Message:
-                    // Send window update
-                    var increment = (uint)f.Length;
-                    if (increment > 0)
+                    // Batch window updates: send only when unacked bytes exceed
+                    // 25% of the initial window, matching connection-level flow
+                    // control. This avoids a lock + ring write per message.
+                    _inFlowUnacked += (uint)f.Length;
+                    if (_inFlowUnacked >= ShmConstants.InitialWindowSize / 4)
                     {
                         Span<byte> windowUpdate = stackalloc byte[4];
-                        BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, increment);
+                        BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, _inFlowUnacked);
                         _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
+                        _inFlowUnacked = 0;
                     }
 
                     if ((f.Flags & MessageFlags.More) != 0)
@@ -457,13 +530,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 switch (f.Type)
                 {
                     case FrameType.Message:
-                        // Send window update
-                        var increment = (uint)f.Length;
-                        if (increment > 0)
+                        // Batch window updates: send only when unacked bytes
+                        // exceed 25% of the initial window.
+                        _inFlowUnacked += (uint)f.Length;
+                        if (_inFlowUnacked >= ShmConstants.InitialWindowSize / 4)
                         {
                             Span<byte> windowUpdate = stackalloc byte[4];
-                            BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, increment);
+                            BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, _inFlowUnacked);
                             _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
+                            _inFlowUnacked = 0;
                         }
 
                         if ((f.Flags & MessageFlags.More) != 0)
@@ -593,17 +668,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task SendFrameAsync(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
+    private Task SendFrameAsync(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
     {
-        await _sendLock.WaitAsync(cancellationToken);
-        try
-        {
-            _connection.SendFrame(type, StreamId, flags, payload.Span);
-        }
-        finally
-        {
-            _sendLock.Release();
-        }
+        // No per-stream send lock needed — ShmConnection.SendFrame holds _txLock
+        // which serializes all ring writes at the connection level.
+        _connection.SendFrame(type, StreamId, flags, payload.Span);
+        return Task.CompletedTask;
     }
 
     private static MetadataKV[] ConvertMetadata(Metadata? metadata)
@@ -637,7 +707,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             _disposeCts.Cancel();
             _inboundFrames.Writer.TryComplete();
             _connection.RemoveStream(StreamId);
-            _sendLock.Dispose();
             _sendWindowSignal.Dispose();
             _disposeCts.Dispose();
         }

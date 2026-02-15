@@ -358,6 +358,34 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Writes HEADERS + MESSAGE + a closing frame (HALF_CLOSE or TRAILERS) to
+    /// the ring in a single lock acquisition.  This cuts per-RPC lock
+    /// acquisitions from 3 to 1 and reduces reader wakeups to 1.
+    /// </summary>
+    internal void SendFramesBatch(
+        uint streamId,
+        FrameType headersType, byte headersFlags, ReadOnlySpan<byte> headersPayload,
+        ReadOnlySpan<byte> messagePayload,
+        FrameType closeType, byte closeFlags, ReadOnlySpan<byte> closePayload)
+    {
+        ThrowIfDisposed();
+
+        lock (_txLock)
+        {
+            // 1. Headers
+            var hdr = new FrameHeader(headersType, streamId, (uint)headersPayload.Length, headersFlags);
+            FrameProtocol.WriteFrame(TxRing, hdr, headersPayload, _disposeCts.Token);
+
+            // 2. Message (supports chunking for very large payloads)
+            FrameProtocol.WriteMessage(TxRing, streamId, messagePayload, true, _disposeCts.Token);
+
+            // 3. Close frame (HalfClose or Trailers)
+            var cls = new FrameHeader(closeType, streamId, (uint)closePayload.Length, closeFlags);
+            FrameProtocol.WriteFrame(TxRing, cls, closePayload, _disposeCts.Token);
+        }
+    }
+
     private Task FrameReaderLoopAsync()
     {
         // Run blocking ReadFramePayload on a dedicated thread.

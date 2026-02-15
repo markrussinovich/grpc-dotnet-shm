@@ -82,22 +82,30 @@ public sealed class ShmControlHandler : HttpMessageHandler
             var metadata = ExtractMetadata(request.Headers);
             var deadline = ExtractDeadline(request.Headers);
 
-            // Send request headers
-            await stream.SendRequestHeadersAsync(method, authority, metadata, deadline).ConfigureAwait(false);
-
-            // Send request body via a write-through stream that forwards each
-            // gRPC frame directly to SHM.  The body send runs on a thread pool
-            // thread (Task.Run) because grpc-dotnet's CopyToAsync can yield
-            // internally (e.g. PushStreamContent awaits CompleteTcs), and if it
-            // yields on the caller's thread, the subsequent
-            // ReceiveResponseHeadersAsync blocks the same thread — deadlock.
+            // Try fast path: for unary RPCs, read the small content inline and
+            // batch headers + message + half-close in a single ring write.
+            // This avoids Task.Run dispatch + 2 extra lock acquisitions.
             if (request.Content != null)
             {
+                // Send request headers first (needed for both unary and streaming).
+                await stream.SendRequestHeadersAsync(method, authority, metadata, deadline).ConfigureAwait(false);
+
+                // Start body send INLINE.  For unary RPCs, all internal awaits
+                // (WriteAsync → SendMessageAsync → SendFrameAsync) complete
+                // synchronously, so the task completes without a thread-pool
+                // dispatch.  For streaming RPCs (PushStreamContent), the task
+                // will be incomplete because CopyToAsync blocks waiting for the
+                // user to write messages — only then do we fall back to Task.Run.
                 var writeStream = new ShmGrpcRequestStream(stream);
-                _ = Task.Run(() => SendBodyAsync(request.Content, writeStream, stream, cancellationToken), cancellationToken);
+                var sendTask = SendBodyAsync(request.Content, writeStream, stream, cancellationToken);
+                if (!sendTask.IsCompleted)
+                {
+                    _ = Task.Run(() => sendTask, cancellationToken);
+                }
             }
             else
             {
+                await stream.SendRequestHeadersAsync(method, authority, metadata, deadline).ConfigureAwait(false);
                 await stream.SendHalfCloseAsync().ConfigureAwait(false);
             }
 
@@ -410,6 +418,22 @@ internal sealed class ShmGrpcRequestStream : Stream
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            // Fast path: complete gRPC frame arrives in one write and nothing
+            // is pending.  Skip the copy into _pending entirely — send the
+            // caller's buffer directly to the ring.  grpc-dotnet always writes
+            // each gRPC message as a single WriteAsync call.
+            if (_pendingCount == 0 && buffer.Length >= 5)
+            {
+                var hdr = buffer.Span.Slice(0, 5);
+                if (hdr[0] != 0) throw new NotSupportedException("Compression not yet supported");
+                var length = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(hdr.Slice(1));
+                if (buffer.Length == 5 + length)
+                {
+                    await _shmStream.SendMessageAsync(buffer.Slice(5, length), cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+            }
+
             EnsureCapacity(_pendingCount + buffer.Length);
             buffer.CopyTo(_pending.AsMemory(_pendingCount));
             _pendingCount += buffer.Length;
@@ -430,8 +454,10 @@ internal sealed class ShmGrpcRequestStream : Stream
                     break;
                 }
 
-                var message = _pending.AsMemory(5, length).ToArray();
-                await _shmStream.SendMessageAsync(message, cancellationToken).ConfigureAwait(false);
+                // Pass _pending memory directly — no .ToArray() copy.
+                // _writeLock prevents concurrent writes and SendMessageAsync
+                // copies to the ring synchronously before returning.
+                await _shmStream.SendMessageAsync(_pending.AsMemory(5, length), cancellationToken).ConfigureAwait(false);
 
                 var remaining = _pendingCount - frameLength;
                 if (remaining > 0)

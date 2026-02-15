@@ -308,19 +308,34 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // Read single request message
             var request = await ReadSingleMessageAsync(stream, _parser, ct);
 
-            // Send response headers
-            await context.EnsureResponseHeadersSentAsync();
-
             // Call handler
             var response = await _handler(request, context);
 
-            // Send response using pooled buffer (avoids LOH allocation)
-            await SendProtobufMessageAsync(stream, response, ct);
+            // Batch response: headers + message + trailers in a single lock
+            // acquisition, cutting per-RPC lock overhead from 3 to 1.
+            var responseHeadersV1 = new HeadersV1 { Version = 1, HeaderType = 1 };
+            var headersPayload = responseHeadersV1.Encode();
 
-            // Send trailers
-            await stream.SendTrailersAsync(
-                context.Status.StatusCode,
-                context.Status.Detail);
+            var msgSize = response.CalculateSize();
+            var msgBuffer = msgSize > 0 ? ArrayPool<byte>.Shared.Rent(msgSize) : Array.Empty<byte>();
+            try
+            {
+                if (msgSize > 0)
+                {
+                    using var cos = new CodedOutputStream(msgBuffer);
+                    response.WriteTo(cos);
+                }
+
+                stream.SendUnaryResponseBatch(
+                    headersPayload,
+                    msgBuffer.AsSpan(0, msgSize),
+                    context.Status.StatusCode,
+                    context.Status.Detail);
+            }
+            finally
+            {
+                if (msgSize > 0) ArrayPool<byte>.Shared.Return(msgBuffer);
+            }
         }
     }
 
