@@ -6,12 +6,21 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <SignAssembly>false</SignAssembly>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
+    <Protobuf Include="..\Proto\echo.proto" GrpcServices="Server" Link="Protos\echo.proto" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.28.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.70.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\..\src\Grpc.Net.SharedMemory\Grpc.Net.SharedMemory.csproj" />
-    <ProjectReference Include="..\..\..\src\Grpc.Core.Api\Grpc.Core.Api.csproj" />
   </ItemGroup>
 
 </Project>

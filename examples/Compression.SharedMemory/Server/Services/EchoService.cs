@@ -23,16 +23,8 @@ namespace Server;
 
 public class EchoService : Echo.Echo.EchoBase
 {
-    private readonly ILogger<EchoService> _logger;
-
-    public EchoService(ILogger<EchoService> logger)
-    {
-        _logger = logger;
-    }
-
     public override Task<EchoResponse> UnaryEcho(EchoRequest request, ServerCallContext context)
     {
-        _logger.LogInformation("UnaryEcho: {Message}", request.Message);
         return Task.FromResult(new EchoResponse { Message = request.Message });
     }
 
@@ -43,7 +35,6 @@ public class EchoService : Echo.Echo.EchoBase
     {
         await foreach (var req in requestStream.ReadAllAsync())
         {
-            _logger.LogInformation("BidirectionalStreamingEcho: {Message}", req.Message);
             await responseStream.WriteAsync(new EchoResponse { Message = req.Message });
         }
     }

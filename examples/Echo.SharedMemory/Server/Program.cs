@@ -4,7 +4,7 @@ using Server;
 
 var service = new EchoService();
 
-await using var server = new ShmGrpcServer("cancellation_shm_example");
+await using var server = new ShmGrpcServer("echo_shm_example");
 
 server.MapUnary<EchoRequest, EchoResponse>(
     "/echo.Echo/UnaryEcho", service.UnaryEcho);

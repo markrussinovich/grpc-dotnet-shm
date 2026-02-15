@@ -1,79 +1,61 @@
-#region Copyright notice and license
-
-// Copyright 2025 The gRPC Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-#endregion
-
-using System.Net;
-using System.Text;
+using Echo;
 using Grpc.Core;
+using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
 
-const string SegmentName = "cancellation_shm";
+const string SegmentName = "cancellation_shm_example";
 
 Console.WriteLine("Cancellation Example - Shared Memory Client");
-Console.WriteLine($"Connecting to shm://{SegmentName}");
 Console.WriteLine();
 
-using var connection = ShmConnection.ConnectAsClient(SegmentName);
-Console.WriteLine("Connected to server");
-Console.WriteLine();
+using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
+{
+    HttpHandler = new ShmControlHandler(SegmentName),
+    DisposeHttpClient = true
+});
 
-// Create a stream for bidirectional communication
-var stream = connection.CreateStream();
+var client = new Echo.Echo.EchoClient(channel);
+
+// Start a bidirectional streaming call
+Console.WriteLine("Starting bidirectional streaming call...");
+using var cts = new CancellationTokenSource();
+using var call = client.BidirectionalStreamingEcho(cancellationToken: cts.Token);
 
 try
 {
-    // Send request headers
-    await stream.SendRequestHeadersAsync("/echo.Echo/BidirectionalStreamingEcho", SegmentName);
-
     // Send a few messages
     for (int i = 1; i <= 3; i++)
     {
         var message = $"message {i}";
-        Console.WriteLine($"Sending {message}");
+        Console.WriteLine($"Sending: {message}");
+        await call.RequestStream.WriteAsync(new EchoRequest { Message = message });
 
-        var messageBytes = Encoding.UTF8.GetBytes(message);
-        var framedMessage = new byte[5 + messageBytes.Length];
-        framedMessage[0] = 0;
-        var lengthBytes = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(messageBytes.Length));
-        Buffer.BlockCopy(lengthBytes, 0, framedMessage, 1, 4);
-        Buffer.BlockCopy(messageBytes, 0, framedMessage, 5, messageBytes.Length);
-
-        await stream.SendMessageAsync(framedMessage);
-        await Task.Delay(200); // Small delay between messages
+        if (await call.ResponseStream.MoveNext(cts.Token))
+        {
+            Console.WriteLine($"Received: {call.ResponseStream.Current.Message}");
+        }
     }
 
-    // Cancel the stream
+    // Cancel the stream after sending 3 messages
     Console.WriteLine("cancelling context");
-    await stream.CancelAsync();
+    cts.Cancel();
 
-    Console.WriteLine("Stream cancelled successfully");
+    // Try to read after cancellation - should throw
+    try
+    {
+        await call.ResponseStream.MoveNext(cts.Token);
+    }
+    catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
+    {
+        Console.WriteLine($"Caught expected cancellation: {ex.Status}");
+    }
 }
 catch (OperationCanceledException)
 {
-    Console.WriteLine("Stream was cancelled");
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"Error: {ex.Message}");
-}
-finally
-{
-    stream.Dispose();
+    Console.WriteLine("Stream was cancelled as expected");
 }
 
 Console.WriteLine();
 Console.WriteLine("Cancellation example completed!");
+Console.WriteLine("Press any key to exit...");
+Console.ReadKey();

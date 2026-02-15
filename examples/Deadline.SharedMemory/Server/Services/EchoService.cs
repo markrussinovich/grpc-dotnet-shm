@@ -23,17 +23,16 @@ namespace Server;
 
 public class EchoService : Echo.Echo.EchoBase
 {
-    private readonly ILogger<EchoService> _logger;
-
-    public EchoService(ILogger<EchoService> logger)
+    public override async Task<EchoResponse> UnaryEcho(EchoRequest request, ServerCallContext context)
     {
-        _logger = logger;
-    }
+        // Simulate slow processing for messages containing "delay"
+        if (request.Message.Contains("delay"))
+        {
+            Console.WriteLine($"Delaying response for: {request.Message}");
+            await Task.Delay(2000);
+        }
 
-    public override Task<EchoResponse> UnaryEcho(EchoRequest request, ServerCallContext context)
-    {
-        _logger.LogInformation("UnaryEcho: {Message}", request.Message);
-        return Task.FromResult(new EchoResponse { Message = request.Message });
+        return new EchoResponse { Message = request.Message };
     }
 
     public override async Task BidirectionalStreamingEcho(
@@ -43,7 +42,6 @@ public class EchoService : Echo.Echo.EchoBase
     {
         await foreach (var req in requestStream.ReadAllAsync())
         {
-            _logger.LogInformation("BidirectionalStreamingEcho: {Message}", req.Message);
             await responseStream.WriteAsync(new EchoResponse { Message = req.Message });
         }
     }
