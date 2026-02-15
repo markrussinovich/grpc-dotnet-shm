@@ -53,6 +53,7 @@ string outDir = Path.Combine("benchmark-shm", "out");
 string? platformOverride = null;
 bool serverMode = false;
 bool profileMode = false;
+const int ShmRingCapacityBytes = 256 * 1024 * 1024;
 string? serverTransport = null;
 int serverPort = 0;
 string? serverSegment = null;
@@ -100,8 +101,8 @@ string platform = platformOverride
 outDir = Path.Combine(outDir, platform);
 Directory.CreateDirectory(outDir);
 
-// Go benchmark sizes: 0, 1, 1K, 4K, 16K, 64K, 256K, 512K, 1M, 2M, 4M, 16M
-int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304, 16777216 };
+// Go benchmark sizes plus large payload coverage: 32M, 64M, 128M
+int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304, 16777216, 33554432, 67108864, 134217728 };
 
 string cpu = GetCpuInfo();
 string runtime = RuntimeInformation.FrameworkDescription;
@@ -590,20 +591,33 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
     Segment.TryRemoveSegment(segmentName);
     Segment.TryRemoveSegment(segmentName + "_ctl");
 
-    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, maxStreams: 2);
+    var server = new ShmGrpcServer(segmentName, ringCapacity: ShmRingCapacityBytes, maxStreams: 2);
 
     // Pre-cache serialized responses to skip per-request protobuf ser/deser.
     // This is the key optimization: the SHM raw handler API lets us bypass
     // ParseFrom (request) and WriteTo (response) entirely.
+    const int maxCachedResponseSize = 16 * 1024 * 1024;
     var cachedResponses = new Dictionary<int, byte[]>();
+
+    static byte[] SerializeResponse(int size)
+    {
+        var response = new SimpleResponse { Payload = MakePayload(size) };
+        var serialized = new byte[response.CalculateSize()];
+        using var cos = new CodedOutputStream(serialized);
+        response.WriteTo(cos);
+        return serialized;
+    }
+
     ReadOnlyMemory<byte> GetCachedResponse(int size)
     {
+        if (size > maxCachedResponseSize)
+        {
+            return SerializeResponse(size);
+        }
+
         if (!cachedResponses.TryGetValue(size, out var cached))
         {
-            var response = new SimpleResponse { Payload = MakePayload(size) };
-            cached = new byte[response.CalculateSize()];
-            using var cos = new CodedOutputStream(cached);
-            response.WriteTo(cos);
+            cached = SerializeResponse(size);
             cachedResponses[size] = cached;
         }
         return cached;
@@ -961,7 +975,7 @@ static async Task<(double avgUs, double throughputMBps)> MeasureStreaming(
 }
 
 // ============================================================================
-// Iteration count — matches Go's iterationsForSize exactly
+// Iteration count
 // ============================================================================
 
 static int IterationsForSize(int size) => size switch
@@ -976,8 +990,9 @@ static int IterationsForSize(int size) => size switch
     <= 2097152 => 80,
     <= 4194304 => 40,
     <= 16777216 => 20,
-    <= 33554432 => 10,
-    _ => 5
+    <= 33554432 => 4,
+    <= 67108864 => 2,
+    _ => 1
 };
 
 // ============================================================================

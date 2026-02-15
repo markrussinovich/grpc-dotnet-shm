@@ -240,18 +240,48 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (_halfCloseSent)
             throw new InvalidOperationException("Cannot send after half-close");
 
-        // Wait for send window — avoid per-call CancellationTokenSource allocation.
-        // _disposeCts cancellation will surface as ObjectDisposedException from the
-        // SemaphoreSlim, which is fine (stream is being torn down).
-        while (Interlocked.Read(ref _sendWindow) < data.Length)
+        if (data.Length == 0)
+        {
+            await SendFrameAsync(FrameType.Message, 0, data, cancellationToken);
+            return;
+        }
+
+        // Respect flow control in chunks so payloads larger than the initial
+        // send window can make progress as WINDOW_UPDATE frames arrive.
+        var maxFramePayload = (int)(_connection.TxRing.Capacity / 2) - ShmConstants.FrameHeaderSize;
+        if (maxFramePayload < 1024)
+        {
+            maxFramePayload = 1024;
+        }
+
+        var remaining = data;
+        while (remaining.Length > 0)
         {
             cancellationToken.ThrowIfCancellationRequested();
             ObjectDisposedException.ThrowIf(_disposed, this);
-            await _sendWindowSignal.WaitAsync(cancellationToken);
-        }
 
-        Interlocked.Add(ref _sendWindow, -data.Length);
-        await SendFrameAsync(FrameType.Message, 0, data, cancellationToken);
+            var currentWindow = Interlocked.Read(ref _sendWindow);
+            if (currentWindow <= 0)
+            {
+                await _sendWindowSignal.WaitAsync(cancellationToken);
+                continue;
+            }
+
+            var chunkLength = (int)Math.Min((long)remaining.Length, Math.Min(currentWindow, maxFramePayload));
+            if (chunkLength <= 0)
+            {
+                await _sendWindowSignal.WaitAsync(cancellationToken);
+                continue;
+            }
+
+            Interlocked.Add(ref _sendWindow, -chunkLength);
+
+            var chunk = remaining[..chunkLength];
+            remaining = remaining[chunkLength..];
+
+            var flags = remaining.Length > 0 ? MessageFlags.More : (byte)0;
+            await SendFrameAsync(FrameType.Message, flags, chunk, cancellationToken);
+        }
     }
 
     /// <summary>
