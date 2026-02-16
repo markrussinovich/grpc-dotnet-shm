@@ -120,4 +120,4 @@ protoc --go_out=greetpb --go-grpc_out=greetpb \
 
 - The Go examples use internal packages from grpc-go-shmem
 - For interop testing, use pre-built binaries from grpc-go-shmem repo
-- The .NET implementation uses ShmHandler for GrpcChannel integration
+- The .NET implementation uses ShmControlHandler for canonical GrpcChannel integration

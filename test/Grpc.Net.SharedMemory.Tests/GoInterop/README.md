@@ -144,10 +144,10 @@ using Greet;
 
 var segmentName = args.Length > 0 ? args[0] : "interop_test";
 
-using var handler = new ShmHandler(segmentName);
-using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
+using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
 {
-    HttpHandler = handler
+    HttpHandler = new ShmControlHandler(segmentName),
+    DisposeHttpClient = true
 });
 
 var client = new Greeter.GreeterClient(channel);

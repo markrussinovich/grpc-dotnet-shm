@@ -67,7 +67,7 @@ Update this table at least once per session.
 |---|---|---|---|---|---|---|
 | WS1 | Remove polling from transport/control paths | TBD | Done | TBD | 2026-02-16 | Completed: polling removed from default control/readiness paths, explicit non-default missing-sync compatibility mode added, and WS1-targeted tests pass. |
 | WS2 | Zero-copy path hardening and copy elimination | TBD | Done | TBD | 2026-02-16 | Completed transport copy-map items: pooled multipart receive assembly, pooled/borrowed control-frame decode paths, allocation-free control-frame writes, and ownership/lifetime regression coverage. |
-| WS3 | Dialer/server API standardization | TBD | In Progress | TBD | 2026-02-15 | Mixed handler/listener/server patterns identified; canonical surface pending. |
+| WS3 | Dialer/server API standardization | TBD | Done | TBD | 2026-02-16 | Canonical surface documented and applied (`ShmControlHandler` + `ShmGrpcServer`); alternates marked advanced/legacy; docs aligned. |
 | WS4 | E2E example normalization to idiomatic gRPC | TBD | In Progress | TBD | 2026-02-15 | Multiple examples are low-level/manual rather than idiomatic generated stubs. |
 | WS5 | Test hardening and coverage alignment | TBD | In Progress | TBD | 2026-02-15 | Existing E2E tests include simulated behavior; realism gap identified. |
 | WS6 | Benchmark realism and reporting cleanup | TBD | In Progress | TBD | 2026-02-15 | README/status drift and estimated plot metrics identified. |
@@ -183,14 +183,14 @@ Objective: define and enforce one recommended SHM client/server usage pattern.
 - [x] Select primary client handler pattern and document why. *(Canonical: `ShmControlHandler` with `GrpcChannel.ForAddress("http://localhost", ...)`.)*
 - [x] Select primary server hosting pattern and document why. *(Canonical: `ShmGrpcServer` with `MapUnary`/`MapDuplexStreaming`.)*
 - [x] Mark alternate APIs as advanced/legacy/internal where appropriate. *(`ShmHandler` and `ShmConnectionListener` XML docs now marked legacy/advanced.)*
-- [ ] Update docs/examples to use the primary pattern. *(In progress: legacy clients migrated; server-side migration completed for `Downloader.SharedMemory`, `Error.SharedMemory`, and `Vigor.SharedMemory`; `Metadata.SharedMemory` remains intentionally low-level and will be normalized in WS4.)*
+- [x] Update docs/examples to use the primary pattern. *(Canonical client/server path now used across standard SHM examples; `Metadata.SharedMemory` is explicitly marked as an intentional low-level/advanced example and tracked under WS4 normalization.)*
 
 ### Validation
-- [ ] All updated examples compile and run.
-- [ ] No contradictory guidance remains in docs.
+- [x] All updated examples compile and run. *(Updated server projects validated: `Vigor.SharedMemory`, `Error.SharedMemory`, `Downloader.SharedMemory`.)*
+- [x] No contradictory guidance remains in docs.
 
 ### Exit Criteria
-- [ ] A single canonical usage path is obvious in docs and examples.
+- [x] A single canonical usage path is obvious in docs and examples.
 
 ---
 
