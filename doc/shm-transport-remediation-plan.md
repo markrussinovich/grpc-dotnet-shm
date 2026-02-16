@@ -69,7 +69,7 @@ Update this table at least once per session.
 | WS2 | Zero-copy path hardening and copy elimination | TBD | Done | TBD | 2026-02-16 | Completed transport copy-map items: pooled multipart receive assembly, pooled/borrowed control-frame decode paths, allocation-free control-frame writes, and ownership/lifetime regression coverage. |
 | WS3 | Dialer/server API standardization | TBD | Done | TBD | 2026-02-16 | Canonical surface documented and applied (`ShmControlHandler` + `ShmGrpcServer`); alternates marked advanced/legacy; docs aligned. |
 | WS4 | E2E example normalization to idiomatic gRPC | TBD | In Progress | TBD | 2026-02-16 | Manual framing removed from Metadata/Reflector/Uploader shared-memory examples; broad smoke-run and remaining payload-memory validation pending. |
-| WS5 | Test hardening and coverage alignment | TBD | In Progress | TBD | 2026-02-16 | EndToEnd tests now use real stream routing (`AcceptStreamAsync`) instead of simulated delays; full SHM suite currently green. |
+| WS5 | Test hardening and coverage alignment | TBD | Done | TBD | 2026-02-16 | Completed: EndToEnd tests use real stream routing, sync wait/cancellation coverage added for supported platforms, and repeat-run anti-flake checks passed. |
 | WS6 | Benchmark realism and reporting cleanup | TBD | In Progress | TBD | 2026-02-15 | README/status drift and estimated plot metrics identified. |
 | WS7 | Code organization and deprecation cleanup | TBD | In Progress | TBD | 2026-02-15 | Overlapping transport surfaces identified; ownership consolidation pending. |
 
@@ -220,14 +220,14 @@ Objective: ensure tests validate real behavior, not simulated behavior.
 ### Tasks
 - [x] Replace simulated E2E patterns with true connection/stream routing where possible. *(Refactored `EndToEndTests` to use real server stream acceptance and true request/response/message/trailer paths.)*
 - [x] Add regression tests for no-polling and no-copy goals (where testable). *(Coverage in place via `SegmentTests.Ws1_NoPollingFallbackMarkers_RemainRemoved`, `ShmGrpcStreamTests.ReceiveMessagesAsync_ReturnsOwnedIndependentBuffers`, and large-message E2E assertions.)*
-- [ ] Ensure cross-platform sync behavior (Windows/Linux) is covered.
+- [x] Ensure cross-platform sync behavior (Windows/Linux) is covered. *(Added readiness-wait signal/cancellation tests in `SegmentTests` that exercise supported-platform sync paths.)*
 
 ### Validation
 - [x] `Grpc.Net.SharedMemory.Tests` fully passing. *(393 total, 0 failed, 388 passed, 4 skipped.)*
-- [ ] No new flaky tests introduced.
+- [x] No new flaky tests introduced. *(Repeated `SegmentTests + EndToEndTests` 10 consecutive runs with 0 failures.)*
 
 ### Exit Criteria
-- [ ] E2E tests represent real transport behavior.
+- [x] E2E tests represent real transport behavior.
 
 ---
 
@@ -640,6 +640,44 @@ Objective: reduce API overlap/confusion and improve maintainability.
 
 ---
 
+## Session Log Entry - S-0010 (WS5 Completion - Sync Coverage + Anti-Flake Validation)
+- Date/Time: 2026-02-16
+- Agent/Owner: GitHub Copilot (GPT-5.3-Codex)
+- Branch/PR: N/A (workspace changes)
+- Workstreams touched: WS5
+- Summary of changes:
+   - Added WS5 sync-behavior coverage in `SegmentTests`:
+      - `Segment_WaitForClientAsync_CompletesAfterClientReadySignal`.
+      - `Segment_WaitForClientAsync_HonorsCancellationWhenNotSignaled`.
+   - Revalidated WS5-targeted suites and executed 10 repeat runs to assess flakiness.
+   - Re-ran full SHM suite after WS5 test additions and confirmed green status.
+   - Marked WS5 checklist/validation/exit criteria complete.
+- Risks introduced:
+   - None identified.
+- Next recommended step:
+   - Proceed to WS6 benchmark realism/reporting cleanup.
+
+### Commands Run
+- Tests (targeted):
+   - `dotnet test test/Grpc.Net.SharedMemory.Tests/Grpc.Net.SharedMemory.Tests.csproj -v minimal --filter "FullyQualifiedName~SegmentTests|FullyQualifiedName~EndToEndTests"`
+- Tests (anti-flake repeat):
+   - `for ($i = 1; $i -le 10; $i++) { dotnet test ... --no-build --filter "FullyQualifiedName~EndToEndTests|FullyQualifiedName~SegmentTests" }`
+- Tests (full SHM):
+   - `dotnet test test/Grpc.Net.SharedMemory.Tests/Grpc.Net.SharedMemory.Tests.csproj -v minimal`
+
+### Results Summary
+- Targeted WS5 tests: Pass (0 failed, 24 passed, 0 skipped)
+- Repeat-run anti-flake: Pass (10/10 runs, each 24/24 passed)
+- Full SHM suite: Pass (0 failed, 390 passed, 4 skipped)
+
+### Artifacts
+- Code changes:
+   - `test/Grpc.Net.SharedMemory.Tests/SegmentTests.cs`
+- Plan update:
+   - `doc/shm-transport-remediation-plan.md`
+
+---
+
 ## Handoff Checklist (Before Agent Stops)
 
 - [ ] Workstream board updated.
@@ -728,6 +766,9 @@ Update after each benchmark-affecting change.
 | 2026-02-16 | N/A | `Grpc.Net.SharedMemory.Tests` (full rerun) | Pass | 0 failed, 387 passed, 4 skipped | Flow-control and BDP test expectations aligned to current 1 GiB constants. |
 | 2026-02-16 | N/A | `Grpc.Net.SharedMemory.Tests` (WS2 streaming-focused filter) | Pass | 0 failed, 27 passed, 2 skipped | Validates pooled multipart receive-path change in `ShmGrpcStream.ReceiveMessagesAsync`. |
 | 2026-02-16 | N/A | `Grpc.Net.SharedMemory.Tests` (full rerun, post-copy-map completion) | Pass | 0 failed, 388 passed, 4 skipped | Includes new ownership/lifetime regression test for `ReceiveMessagesAsync`. |
+| 2026-02-16 | N/A | `Grpc.Net.SharedMemory.Tests` (`SegmentTests` + `EndToEndTests` filter) | Pass | 0 failed, 24 passed, 0 skipped | Includes new sync wait/signal and cancellation coverage in `SegmentTests`. |
+| 2026-02-16 | N/A | `Grpc.Net.SharedMemory.Tests` (`SegmentTests` + `EndToEndTests` repeated x10) | Pass | 0 failed across all runs | Anti-flake confidence run; each run passed 24/24. |
+| 2026-02-16 | N/A | `Grpc.Net.SharedMemory.Tests` (full rerun, post-WS5 completion) | Pass | 0 failed, 390 passed, 4 skipped | Confirms WS5 additions do not regress broader SHM coverage. |
 | TBD | TBD | Full solution tests (relevant subset/full) |  |  |  |
 
 ---

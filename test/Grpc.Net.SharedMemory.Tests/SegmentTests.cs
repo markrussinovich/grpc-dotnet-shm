@@ -242,6 +242,46 @@ public class SegmentTests
         Assert.Throws<ArgumentException>(() => Segment.Create(name, ringCapacity: 1000, maxStreams: 100));
     }
 
+    [Test]
+    [Timeout(10000)]
+    public async Task Segment_WaitForClientAsync_CompletesAfterClientReadySignal()
+    {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Shared-memory synchronization waits are supported on Windows and Linux only.");
+        }
+
+        var name = $"grpc_wait_client_{Guid.NewGuid():N}";
+        using var segment = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var waitTask = segment.WaitForClientAsync(cts.Token);
+
+        Assert.That(waitTask.IsCompleted, Is.False);
+
+        await Task.Delay(50, cts.Token);
+        segment.SetClientReady(true);
+
+        await waitTask;
+        Assert.That(segment.IsClientReady(), Is.True);
+    }
+
+    [Test]
+    [Timeout(10000)]
+    public async Task Segment_WaitForClientAsync_HonorsCancellationWhenNotSignaled()
+    {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+        {
+            Assert.Ignore("Shared-memory synchronization waits are supported on Windows and Linux only.");
+        }
+
+        var name = $"grpc_wait_client_cancel_{Guid.NewGuid():N}";
+        using var segment = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        Assert.ThrowsAsync<OperationCanceledException>(async () => await segment.WaitForClientAsync(cts.Token));
+    }
+
     private static string CreateInteropSegmentFileWithoutSyncPrimitives(string name, ulong ringCapacity, uint maxStreams)
     {
         var filePath = Path.Combine(Path.GetTempPath(), $"grpc_shm_{name}");
