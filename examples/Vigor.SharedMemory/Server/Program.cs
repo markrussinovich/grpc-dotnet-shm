@@ -19,8 +19,8 @@
 using Google.Protobuf;
 using Grpc.Core;
 using Grpc.Health.V1;
+using Grpc.HealthCheck;
 using Grpc.Net.SharedMemory;
-using Server.Services;
 
 const string SegmentName = "vigor_shm_example";
 
@@ -29,10 +29,15 @@ Console.WriteLine("====================================");
 Console.WriteLine($"Segment name: {SegmentName}");
 
 // Create the health service
-var healthService = new HealthService();
+var healthService = new HealthServiceImpl();
 
-// Create the shared memory listener
-using var listener = new ShmConnectionListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+// Create SHM gRPC server (canonical WS3 hosting surface)
+await using var server = new ShmGrpcServer(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+server.MapUnary<HealthCheckRequest, HealthCheckResponse>(
+    "/grpc.health.v1.Health/Check", healthService.Check);
+server.MapServerStreaming<HealthCheckRequest, HealthCheckResponse>(
+    "/grpc.health.v1.Health/Watch", healthService.Watch);
+
 Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
 Console.WriteLine("Press Ctrl+C to stop the server.");
 
@@ -60,50 +65,7 @@ _ = Task.Run(async () =>
 
 try
 {
-    while (!cts.Token.IsCancellationRequested)
-    {
-        var serverStream = listener.Connection.CreateStream();
-
-        if (serverStream.RequestHeaders is { Method: var method } && method != null)
-        {
-            try
-            {
-                Console.WriteLine($"Received request for method: {method}");
-
-                if (method == "/grpc.health.v1.Health/Check")
-                {
-                    await serverStream.SendResponseHeadersAsync();
-
-                    var response = healthService.Check();
-                    await serverStream.SendMessageAsync(response.ToByteArray());
-                    await serverStream.SendTrailersAsync(StatusCode.OK);
-                }
-                else if (method == "/grpc.health.v1.Health/Watch")
-                {
-                    await serverStream.SendResponseHeadersAsync();
-
-                    // Stream health updates
-                    await healthService.WatchAsync(serverStream, cts.Token);
-                }
-                else
-                {
-                    throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
-                }
-            }
-            catch (RpcException ex)
-            {
-                Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
-                await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error: {ex.Message}");
-                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
-            }
-        }
-
-        await Task.Delay(10, cts.Token);
-    }
+    await server.RunAsync(cts.Token);
 }
 catch (OperationCanceledException)
 {

@@ -18,6 +18,7 @@
 
 using Download;
 using Google.Protobuf;
+using Grpc.Core;
 using Grpc.Net.SharedMemory;
 
 namespace Server.Services;
@@ -32,16 +33,20 @@ public class DownloaderService
     /// <summary>
     /// Downloads a file by streaming its contents to the client.
     /// </summary>
-    public async Task DownloadFileAsync(ShmGrpcStream stream, CancellationToken cancellationToken)
+    public async Task DownloadFileAsync(
+        DownloadFileRequest request,
+        IServerStreamWriter<DownloadFileResponse> responseStream,
+        ServerCallContext context)
     {
         var filename = "sample.txt";
+        var cancellationToken = context.CancellationToken;
 
         // Send metadata first
         var metadataMessage = new DownloadFileResponse
         {
             Metadata = new FileMetadata { FileName = filename }
         };
-        await stream.SendMessageAsync(metadataMessage.ToByteArray());
+        await responseStream.WriteAsync(metadataMessage);
         Console.WriteLine($"Sent metadata for file: {filename}");
 
         // Stream file content in chunks
@@ -63,7 +68,7 @@ public class DownloaderService
             {
                 Data = UnsafeByteOperations.UnsafeWrap(buffer.AsMemory(0, numBytesRead))
             };
-            await stream.SendMessageAsync(dataMessage.ToByteArray());
+            await responseStream.WriteAsync(dataMessage);
             totalBytesSent += numBytesRead;
         }
 

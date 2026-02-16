@@ -183,7 +183,7 @@ Objective: define and enforce one recommended SHM client/server usage pattern.
 - [x] Select primary client handler pattern and document why. *(Canonical: `ShmControlHandler` with `GrpcChannel.ForAddress("http://localhost", ...)`.)*
 - [x] Select primary server hosting pattern and document why. *(Canonical: `ShmGrpcServer` with `MapUnary`/`MapDuplexStreaming`.)*
 - [x] Mark alternate APIs as advanced/legacy/internal where appropriate. *(`ShmHandler` and `ShmConnectionListener` XML docs now marked legacy/advanced.)*
-- [ ] Update docs/examples to use the primary pattern. *(In progress: remaining `ShmHandler` clients and stale example docs migrated in this session.)*
+- [ ] Update docs/examples to use the primary pattern. *(In progress: legacy clients migrated; server-side migration completed for `Downloader.SharedMemory`, `Error.SharedMemory`, and `Vigor.SharedMemory`; `Metadata.SharedMemory` remains intentionally low-level and will be normalized in WS4.)*
 
 ### Validation
 - [ ] All updated examples compile and run.

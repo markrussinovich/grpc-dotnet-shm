@@ -2,6 +2,8 @@
 
 This example demonstrates metadata (headers/trailers) handling over shared memory transport.
 
+> Note: This example intentionally uses low-level `ShmConnection`/`ShmGrpcStream` APIs to show frame-level metadata behavior. For normal applications, prefer the canonical `ShmControlHandler` (client) + `ShmGrpcServer` (server) pattern used in other shared-memory examples.
+
 ## Design
 
 Mirrors the Go grpc-go-shmem `examples/shm/features/metadata` example.

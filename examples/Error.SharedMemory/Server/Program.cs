@@ -16,7 +16,7 @@
 
 #endregion
 
-using Grpc.Core;
+using Greet;
 using Grpc.Net.SharedMemory;
 using Server.Services;
 
@@ -29,8 +29,11 @@ Console.WriteLine($"Segment name: {SegmentName}");
 // Create the greeter service with validation
 var greeterService = new GreeterService();
 
-// Create the shared memory listener
-using var listener = new ShmConnectionListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+// Create SHM gRPC server (canonical WS3 hosting surface)
+await using var server = new ShmGrpcServer(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+server.MapUnary<HelloRequest, HelloReply>(
+    "/greet.Greeter/SayHello", greeterService.SayHelloAsync);
+
 Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
 Console.WriteLine("Press Ctrl+C to stop the server.");
 
@@ -43,46 +46,7 @@ Console.CancelKeyPress += (_, e) =>
 
 try
 {
-    while (!cts.Token.IsCancellationRequested)
-    {
-        var serverStream = listener.Connection.CreateStream();
-
-        if (serverStream.RequestHeaders is { Method: var method } && method != null)
-        {
-            try
-            {
-                Console.WriteLine($"Received request for method: {method}");
-
-                // Send response headers
-                await serverStream.SendResponseHeadersAsync();
-
-                // Handle the method with validation
-                var response = await greeterService.HandleMethodAsync(
-                    serverStream,
-                    method,
-                    Array.Empty<byte>());
-
-                await serverStream.SendMessageAsync(response);
-                await serverStream.SendTrailersAsync(StatusCode.OK);
-
-                Console.WriteLine("Response sent successfully.");
-            }
-            catch (RpcException ex)
-            {
-                Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
-                
-                // Send the error trailers
-                await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error: {ex.Message}");
-                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
-            }
-        }
-
-        await Task.Delay(10, cts.Token);
-    }
+    await server.RunAsync(cts.Token);
 }
 catch (OperationCanceledException)
 {
