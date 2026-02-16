@@ -17,12 +17,73 @@
 #endregion
 
 using NUnit.Framework;
+using System.Buffers.Binary;
 
 namespace Grpc.Net.SharedMemory.Tests;
 
 [TestFixture]
 public class SegmentTests
 {
+    [Test]
+    public void Segment_Open_WithoutSyncPrimitives_DefaultMode_Throws()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Ignore("This test is specific to Windows named-event synchronization behavior.");
+        }
+
+        var name = $"grpc_nosync_{Guid.NewGuid():N}";
+        var filePath = CreateInteropSegmentFileWithoutSyncPrimitives(name, ringCapacity: 4096, maxStreams: 100);
+
+        try
+        {
+            Assert.Throws<InvalidOperationException>(() => Segment.Open(name));
+        }
+        finally
+        {
+            TryDelete(filePath);
+        }
+    }
+
+    [Test]
+    public void Segment_Open_WithoutSyncPrimitives_ExplicitCompatibilityMode_Opens()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Ignore("This test is specific to Windows named-event synchronization behavior.");
+        }
+
+        var name = $"grpc_nosync_{Guid.NewGuid():N}";
+        var filePath = CreateInteropSegmentFileWithoutSyncPrimitives(name, ringCapacity: 4096, maxStreams: 100);
+
+        try
+        {
+            using var segment = Segment.Open(name, allowMissingSyncPrimitives: true);
+            Assert.That(segment.Header.MagicValue, Is.EqualTo(BitConverter.ToUInt64(ShmConstants.SegmentMagicBytes)));
+            Assert.That(segment.Header.Version, Is.EqualTo(ShmConstants.ProtocolVersion));
+            Assert.That(segment.Header.MaxStreams, Is.EqualTo(100u));
+        }
+        finally
+        {
+            TryDelete(filePath);
+        }
+    }
+
+    [Test]
+    public void Ws1_NoPollingFallbackMarkers_RemainRemoved()
+    {
+        var repoRoot = Path.GetFullPath(Path.Combine(TestContext.CurrentContext.TestDirectory, "..", "..", "..", "..", ".."));
+        var segmentSourcePath = Path.Combine(repoRoot, "src", "Grpc.Net.SharedMemory", "Segment.cs");
+        var httpHandlerSourcePath = Path.Combine(repoRoot, "src", "Grpc.Net.SharedMemory", "ShmHttpHandler.cs");
+
+        var segmentSource = File.ReadAllText(segmentSourcePath);
+        var httpHandlerSource = File.ReadAllText(httpHandlerSourcePath);
+
+        Assert.That(segmentSource, Does.Not.Contain("WaitHeaderFlagPollingAsync"));
+        Assert.That(segmentSource, Does.Not.Contain("Task.Delay(1)"));
+        Assert.That(httpHandlerSource, Does.Not.Contain("Task.Delay(1)"));
+    }
+
     [Test]
     public void Segment_Create_CreatesNewSegment()
     {
@@ -179,6 +240,53 @@ public class SegmentTests
     {
         var name = $"grpc_test_{Guid.NewGuid():N}";
         Assert.Throws<ArgumentException>(() => Segment.Create(name, ringCapacity: 1000, maxStreams: 100));
+    }
+
+    private static string CreateInteropSegmentFileWithoutSyncPrimitives(string name, ulong ringCapacity, uint maxStreams)
+    {
+        var filePath = Path.Combine(Path.GetTempPath(), $"grpc_shm_{name}");
+
+        var ringAOffset = (ulong)ShmConstants.SegmentHeaderSize;
+        var ringBOffset = ringAOffset + (ulong)ShmConstants.RingHeaderSize + ringCapacity;
+        var totalSize = ringBOffset + (ulong)ShmConstants.RingHeaderSize + ringCapacity;
+
+        var bytes = new byte[(int)totalSize];
+
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(0x00, 8), BitConverter.ToUInt64(ShmConstants.SegmentMagicBytes));
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0x08, 4), ShmConstants.ProtocolVersion);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0x0C, 4), 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(0x10, 8), totalSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(0x18, 8), ringAOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(0x20, 8), ringCapacity);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(0x28, 8), ringBOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(0x30, 8), ringCapacity);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0x38, 4), (uint)Environment.ProcessId);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0x3C, 4), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0x40, 4), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0x44, 4), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0x48, 4), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0x4C, 4), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0x50, 4), maxStreams);
+
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan((int)ringAOffset, 8), ringCapacity);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan((int)ringBOffset, 8), ringCapacity);
+
+        File.WriteAllBytes(filePath, bytes);
+        return filePath;
+    }
+
+    private static void TryDelete(string filePath)
+    {
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+            }
+        }
+        catch
+        {
+        }
     }
 
     // Note: Cross-segment communication tests require proper shared memory implementation

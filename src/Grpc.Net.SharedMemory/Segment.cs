@@ -164,6 +164,7 @@ public sealed partial class Segment : IDisposable
         MemoryMappedViewAccessor accessor,
         MappedMemoryManager memoryManager,
         bool isServer,
+        bool allowMissingSyncPrimitives,
         ulong ringAOffset,
         ulong ringACapacity,
         ulong ringBOffset,
@@ -181,24 +182,43 @@ public sealed partial class Segment : IDisposable
         // Create ring sync primitives
         IRingSync? syncA = null;
         IRingSync? syncB = null;
+        Exception? syncInitException = null;
 
         try
         {
-            if (OperatingSystem.IsWindows())
+            if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux())
             {
                 syncA = RingSyncFactory.Create(name, "A", isServer, memoryManager, (int)ringAOffset);
                 syncB = RingSyncFactory.Create(name, "B", isServer, memoryManager, (int)ringBOffset);
             }
-            else if (OperatingSystem.IsLinux())
+            else
             {
-                syncA = RingSyncFactory.Create(name, "A", isServer, memoryManager, (int)ringAOffset);
-                syncB = RingSyncFactory.Create(name, "B", isServer, memoryManager, (int)ringBOffset);
+                throw new PlatformNotSupportedException("Shared memory transport requires Windows or Linux synchronization primitives.");
             }
         }
         catch (Exception ex)
         {
-            // Sync primitives are optional - fall back to polling if not available
-            System.Diagnostics.Debug.WriteLine($"Sync creation failed (name={name}, isServer={isServer}): {ex.Message}");
+            syncInitException = ex;
+        }
+
+        if (syncInitException is not null)
+        {
+            if (allowMissingSyncPrimitives && !isServer)
+            {
+                syncA = new MissingRingSync(name, "A", syncInitException);
+                syncB = new MissingRingSync(name, "B", syncInitException);
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    $"Failed to create shared-memory synchronization primitives for segment '{name}' (isServer={isServer}).", syncInitException);
+            }
+        }
+
+        if (syncA is null || syncB is null)
+        {
+            throw new InvalidOperationException(
+                $"Shared-memory synchronization primitives were not initialized for segment '{name}' (isServer={isServer}).");
         }
 
         // Create ring buffers operating directly on mapped memory (zero-copy)
@@ -295,7 +315,7 @@ public sealed partial class Segment : IDisposable
         // Flush to ensure visibility to other processes
         accessor.Flush();
 
-        return new Segment(name, filePath, mappedFile, accessor, memoryManager, true,
+        return new Segment(name, filePath, mappedFile, accessor, memoryManager, true, false,
             ringAOffset, ringCapacity, ringBOffset, ringCapacity);
     }
 
@@ -307,6 +327,21 @@ public sealed partial class Segment : IDisposable
     /// <param name="name">The segment name.</param>
     /// <returns>The opened segment.</returns>
     public static Segment Open(string name)
+    {
+        return Open(name, allowMissingSyncPrimitives: false);
+    }
+
+    /// <summary>
+    /// Opens an existing shared memory segment (client-side), with optional explicit compatibility mode
+    /// for segments that do not provide .NET synchronization primitives.
+    /// </summary>
+    /// <param name="name">The segment name.</param>
+    /// <param name="allowMissingSyncPrimitives">
+    /// If true, opening succeeds even when synchronization primitives are unavailable.
+    /// This mode is non-default and intended for interoperability/header-validation scenarios only.
+    /// </param>
+    /// <returns>The opened segment.</returns>
+    public static Segment Open(string name, bool allowMissingSyncPrimitives)
     {
         if (string.IsNullOrEmpty(name))
         {
@@ -366,7 +401,7 @@ public sealed partial class Segment : IDisposable
         // Create zero-copy memory manager over the mapped region
         var memoryManager = new MappedMemoryManager(accessor);
 
-        return new Segment(name, filePath, mappedFile, accessor, memoryManager, false,
+        return new Segment(name, filePath, mappedFile, accessor, memoryManager, false, allowMissingSyncPrimitives,
             header.RingAOffset, header.RingACapacity, header.RingBOffset, header.RingBCapacity);
     }
 
@@ -578,22 +613,13 @@ public sealed partial class Segment : IDisposable
             return Task.Run(() => WaitHeaderFlagLinux(offset, cancellationToken), cancellationToken);
         }
 
-        return WaitHeaderFlagPollingAsync(offset, cancellationToken);
+        throw new PlatformNotSupportedException("Header flag waits require Windows or Linux synchronization support.");
     }
 
     private bool IsHeaderFlagSet(int offset)
     {
         var span = _memory.Span;
         return BinaryPrimitives.ReadUInt32LittleEndian(span[offset..(offset + sizeof(uint))]) != 0;
-    }
-
-    private async Task WaitHeaderFlagPollingAsync(int offset, CancellationToken cancellationToken)
-    {
-        while (!IsHeaderFlagSet(offset))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            await Task.Delay(1, cancellationToken).ConfigureAwait(false);
-        }
     }
 
     private unsafe void WaitHeaderFlagWindows(int offset, CancellationToken cancellationToken)

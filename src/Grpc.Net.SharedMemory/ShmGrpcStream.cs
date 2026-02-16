@@ -464,75 +464,123 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public async IAsyncEnumerable<byte[]> ReceiveMessagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        MemoryStream? messageAccumulator = null;
-        while (true)
+        byte[]? messageAccumulator = null;
+        var messageAccumulatorLength = 0;
+
+        static byte[] EnsureAccumulatorCapacity(byte[]? current, int existingLength, int neededLength)
         {
-            if (_cancelled) yield break;
-
-            var frame = await ReceiveFrameAsync(cancellationToken);
-            if (frame == null) yield break;
-
-            var f = frame.Value;
-            switch (f.Type)
+            if (current != null && current.Length >= neededLength)
             {
-                case FrameType.Message:
-                    // Batch window updates: send only when unacked bytes exceed
-                    // 25% of the initial window, matching connection-level flow
-                    // control. This avoids a lock + ring write per message.
-                    _inFlowUnacked += (uint)f.Length;
-                    if (_inFlowUnacked >= ShmConstants.InitialWindowSize / 4)
-                    {
-                        Span<byte> windowUpdate = stackalloc byte[4];
-                        BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, _inFlowUnacked);
-                        _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
-                        _inFlowUnacked = 0;
-                    }
+                return current;
+            }
 
-                    if ((f.Flags & MessageFlags.More) != 0)
-                    {
-                        messageAccumulator ??= new MemoryStream();
-                        messageAccumulator.Write(f.Memory.Span);
+            var newCapacity = current == null ? 1024 : current.Length;
+            while (newCapacity < neededLength)
+            {
+                newCapacity *= 2;
+            }
+
+            var next = ArrayPool<byte>.Shared.Rent(newCapacity);
+            if (current != null)
+            {
+                current.AsSpan(0, existingLength).CopyTo(next);
+                ArrayPool<byte>.Shared.Return(current);
+            }
+
+            return next;
+        }
+
+        try
+        {
+            while (true)
+            {
+                if (_cancelled) yield break;
+
+                var frame = await ReceiveFrameAsync(cancellationToken);
+                if (frame == null) yield break;
+
+                var f = frame.Value;
+                switch (f.Type)
+                {
+                    case FrameType.Message:
+                        // Batch window updates: send only when unacked bytes exceed
+                        // 25% of the initial window, matching connection-level flow
+                        // control. This avoids a lock + ring write per message.
+                        _inFlowUnacked += (uint)f.Length;
+                        if (_inFlowUnacked >= ShmConstants.InitialWindowSize / 4)
+                        {
+                            Span<byte> windowUpdate = stackalloc byte[4];
+                            BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, _inFlowUnacked);
+                            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
+                            _inFlowUnacked = 0;
+                        }
+
+                        if ((f.Flags & MessageFlags.More) != 0)
+                        {
+                            var nextLength = messageAccumulatorLength + f.Length;
+                            var priorLength = messageAccumulatorLength;
+                            messageAccumulator = EnsureAccumulatorCapacity(messageAccumulator, priorLength, nextLength);
+                            f.Memory.Span.CopyTo(messageAccumulator.AsSpan(priorLength, f.Length));
+                            messageAccumulatorLength = nextLength;
+                            f.ReturnToPool();
+                            break;
+                        }
+
+                        if (messageAccumulatorLength > 0)
+                        {
+                            var nextLength = messageAccumulatorLength + f.Length;
+                            var priorLength = messageAccumulatorLength;
+                            messageAccumulator = EnsureAccumulatorCapacity(messageAccumulator, priorLength, nextLength);
+                            f.Memory.Span.CopyTo(messageAccumulator.AsSpan(priorLength, f.Length));
+                            messageAccumulatorLength = nextLength;
+                            f.ReturnToPool();
+
+                            var assembled = new byte[messageAccumulatorLength];
+                            messageAccumulator.AsSpan(0, messageAccumulatorLength).CopyTo(assembled);
+                            ArrayPool<byte>.Shared.Return(messageAccumulator);
+                            messageAccumulator = null;
+                            messageAccumulatorLength = 0;
+
+                            yield return assembled;
+                            break;
+                        }
+
+                        // Yield an owned copy so payload buffers can be released safely.
+                        var owned = f.Memory.ToArray();
+                        f.ReturnToPool();
+                        yield return owned;
+                        break;
+
+                    case FrameType.HalfClose:
+                        FlushPendingWindowUpdate();
+                        f.ReturnToPool();
+                        _halfCloseReceived = true;
+                        yield break;
+
+                    case FrameType.Trailers:
+                        FlushPendingWindowUpdate();
+                        _trailers = TrailersV1.Decode(f.Memory.Span);
+                        f.ReturnToPool();
+                        _halfCloseReceived = true;
+                        yield break;
+
+                    case FrameType.Cancel:
+                        FlushPendingWindowUpdate();
+                        f.ReturnToPool();
+                        _cancelled = true;
+                        yield break;
+
+                    default:
                         f.ReturnToPool();
                         break;
-                    }
-
-                    if (messageAccumulator != null)
-                    {
-                        messageAccumulator.Write(f.Memory.Span);
-                        f.ReturnToPool();
-                        yield return messageAccumulator.ToArray();
-                        messageAccumulator.SetLength(0);
-                        break;
-                    }
-
-                    // Yield an owned copy so payload buffers can be released safely.
-                    var owned = f.Memory.ToArray();
-                    f.ReturnToPool();
-                    yield return owned;
-                    break;
-
-                case FrameType.HalfClose:
-                    FlushPendingWindowUpdate();
-                    f.ReturnToPool();
-                    _halfCloseReceived = true;
-                    yield break;
-
-                case FrameType.Trailers:
-                    FlushPendingWindowUpdate();
-                    _trailers = TrailersV1.Decode(f.Memory.Span);
-                    f.ReturnToPool();
-                    _halfCloseReceived = true;
-                    yield break;
-
-                case FrameType.Cancel:
-                    FlushPendingWindowUpdate();
-                    f.ReturnToPool();
-                    _cancelled = true;
-                    yield break;
-
-                default:
-                    f.ReturnToPool();
-                    break;
+                }
+            }
+        }
+        finally
+        {
+            if (messageAccumulator != null)
+            {
+                ArrayPool<byte>.Shared.Return(messageAccumulator);
             }
         }
     }

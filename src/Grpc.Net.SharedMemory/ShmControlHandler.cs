@@ -213,27 +213,34 @@ public sealed class ShmControlHandler : HttpMessageHandler
             // Read response
             var (responseHeader, responsePayload) = await ReadControlFrameAsync(ctlRx, ct).ConfigureAwait(false);
 
-            switch (responseHeader.Type)
+            try
             {
-                case FrameType.Accept:
-                    var dataSegmentName = ControlWire.DecodeConnectResponse(responsePayload.Span);
+                switch (responseHeader.Type)
+                {
+                    case FrameType.Accept:
+                        var dataSegmentName = ControlWire.DecodeConnectResponse(responsePayload.Memory.Span);
 
-                    // Open the data segment
-                    var dataSegment = Segment.Open(dataSegmentName);
-                    await dataSegment.WaitForServerAsync(ct).ConfigureAwait(false);
+                        // Open the data segment
+                        var dataSegment = Segment.Open(dataSegmentName);
+                        await dataSegment.WaitForServerAsync(ct).ConfigureAwait(false);
 
-                    // Signal that client has mapped the segment
-                    dataSegment.SetClientReady(true);
+                        // Signal that client has mapped the segment
+                        dataSegment.SetClientReady(true);
 
-                    // Create and return the connection
-                    return ShmConnection.FromClientSegment(dataSegmentName, dataSegment);
+                        // Create and return the connection
+                        return ShmConnection.FromClientSegment(dataSegmentName, dataSegment);
 
-                case FrameType.Reject:
-                    var message = ControlWire.DecodeConnectReject(responsePayload.Span);
-                    throw new InvalidOperationException($"Connection rejected by server: {message}");
+                    case FrameType.Reject:
+                        var message = ControlWire.DecodeConnectReject(responsePayload.Memory.Span);
+                        throw new InvalidOperationException($"Connection rejected by server: {message}");
 
-                default:
-                    throw new InvalidOperationException($"Unexpected response frame type: {responseHeader.Type}");
+                    default:
+                        throw new InvalidOperationException($"Unexpected response frame type: {responseHeader.Type}");
+                }
+            }
+            finally
+            {
+                responsePayload.Release();
             }
         }
         finally
@@ -244,52 +251,16 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
     private static Task WriteControlFrameAsync(ShmRing ring, FrameType type, byte[] payload, CancellationToken ct)
     {
-        var header = new FrameHeader
-        {
-            Length = (uint)payload.Length,
-            StreamId = 0,
-            Type = type,
-            Flags = 0
-        };
-
-        var headerBytes = header.ToBytes();
-        // Write header and payload (ring.Write blocks until space is available)
-        ring.Write(headerBytes, ct);
-        if (payload.Length > 0)
-        {
-            ring.Write(payload, ct);
-        }
+        var header = new FrameHeader(type, 0, 0, 0);
+        FrameProtocol.WriteFrame(ring, header, payload, ct);
 
         return Task.CompletedTask;
     }
 
-    private static Task<(FrameHeader header, Memory<byte> payload)> ReadControlFrameAsync(ShmRing ring, CancellationToken ct)
+    private static Task<(FrameHeader header, FramePayload payload)> ReadControlFrameAsync(ShmRing ring, CancellationToken ct)
     {
-        // Read frame header
-        var headerBuffer = new byte[ShmConstants.FrameHeaderSize];
-        ReadExact(ring, headerBuffer, ct);
-
-        var header = FrameHeader.Parse(headerBuffer);
-
-        // Read payload if any
-        Memory<byte> payload = Memory<byte>.Empty;
-        if (header.Length > 0)
-        {
-            var payloadBuffer = new byte[header.Length];
-            ReadExact(ring, payloadBuffer, ct);
-            payload = payloadBuffer;
-        }
-
-        return Task.FromResult((header, payload));
-    }
-
-    private static void ReadExact(ShmRing ring, Span<byte> buffer, CancellationToken ct)
-    {
-        var read = 0;
-        while (read < buffer.Length)
-        {
-            read += ring.Read(buffer[read..], ct);
-        }
+        var frame = FrameProtocol.ReadFramePayload(ring, allowBorrowed: true, ct);
+        return Task.FromResult((frame.Header, frame.Payload));
     }
 
     private static Metadata? ExtractMetadata(HttpRequestHeaders headers)

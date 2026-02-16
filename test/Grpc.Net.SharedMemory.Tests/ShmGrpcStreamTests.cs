@@ -18,6 +18,7 @@
 
 using NUnit.Framework;
 using Grpc.Core;
+using System.Text;
 
 namespace Grpc.Net.SharedMemory.Tests;
 
@@ -166,5 +167,51 @@ public class ShmGrpcStreamTests
         // Assert - should throw on further operations
         Assert.ThrowsAsync<ObjectDisposedException>(async () =>
             await stream.SendTrailersAsync(StatusCode.OK));
+    }
+
+    [Test]
+    [Timeout(10000)]
+    public async Task ReceiveMessagesAsync_ReturnsOwnedIndependentBuffers()
+    {
+        // Arrange
+        var segmentName = $"grpc_test_{Guid.NewGuid():N}";
+        using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 64 * 1024, maxStreams: 100);
+        using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
+
+        var firstPayload = Encoding.UTF8.GetBytes("first-payload");
+        var secondPayload = Encoding.UTF8.GetBytes("second-payload");
+
+        var serverTask = Task.Run(async () =>
+        {
+            var serverStream = await serverConnection.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+
+            var received = new List<byte[]>();
+            await foreach (var message in serverStream!.ReceiveMessagesAsync())
+            {
+                received.Add(message);
+            }
+
+            await serverStream.SendResponseHeadersAsync();
+            await serverStream.SendTrailersAsync(StatusCode.OK);
+            return received;
+        });
+
+        var clientStream = clientConnection.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/ReceiveMessagesAsync_ReturnsOwnedIndependentBuffers", "localhost");
+        await clientStream.SendMessageAsync(firstPayload);
+        await clientStream.SendMessageAsync(secondPayload);
+        await clientStream.SendHalfCloseAsync();
+
+        var receivedMessages = await serverTask;
+
+        // Assert payload correctness
+        Assert.That(receivedMessages.Count, Is.EqualTo(2));
+        Assert.That(receivedMessages[0], Is.EqualTo(firstPayload));
+        Assert.That(receivedMessages[1], Is.EqualTo(secondPayload));
+
+        // Assert ownership/lifetime independence across returned arrays.
+        receivedMessages[1][0] ^= 0x1;
+        Assert.That(receivedMessages[0], Is.EqualTo(firstPayload));
     }
 }

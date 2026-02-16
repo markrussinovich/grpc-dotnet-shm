@@ -446,7 +446,7 @@ public class InteropTests
             Console.WriteLine($"Go created segment: {output}");
 
             // Now open with .NET
-            using var segment = Segment.Open(segmentName);
+            using var segment = Segment.Open(segmentName, allowMissingSyncPrimitives: true);
 
             Assert.That(segment.Header.MagicValue, Is.EqualTo(BitConverter.ToUInt64(ShmConstants.SegmentMagicBytes)), "Magic");
             Assert.That(segment.Header.Version, Is.EqualTo(1u), "Version");

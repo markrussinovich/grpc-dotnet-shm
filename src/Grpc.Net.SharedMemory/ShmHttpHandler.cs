@@ -94,28 +94,35 @@ public sealed class ShmHttpHandler : DelegatingHandler
             var (header, payload) = await ReadControlFrameAsync(ctlRx, cancellationToken)
                 .ConfigureAwait(false);
 
-            switch (header.Type)
+            try
             {
-                case FrameType.Accept:
-                    var dataSegmentName = ControlWire.DecodeConnectResponse(payload.Span);
+                switch (header.Type)
+                {
+                    case FrameType.Accept:
+                        var dataSegmentName = ControlWire.DecodeConnectResponse(payload.Memory.Span);
 
-                    // Open the data segment
-                    var dataSegment = Segment.Open(dataSegmentName);
-                    await dataSegment.WaitForServerAsync(cancellationToken).ConfigureAwait(false);
+                        // Open the data segment
+                        var dataSegment = Segment.Open(dataSegmentName);
+                        await dataSegment.WaitForServerAsync(cancellationToken).ConfigureAwait(false);
 
-                    // Signal that client has mapped the segment
-                    dataSegment.SetClientReady(true);
+                        // Signal that client has mapped the segment
+                        dataSegment.SetClientReady(true);
 
-                    // Client reads from RingB (server→client), writes to RingA (client→server)
-                    return new ShmStream(dataSegment.RingB, dataSegment.RingA);
+                        // Client reads from RingB (server→client), writes to RingA (client→server)
+                        return new ShmStream(dataSegment.RingB, dataSegment.RingA);
 
-                case FrameType.Reject:
-                    var message = ControlWire.DecodeConnectReject(payload.Span);
-                    throw new InvalidOperationException($"Connection rejected by server: {message}");
+                    case FrameType.Reject:
+                        var message = ControlWire.DecodeConnectReject(payload.Memory.Span);
+                        throw new InvalidOperationException($"Connection rejected by server: {message}");
 
-                default:
-                    throw new InvalidOperationException(
-                        $"Unexpected response frame type: {header.Type}");
+                    default:
+                        throw new InvalidOperationException(
+                            $"Unexpected response frame type: {header.Type}");
+                }
+            }
+            finally
+            {
+                payload.Release();
             }
         }
         finally
@@ -127,61 +134,14 @@ public sealed class ShmHttpHandler : DelegatingHandler
 
     private static void WriteControlFrame(ShmRing ring, FrameType type, byte[] payload)
     {
-        var header = new FrameHeader
-        {
-            Length = (uint)payload.Length,
-            StreamId = 0,
-            Type = type,
-            Flags = 0
-        };
-
-        var headerBytes = header.ToBytes();
-
-        // Write header then payload — reader waits for full payload via TryPeek
-        ring.Write(headerBytes);
-        if (payload.Length > 0)
-        {
-            ring.Write(payload);
-        }
+        var header = new FrameHeader(type, 0, 0, 0);
+        FrameProtocol.WriteFrame(ring, header, payload);
     }
 
-    private static async Task<(FrameHeader header, Memory<byte> payload)> ReadControlFrameAsync(
+    private static Task<(FrameHeader header, FramePayload payload)> ReadControlFrameAsync(
         ShmRing ring, CancellationToken ct)
     {
-        // Wait for frame header data
-        while (!ring.TryPeek(ShmConstants.FrameHeaderSize, out _))
-        {
-            ct.ThrowIfCancellationRequested();
-            await Task.Delay(1, ct).ConfigureAwait(false);
-        }
-
-        // Read frame header
-        var headerBuffer = new byte[ShmConstants.FrameHeaderSize];
-        if (!ring.TryRead(headerBuffer))
-        {
-            throw new InvalidOperationException("Failed to read control frame header");
-        }
-
-        var header = FrameHeader.Parse(headerBuffer);
-
-        // Read payload if present
-        Memory<byte> payload = Memory<byte>.Empty;
-        if (header.Length > 0)
-        {
-            while (!ring.TryPeek((int)header.Length, out _))
-            {
-                ct.ThrowIfCancellationRequested();
-                await Task.Delay(1, ct).ConfigureAwait(false);
-            }
-
-            var payloadBuffer = new byte[header.Length];
-            if (!ring.TryRead(payloadBuffer))
-            {
-                throw new InvalidOperationException("Failed to read control frame payload");
-            }
-            payload = payloadBuffer;
-        }
-
-        return (header, payload);
+        var frame = FrameProtocol.ReadFramePayload(ring, allowBorrowed: true, ct);
+        return Task.FromResult((frame.Header, frame.Payload));
     }
 }

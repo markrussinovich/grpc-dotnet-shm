@@ -93,6 +93,7 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
 
             if (frameHeader.Type != FrameType.Connect)
             {
+                payload.Release();
                 // Ignore non-CONNECT frames
                 continue;
             }
@@ -100,13 +101,17 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             // Decode and validate CONNECT request
             try
             {
-                ControlWire.DecodeConnectRequest(payload.Span);
+                ControlWire.DecodeConnectRequest(payload.Memory.Span);
             }
             catch (Exception ex)
             {
                 // Send REJECT
                 await SendRejectAsync(ex.Message, ct).ConfigureAwait(false);
                 continue;
+            }
+            finally
+            {
+                payload.Release();
             }
 
             // Create a new data segment for this connection
@@ -178,54 +183,18 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         }
     }
 
-    private Task<(FrameHeader header, Memory<byte> payload)> ReadControlFrameAsync(CancellationToken ct)
+    private Task<(FrameHeader header, FramePayload payload)> ReadControlFrameAsync(CancellationToken ct)
     {
-        // Read frame header
-        var headerBuffer = new byte[ShmConstants.FrameHeaderSize];
-        ReadExact(_controlRx, headerBuffer, ct);
-
-        var header = FrameHeader.Parse(headerBuffer);
-
-        // Read payload if any
-        Memory<byte> payload = Memory<byte>.Empty;
-        if (header.Length > 0)
-        {
-            var payloadBuffer = new byte[header.Length];
-            ReadExact(_controlRx, payloadBuffer, ct);
-            payload = payloadBuffer;
-        }
-
-        return Task.FromResult((header, payload));
+        var frame = FrameProtocol.ReadFramePayload(_controlRx, allowBorrowed: true, ct);
+        return Task.FromResult((frame.Header, frame.Payload));
     }
 
     private Task WriteControlFrameAsync(FrameType type, byte[] payload, CancellationToken ct)
     {
-        var header = new FrameHeader
-        {
-            Length = (uint)payload.Length,
-            StreamId = 0,
-            Type = type,
-            Flags = 0
-        };
-
-        var headerBytes = header.ToBytes();
-        // Write header and payload (ring.Write blocks until space is available)
-        _controlTx.Write(headerBytes, ct);
-        if (payload.Length > 0)
-        {
-            _controlTx.Write(payload, ct);
-        }
+        var header = new FrameHeader(type, 0, 0, 0);
+        FrameProtocol.WriteFrame(_controlTx, header, payload, ct);
 
         return Task.CompletedTask;
-    }
-
-    private static void ReadExact(ShmRing ring, Span<byte> buffer, CancellationToken ct)
-    {
-        var read = 0;
-        while (read < buffer.Length)
-        {
-            read += ring.Read(buffer[read..], ct);
-        }
     }
 
     private Task SendAcceptAsync(string segmentName, CancellationToken ct)

@@ -30,7 +30,7 @@ namespace Grpc.Net.SharedMemory;
 /// - alpha = 0.9: Smoothing factor for RTT estimation
 /// - beta = 0.66: Threshold for BDP increase trigger
 /// - gamma = 2: Multiplicative factor for BDP growth
-/// - bdpLimit = 32MB: Maximum BDP window
+/// - bdpLimit = 1 GiB: Maximum BDP window
 /// </summary>
 public sealed class ShmBdpEstimator
 {
