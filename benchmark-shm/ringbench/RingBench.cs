@@ -190,6 +190,10 @@ var results = new
     timestamp = DateTime.UtcNow.ToString("o"),
     cpu,
     runtime,
+    os = RuntimeInformation.OSDescription,
+    os_architecture = RuntimeInformation.OSArchitecture.ToString(),
+    process_architecture = RuntimeInformation.ProcessArchitecture.ToString(),
+    ring_capacity_bytes = ShmRingCapacityBytes,
     sizes_bytes = sizes,
     unary = unaryResults.Select(r => new
     {

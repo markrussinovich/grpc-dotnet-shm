@@ -70,7 +70,7 @@ Update this table at least once per session.
 | WS3 | Dialer/server API standardization | TBD | Done | TBD | 2026-02-16 | Canonical surface documented and applied (`ShmControlHandler` + `ShmGrpcServer`); alternates marked advanced/legacy; docs aligned. |
 | WS4 | E2E example normalization to idiomatic gRPC | TBD | In Progress | TBD | 2026-02-16 | Manual framing removed from Metadata/Reflector/Uploader shared-memory examples; broad smoke-run and remaining payload-memory validation pending. |
 | WS5 | Test hardening and coverage alignment | TBD | Done | TBD | 2026-02-16 | Completed: EndToEnd tests use real stream routing, sync wait/cancellation coverage added for supported platforms, and repeat-run anti-flake checks passed. |
-| WS6 | Benchmark realism and reporting cleanup | TBD | In Progress | TBD | 2026-02-15 | README/status drift and estimated plot metrics identified. |
+| WS6 | Benchmark realism and reporting cleanup | TBD | Done | TBD | 2026-02-16 | Completed: benchmark docs aligned to current SHM+TCP workflow, estimated/synthetic bidi panels removed from default reports, and fresh measured artifacts recorded with explicit env metadata. |
 | WS7 | Code organization and deprecation cleanup | TBD | In Progress | TBD | 2026-02-15 | Overlapping transport surfaces identified; ownership consolidation pending. |
 
 Allowed Status values: `Not Started`, `In Progress`, `Blocked`, `Ready for Review`, `Done`.
@@ -236,17 +236,17 @@ Objective: ensure tests validate real behavior, not simulated behavior.
 Objective: make benchmark methodology and reporting strictly measured and comparable.
 
 ### Tasks
-- [ ] Align benchmark README with actual SHM support status.
-- [ ] Remove estimated/synthetic performance lines from default reports.
-- [ ] Ensure TCP and SHM paths use equivalent workload semantics and constraints.
-- [ ] Record benchmark environment details (CPU, runtime, OS, ring size, message sizes).
+- [x] Align benchmark README with actual SHM support status. *(Updated `benchmark-shm/README.md` quick-start and status to measured SHM+TCP workflow.)*
+- [x] Remove estimated/synthetic performance lines from default reports. *(Removed estimated bidirectional panels from `benchmark_runner.py` default plot set.)*
+- [x] Ensure TCP and SHM paths use equivalent workload semantics and constraints. *(Validated current `RingBench` server/client setup already uses equivalent typed benchmark RPC semantics and limits for both transports.)*
+- [x] Record benchmark environment details (CPU, runtime, OS, ring size, message sizes). *(Added explicit `os`, architecture, and `ring_capacity_bytes` metadata fields in `results.json`.)*
 
 ### Validation
-- [ ] Benchmark runs for both TCP and SHM complete successfully.
-- [ ] Output artifacts contain measured-only key comparison figures.
+- [x] Benchmark runs for both TCP and SHM complete successfully. *(Ran `run benchmark runner` task; both transport suites completed and artifacts regenerated.)*
+- [x] Output artifacts contain measured-only key comparison figures. *(Default PNG dashboards generated from measured unary/streaming data only; estimated bidi panels removed.)*
 
 ### Exit Criteria
-- [ ] Benchmark docs and output are accurate and reproducible.
+- [x] Benchmark docs and output are accurate and reproducible.
 
 ---
 
@@ -678,6 +678,53 @@ Objective: reduce API overlap/confusion and improve maintainability.
 
 ---
 
+## Session Log Entry - S-0011 (WS6 Completion - Measured-Only Benchmark Reporting)
+- Date/Time: 2026-02-16
+- Agent/Owner: GitHub Copilot (GPT-5.3-Codex)
+- Branch/PR: N/A (workspace changes)
+- Workstreams touched: WS6
+- Summary of changes:
+   - Updated benchmark documentation to reflect active SHM+TCP workflow and measured artifact outputs.
+   - Removed estimated/synthetic bidirectional panels from default `benchmark_runner.py` pattern plots.
+   - Extended `RingBench` JSON output metadata with explicit environment details (`os`, OS/process architecture, `ring_capacity_bytes`).
+   - Re-ran benchmark runner end-to-end to regenerate measured artifacts and validate report generation.
+- Risks introduced:
+   - None identified.
+- Next recommended step:
+   - Proceed to WS7 code organization/deprecation cleanup.
+
+### Commands Run
+- Build:
+   - `dotnet build benchmark-shm/ringbench/RingBench.csproj -c Release`
+- Benchmarks:
+   - `run benchmark runner` task (`python benchmark-shm/benchmark_runner.py --run`)
+- Metrics extraction:
+   - PowerShell JSON extraction from `benchmark-shm/out/windows/results.json` for key benchmark tracking entries.
+
+### Results Summary
+- Build: Pass
+- Benchmark: Pass (TCP + SHM completed; `30` unary + `30` streaming measured entries)
+- Key measured comparisons:
+   - Unary 1KB avg latency: TCP `165.791 us`, SHM `89.845 us` (SHM `1.85x` faster)
+   - Streaming 64KB throughput: TCP `406.253 MB/s`, SHM `1025.472 MB/s` (SHM `2.52x` higher)
+   - Streaming 1MB throughput: TCP `271.847 MB/s`, SHM `1183.193 MB/s` (SHM `4.35x` higher)
+   - Streaming 128MB throughput: TCP `380.512 MB/s`, SHM `542.884 MB/s` (SHM `1.43x` higher)
+
+### Artifacts
+- Code changes:
+   - `benchmark-shm/README.md`
+   - `benchmark-shm/benchmark_runner.py`
+   - `benchmark-shm/ringbench/RingBench.cs`
+- Benchmark outputs:
+   - `benchmark-shm/out/windows/results.json`
+   - `benchmark-shm/out/windows/results.csv`
+   - `benchmark-shm/out/windows/benchmark_patterns.png`
+   - `benchmark-shm/out/windows/benchmark_summary.png`
+   - `benchmark-shm/out/windows/benchmark_large_payloads.png`
+   - `benchmark-shm/out/windows/benchmark_consolidated.png`
+
+---
+
 ## Handoff Checklist (Before Agent Stops)
 
 - [ ] Workstream board updated.
@@ -752,6 +799,10 @@ Update after each benchmark-affecting change.
 | 2026-02-16 | N/A (`results.json`) | Streaming 64KB throughput | 330.507 MB/s | 653.774 MB/s | SHM 1.98x higher | No | Post-WS2 run on .NET 10.0.3; fresh scripted benchmark output. |
 | 2026-02-16 | N/A (`results.json`) | Streaming 1MB throughput | 243.844 MB/s | 704.222 MB/s | SHM 2.89x higher | No | Post-WS2 run on .NET 10.0.3; fresh scripted benchmark output. |
 | 2026-02-16 | N/A (`results.json`) | Largest payload throughput (128MB, streaming) | 315.869 MB/s | 354.496 MB/s | SHM 1.12x higher | No | Post-WS2 run on .NET 10.0.3; fresh scripted benchmark output. |
+| 2026-02-16 | N/A (`results.json`) | Unary 1KB avg latency | 165.791 us | 89.845 us | SHM 1.85x faster | No | WS6 measured-only reporting validation run; metadata now records OS/arch/ring capacity. |
+| 2026-02-16 | N/A (`results.json`) | Streaming 64KB throughput | 406.253 MB/s | 1025.472 MB/s | SHM 2.52x higher | No | WS6 measured-only reporting validation run. |
+| 2026-02-16 | N/A (`results.json`) | Streaming 1MB throughput | 271.847 MB/s | 1183.193 MB/s | SHM 4.35x higher | No | WS6 measured-only reporting validation run. |
+| 2026-02-16 | N/A (`results.json`) | Largest payload throughput (128MB, streaming) | 380.512 MB/s | 542.884 MB/s | SHM 1.43x higher | No | WS6 measured-only reporting validation run. |
 
 ---
 

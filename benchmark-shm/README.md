@@ -10,14 +10,14 @@ This directory contains benchmarks comparing gRPC .NET performance over TCP vs s
 ## Quick Start
 
 ```bash
-# Run quick benchmark (TCP only for now)
-./run_benchmarks.sh --quick --transport tcp
+# Build benchmark runner
+dotnet build benchmark-shm/ringbench/RingBench.csproj -c Release
 
-# Run full benchmark suite (TCP only)
-./run_benchmarks.sh --full --transport tcp
+# Run measured SHM+TCP benchmark and generate artifacts
+python benchmark-shm/benchmark_runner.py --run
 
-# Run with specific options
-./run_benchmarks.sh --transport tcp --workload unary --duration 15
+# Re-generate plots from cached measured results only
+python benchmark-shm/benchmark_runner.py --plot-only
 ```
 
 ## Benchmark Types
@@ -54,6 +54,15 @@ This directory contains benchmarks comparing gRPC .NET performance over TCP vs s
 - `benchmark_results_YYYYMMDD_HHMMSS.json` - Raw benchmark data
 - `benchmark_results.json` - Symlink to latest results
 
+### Ringbench Output (`out/<platform>/`)
+
+- `results.json` - Measured benchmark results from `RingBench` (source of truth)
+- `results.csv` - Tabular export of measured results
+- `benchmark_patterns.png` - Measured unary/streaming comparison panels
+- `benchmark_summary.png` - Measured summary dashboard
+- `benchmark_large_payloads.png` - Measured large-payload panels
+- `benchmark_consolidated.png` - Combined measured dashboard
+
 ### Plots Directory (`plots/`)
 
 - `throughput_unary.png` - Throughput comparison for unary RPCs
@@ -73,7 +82,7 @@ This directory contains benchmarks comparing gRPC .NET performance over TCP vs s
 
 ## Requirements
 
-- .NET 8.0 SDK
+- .NET SDK compatible with repo `global.json` (currently .NET 10.x)
 - Python 3 with matplotlib and numpy (for plot generation)
 
 ```bash
@@ -115,6 +124,9 @@ Shared memory transport typically shows:
 - **Lower latency**: 2-10x improvement for small messages
 - **Higher throughput**: 1.5-3x improvement depending on message size
 - **Reduced CPU overhead**: Less system call overhead
+
+Note: Reported charts and summaries in `benchmark_runner.py` are measured-only.
+No synthetic/estimated bidirectional panels are included in default outputs.
 
 The improvement is most pronounced for:
 - Small messages (< 4KB)

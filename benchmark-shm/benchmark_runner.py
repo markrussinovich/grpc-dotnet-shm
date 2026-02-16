@@ -215,7 +215,7 @@ def _safe_number(seq, idx):
 # =========================================================================
 
 def generate_plots(data: dict):
-    """Generate benchmark plots (patterns + summary + large payloads)."""
+    """Generate benchmark plots from measured benchmark data only."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     plt.style.use('default')
@@ -238,7 +238,7 @@ def generate_plots(data: dict):
     # ================================================================
     # Plot 1: Communication Pattern Benchmarks (main dashboard)
     # ================================================================
-    fig, axes = plt.subplots(3, 2, figsize=(14, 14))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
         f'gRPC Shared Memory Transport - Communication Pattern Benchmarks\n'
         f'64 MiB Ring Buffers \u2022 {cpu[:40]}',
@@ -327,41 +327,6 @@ def generate_plots(data: dict):
     else:
         ax.text(0.5, 0.5, 'No streaming data', ha='center', va='center', transform=ax.transAxes)
         ax.set_title('[STREAM] Streaming - Throughput')
-
-    # --- Row 3: Bidirectional Streaming (estimated) ---
-    bidi_overhead = 1.15
-
-    ax = axes[2, 0]
-    if all(v is not None for v in shm_lat + tcp_lat):
-        bidi_shm = [v * 2 * bidi_overhead for v in shm_lat]
-        bidi_tcp = [v * 2 * bidi_overhead for v in tcp_lat]
-        ax.bar(x - width / 2, bidi_shm, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width / 2, bidi_tcp, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Latency (ns)')
-        ax.set_title('[BIDI] Bidirectional Streaming - Latency (est.)\n(lower is better)')
-        ax.set_xticks(x); ax.set_xticklabels(size_labels)
-        ax.legend(loc='upper left')
-        ax.set_yscale('log')
-    else:
-        ax.text(0.5, 0.5, 'No streaming data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('[BIDI] Bidirectional Streaming - Latency')
-
-    ax = axes[2, 1]
-    if all(v is not None for v in shm_tp + tcp_tp):
-        bidi_shm_tp = [v * 0.85 for v in shm_tp]
-        bidi_tcp_tp = [v * 0.80 for v in tcp_tp]
-        ax.bar(x - width / 2, bidi_shm_tp, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width / 2, bidi_tcp_tp, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Throughput (MB/s)')
-        ax.set_title('[BIDI] Bidirectional Streaming - Throughput (est.)\n(higher is better)')
-        ax.set_xticks(x); ax.set_xticklabels(size_labels)
-        ax.legend(loc='upper left')
-        ax.set_yscale('log')
-    else:
-        ax.text(0.5, 0.5, 'No streaming data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('[BIDI] Bidirectional Streaming - Throughput')
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     patterns_file = OUT_DIR / "benchmark_patterns.png"
