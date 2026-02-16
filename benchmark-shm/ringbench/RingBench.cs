@@ -98,6 +98,7 @@ if (profileMode)
 
 string platform = platformOverride
     ?? (OperatingSystem.IsWindows() ? "windows" : OperatingSystem.IsLinux() ? "linux" : "other");
+outDir = ResolveOutputRoot(outDir);
 outDir = Path.Combine(outDir, platform);
 Directory.CreateDirectory(outDir);
 
@@ -593,50 +594,57 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
 
     var server = new ShmGrpcServer(segmentName, ringCapacity: ShmRingCapacityBytes, maxStreams: 2);
 
-    // Pre-cache serialized responses to skip per-request protobuf ser/deser.
-    // This is the key optimization: the SHM raw handler API lets us bypass
-    // ParseFrom (request) and WriteTo (response) entirely.
-    const int maxCachedResponseSize = 16 * 1024 * 1024;
-    var cachedResponses = new Dictionary<int, byte[]>();
-
-    static byte[] SerializeResponse(int size)
+    static ReadOnlyMemory<byte> BuildSerializedResponse(ReadOnlySpan<byte> rawRequest)
     {
-        var response = new SimpleResponse { Payload = MakePayload(size) };
-        var serialized = new byte[response.CalculateSize()];
-        using var cos = new CodedOutputStream(serialized);
-        response.WriteTo(cos);
-        return serialized;
-    }
+        // Parse only the ResponseSize field (field 1, varint) without copying the payload.
+        var request = SimpleRequest.Parser.ParseFrom(rawRequest);
+        int responseSize = request.ResponseSize;
 
-    ReadOnlyMemory<byte> GetCachedResponse(int size)
-    {
-        if (size > maxCachedResponseSize)
+        if (responseSize <= 0)
         {
-            return SerializeResponse(size);
+            // Empty SimpleResponse — zero bytes on the wire.
+            return ReadOnlyMemory<byte>.Empty;
         }
 
-        if (!cachedResponses.TryGetValue(size, out var cached))
-        {
-            cached = SerializeResponse(size);
-            cachedResponses[size] = cached;
-        }
-        return cached;
+        // Build the wire-format directly: SimpleResponse { Payload { Body = bytes } }
+        // This avoids an extra allocation + memcpy that the typed TCP path doesn't pay.
+        //
+        // Wire layout:
+        //   field 1 (Payload) = tag 0x0A, length-delimited
+        //     field 1 (Body)  = tag 0x0A, length-delimited, <responseSize zero bytes>
+        var bodyTag = 1;          // field 1 = Body (bytes)
+        var bodyTagByte = (byte)((bodyTag << 3) | 2); // wire type 2 = length-delimited
+        int bodyHeaderSize = 1 + CodedOutputStream.ComputeRawVarint32Size((uint)responseSize);
+        int innerPayloadSize = bodyHeaderSize + responseSize;
+
+        var payloadTag = 1;      // field 1 = Payload (message)
+        var payloadTagByte = (byte)((payloadTag << 3) | 2);
+        int payloadHeaderSize = 1 + CodedOutputStream.ComputeRawVarint32Size((uint)innerPayloadSize);
+
+        int totalSize = payloadHeaderSize + innerPayloadSize;
+        var buffer = new byte[totalSize];
+        var cos = new CodedOutputStream(buffer);
+        cos.WriteTag(payloadTagByte);
+        cos.WriteLength(innerPayloadSize);
+        cos.WriteTag(bodyTagByte);
+        cos.WriteLength(responseSize);
+        // Body bytes are already zeroed (new byte[]).
+        cos.Flush();
+        return buffer;
     }
 
     server.MapUnaryRaw(
         "/grpc.testing.BenchmarkService/UnaryCall",
         (rawRequest, _) =>
         {
-            int responseSize = ExtractResponseSize(rawRequest.Span);
-            return Task.FromResult(GetCachedResponse(responseSize));
+            return Task.FromResult(BuildSerializedResponse(rawRequest.Span));
         });
 
     server.MapDuplexStreamingRaw(
         "/grpc.testing.BenchmarkService/StreamingCall",
         (rawRequest, ct) =>
         {
-            int responseSize = ExtractResponseSize(rawRequest.Span);
-            return new ValueTask<ReadOnlyMemory<byte>>(GetCachedResponse(responseSize));
+            return new ValueTask<ReadOnlyMemory<byte>>(BuildSerializedResponse(rawRequest.Span));
         });
 
     Console.WriteLine($"[SERVER] SHM ready on segment: {segmentName}");
@@ -990,9 +998,9 @@ static int IterationsForSize(int size) => size switch
     <= 2097152 => 80,
     <= 4194304 => 40,
     <= 16777216 => 20,
-    <= 33554432 => 4,
-    <= 67108864 => 2,
-    _ => 1
+    <= 33554432 => 10,
+    <= 67108864 => 6,
+    _ => 4
 };
 
 // ============================================================================
@@ -1029,18 +1037,69 @@ static string GetCpuInfo()
     return Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER") ?? "Unknown";
 }
 
+static string? FindRepoRoot(string startPath)
+{
+    var current = new DirectoryInfo(startPath);
+    while (current != null)
+    {
+        var hasGlobalJson = File.Exists(Path.Combine(current.FullName, "global.json"));
+        if (hasGlobalJson)
+        {
+            return current.FullName;
+        }
+
+        current = current.Parent;
+    }
+
+    return null;
+}
+
+static string ResolveOutputRoot(string requestedOutDir)
+{
+    if (Path.IsPathRooted(requestedOutDir))
+    {
+        return Path.GetFullPath(requestedOutDir);
+    }
+
+    var fromCwd = FindRepoRoot(Directory.GetCurrentDirectory());
+    if (fromCwd != null)
+    {
+        return Path.GetFullPath(requestedOutDir, fromCwd);
+    }
+
+    var baseDir = AppContext.BaseDirectory;
+    var fromBaseDir = FindRepoRoot(baseDir);
+    if (fromBaseDir != null)
+    {
+        return Path.GetFullPath(requestedOutDir, fromBaseDir);
+    }
+
+    return Path.GetFullPath(requestedOutDir, Directory.GetCurrentDirectory());
+}
+
 static void TryGenerateRunnerPlots()
 {
-    var scriptPath = Path.Combine("benchmark-shm", "benchmark_runner.py");
+    // Resolve paths relative to the repo root, not CWD (which may be the project dir).
+    var repoRoot = FindRepoRoot(Directory.GetCurrentDirectory())
+                ?? FindRepoRoot(AppContext.BaseDirectory);
+
+    var scriptPath = repoRoot != null
+        ? Path.Combine(repoRoot, "benchmark-shm", "benchmark_runner.py")
+        : Path.Combine("benchmark-shm", "benchmark_runner.py");
+
     if (!File.Exists(scriptPath))
     {
-        Console.WriteLine("Plot generation skipped: benchmark_runner.py not found.");
+        Console.WriteLine($"Plot generation skipped: benchmark_runner.py not found at {scriptPath}");
         return;
     }
 
+    var venvPython = repoRoot != null
+        ? Path.Combine(repoRoot, ".venv", "Scripts", "python.exe")
+        : Path.Combine(".venv", "Scripts", "python.exe");
+
     var pythonCandidates = new[]
     {
-        Path.Combine(".venv", "Scripts", "python.exe"),
+        venvPython,
         "python",
         "py"
     };
@@ -1060,7 +1119,8 @@ static void TryGenerateRunnerPlots()
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                WorkingDirectory = repoRoot ?? Directory.GetCurrentDirectory()
             };
 
             using var process = Process.Start(psi);

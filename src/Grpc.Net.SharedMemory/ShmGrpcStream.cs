@@ -17,6 +17,7 @@
 #endregion
 
 using System.Buffers.Binary;
+using System.Buffers;
 using System.Threading.Channels;
 using Grpc.Core;
 
@@ -511,17 +512,20 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     break;
 
                 case FrameType.HalfClose:
+                    FlushPendingWindowUpdate();
                     f.ReturnToPool();
                     _halfCloseReceived = true;
                     yield break;
 
                 case FrameType.Trailers:
+                    FlushPendingWindowUpdate();
                     _trailers = TrailersV1.Decode(f.Memory.Span);
                     f.ReturnToPool();
                     _halfCloseReceived = true;
                     yield break;
 
                 case FrameType.Cancel:
+                    FlushPendingWindowUpdate();
                     f.ReturnToPool();
                     _cancelled = true;
                     yield break;
@@ -543,7 +547,31 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal async IAsyncEnumerable<ReadOnlyMemory<byte>> ReceiveMessageBuffersAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         InboundFrame previousFrame = default;
-        MemoryStream? messageAccumulator = null;
+        byte[]? messageAccumulator = null;
+        var messageAccumulatorLength = 0;
+
+        static byte[] EnsureAccumulatorCapacity(byte[]? current, int existingLength, int neededLength)
+        {
+            if (current != null && current.Length >= neededLength)
+            {
+                return current;
+            }
+
+            var newCapacity = current == null ? 1024 : current.Length;
+            while (newCapacity < neededLength)
+            {
+                newCapacity *= 2;
+            }
+
+            var next = ArrayPool<byte>.Shared.Rent(newCapacity);
+            if (current != null)
+            {
+                current.AsSpan(0, existingLength).CopyTo(next);
+                ArrayPool<byte>.Shared.Return(current);
+            }
+            return next;
+        }
+
         try
         {
             while (true)
@@ -573,22 +601,31 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
                         if ((f.Flags & MessageFlags.More) != 0)
                         {
-                            messageAccumulator ??= new MemoryStream();
-                            messageAccumulator.Write(f.Memory.Span);
+                            var nextLength = messageAccumulatorLength + f.Length;
+                            var priorLength = messageAccumulatorLength;
+                            messageAccumulator = EnsureAccumulatorCapacity(messageAccumulator, priorLength, nextLength);
+                            f.Memory.Span.CopyTo(messageAccumulator.AsSpan(priorLength, f.Length));
+                            messageAccumulatorLength = nextLength;
                             f.ReturnToPool();
                             break;
                         }
 
                         if (messageAccumulator != null)
                         {
-                            messageAccumulator.Write(f.Memory.Span);
+                            var nextLength = messageAccumulatorLength + f.Length;
+                            var priorLength = messageAccumulatorLength;
+                            messageAccumulator = EnsureAccumulatorCapacity(messageAccumulator, priorLength, nextLength);
+                            f.Memory.Span.CopyTo(messageAccumulator.AsSpan(priorLength, f.Length));
+                            messageAccumulatorLength = nextLength;
                             f.ReturnToPool();
 
                             // Returning accumulated payload as owned memory avoids
                             // lifetime issues while still preventing many intermediate copies.
                             previousFrame.ReturnToPool();
-                            yield return messageAccumulator.ToArray();
-                            messageAccumulator.SetLength(0);
+                            var owned = new byte[messageAccumulatorLength];
+                            messageAccumulator.AsSpan(0, messageAccumulatorLength).CopyTo(owned);
+                            yield return owned;
+                            messageAccumulatorLength = 0;
                             break;
                         }
 
@@ -601,17 +638,20 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         break;
 
                     case FrameType.HalfClose:
+                        FlushPendingWindowUpdate();
                         f.ReturnToPool();
                         _halfCloseReceived = true;
                         yield break;
 
                     case FrameType.Trailers:
+                        FlushPendingWindowUpdate();
                         _trailers = TrailersV1.Decode(f.Memory.Span);
                         f.ReturnToPool();
                         _halfCloseReceived = true;
                         yield break;
 
                     case FrameType.Cancel:
+                        FlushPendingWindowUpdate();
                         f.ReturnToPool();
                         _cancelled = true;
                         yield break;
@@ -624,8 +664,27 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
         finally
         {
+            FlushPendingWindowUpdate();
             previousFrame.ReturnToPool();
+            if (messageAccumulator != null)
+            {
+                ArrayPool<byte>.Shared.Return(messageAccumulator);
+            }
         }
+    }
+
+    private void FlushPendingWindowUpdate()
+    {
+        var pending = _inFlowUnacked;
+        if (pending == 0)
+        {
+            return;
+        }
+
+        Span<byte> windowUpdate = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, pending);
+        _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
+        _inFlowUnacked = 0;
     }
 
     internal void OnFrameReceived(InboundFrame frame)

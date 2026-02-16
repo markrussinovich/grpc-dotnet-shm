@@ -134,7 +134,7 @@ def extract_data(results: dict) -> dict:
     rt_labels = [format_size(s) for s in rt_sizes]
 
     # Large payload sizes  (Go: 1MB-256MB; .NET: 1MB-128MB)
-    large_sizes = [1048576, 2097152, 4194304, 16777216]
+    large_sizes = [1048576, 2097152, 4194304, 16777216, 33554432, 67108864, 134217728]
     large_size_labels = [format_size(s) for s in large_sizes]
 
     # --- Helpers ---
@@ -946,7 +946,8 @@ def generate_consolidated_plot(data: dict):
     tcp_rt = data["tcp_rt_latency"]
     if (_has_numeric(shm_lat) and _has_numeric(tcp_lat)
             and _has_numeric(shm_rt) and _has_numeric(tcp_rt)):
-        categories = ['Unary\n(1KB)', 'Stream\n(1MB)', 'Large Stream\n(16MB)', 'Large Unary\n(16MB)']
+        large_label = large_labels[-1] if large_labels else 'N/A'
+        categories = ['Unary\n(1KB)', 'Stream\n(1MB)', f'Large Stream\n({large_label})', f'Large Unary\n({large_label})']
         speedups_tcp = []
 
         # Unary 1KB (index 1 in rt_sizes)
@@ -959,14 +960,15 @@ def generate_consolidated_plot(data: dict):
         s_tcp = _safe_number(tcp_lat, len(tcp_lat) - 1)
         speedups_tcp.append(s_tcp / s_shm if s_shm and s_tcp else 0)
 
-        # Large Stream 16MB (index 3 in large_sizes)
-        ls_shm = _safe_number(shm_large_stream_lat, 3)
-        ls_tcp = _safe_number(tcp_large_stream_lat, 3)
+        # Largest configured large size
+        large_idx = len(shm_large_stream_lat) - 1
+        ls_shm = _safe_number(shm_large_stream_lat, large_idx)
+        ls_tcp = _safe_number(tcp_large_stream_lat, large_idx)
         speedups_tcp.append(ls_tcp / ls_shm if ls_shm and ls_tcp else 0)
 
-        # Large Unary 16MB (index 3 in large_sizes)
-        lu_shm = _safe_number(shm_large_rt_lat, 3)
-        lu_tcp = _safe_number(tcp_large_rt_lat, 3)
+        # Largest configured large size
+        lu_shm = _safe_number(shm_large_rt_lat, large_idx)
+        lu_tcp = _safe_number(tcp_large_rt_lat, large_idx)
         speedups_tcp.append(lu_tcp / lu_shm if lu_shm and lu_tcp else 0)
 
         if any(v > 0 for v in speedups_tcp):
@@ -1020,17 +1022,21 @@ def generate_consolidated_plot(data: dict):
             f"STREAMING (1KB):         SHM: {shm_lat[1]:.0f} ns    TCP: {tcp_lat[1]:.0f} ns    "
             f"Speedup: {stream_speedup:.1f}x vs TCP")
 
-    if valid_stream_idx and 3 in valid_stream_idx:
-        shm_v = shm_large_stream_tp[3] / 1000
-        tcp_v = (tcp_large_stream_tp[3] or 0) / 1000
-        summary_lines.append(
-            f"STREAMING (16MB):        SHM: {shm_v:.1f} GB/s    TCP: {tcp_v:.2f} GB/s")
+    largest_stream_idx = max(valid_stream_idx) if valid_stream_idx else None
+    largest_rt_idx = max(valid_rt_idx) if valid_rt_idx else None
+    largest_size_label = large_labels[-1] if large_labels else "N/A"
 
-    if valid_rt_idx and 3 in valid_rt_idx:
-        shm_v = shm_large_rt_tp[3] / 1000
-        tcp_v = (tcp_large_rt_tp[3] or 0) / 1000
+    if largest_stream_idx is not None:
+        shm_v = shm_large_stream_tp[largest_stream_idx] / 1000
+        tcp_v = (tcp_large_stream_tp[largest_stream_idx] or 0) / 1000
         summary_lines.append(
-            f"UNARY RPC (16MB):        SHM: {shm_v:.1f} GB/s    TCP: {tcp_v:.2f} GB/s")
+            f"STREAMING ({largest_size_label}):        SHM: {shm_v:.1f} GB/s    TCP: {tcp_v:.2f} GB/s")
+
+    if largest_rt_idx is not None:
+        shm_v = shm_large_rt_tp[largest_rt_idx] / 1000
+        tcp_v = (tcp_large_rt_tp[largest_rt_idx] or 0) / 1000
+        summary_lines.append(
+            f"UNARY RPC ({largest_size_label}):        SHM: {shm_v:.1f} GB/s    TCP: {tcp_v:.2f} GB/s")
 
     summary_lines.extend(["", f"CPU: {cpu_full}    Runtime: {runtime}    Ring Buffer: 64 MiB", "\u2550" * 120])
 
@@ -1105,7 +1111,7 @@ Examples:
     print("=" * 70)
     for f in plot_files:
         print(f"  {f}")
-    print(f"  {consolidated_file}  \u2190 CONSOLIDATED (all data)")
+    print(f"  {consolidated_file}  <- CONSOLIDATED (all data)")
     print(f"\nConsolidated plot: {consolidated_file}")
 
     return 0
