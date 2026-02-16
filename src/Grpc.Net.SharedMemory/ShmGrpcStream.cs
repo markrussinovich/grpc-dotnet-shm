@@ -619,12 +619,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                             messageAccumulatorLength = nextLength;
                             f.ReturnToPool();
 
-                            // Returning accumulated payload as owned memory avoids
-                            // lifetime issues while still preventing many intermediate copies.
+                            // Yield direct slice of the accumulator — valid until
+                            // next MoveNextAsync per the ReceiveMessageBuffersAsync contract.
                             previousFrame.ReturnToPool();
-                            var owned = new byte[messageAccumulatorLength];
-                            messageAccumulator.AsSpan(0, messageAccumulatorLength).CopyTo(owned);
-                            yield return owned;
+                            yield return new ReadOnlyMemory<byte>(messageAccumulator, 0, messageAccumulatorLength);
                             messageAccumulatorLength = 0;
                             break;
                         }

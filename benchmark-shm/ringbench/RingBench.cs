@@ -594,21 +594,24 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
 
     var server = new ShmGrpcServer(segmentName, ringCapacity: ShmRingCapacityBytes, maxStreams: 2);
 
-    static ReadOnlyMemory<byte> BuildSerializedResponse(ReadOnlySpan<byte> rawRequest)
+    // Reusable response buffer to avoid LOH allocations per RPC.
+    // At 128MB, new byte[] every call triggers Gen2 GC pauses.
+    // Safe because the SHM server processes one unary/streaming RPC at a time
+    // per stream, and the buffer is fully consumed before the next call.
+    byte[]? _cachedResponseBuffer = null;
+
+    (byte[] buffer, int length) BuildSerializedResponse(ReadOnlySpan<byte> rawRequest)
     {
-        // Parse only the ResponseSize field (field 1, varint) without copying the payload.
-        var request = SimpleRequest.Parser.ParseFrom(rawRequest);
-        int responseSize = request.ResponseSize;
+        // Extract only the ResponseSize field without full protobuf deserialization.
+        // At 128MB this avoids parsing the entire payload body just for a 4-byte int.
+        int responseSize = ExtractResponseSize(rawRequest);
 
         if (responseSize <= 0)
         {
-            // Empty SimpleResponse — zero bytes on the wire.
-            return ReadOnlyMemory<byte>.Empty;
+            return (Array.Empty<byte>(), 0);
         }
 
         // Build the wire-format directly: SimpleResponse { Payload { Body = bytes } }
-        // This avoids an extra allocation + memcpy that the typed TCP path doesn't pay.
-        //
         // Wire layout:
         //   field 1 (Payload) = tag 0x0A, length-delimited
         //     field 1 (Body)  = tag 0x0A, length-delimited, <responseSize zero bytes>
@@ -622,29 +625,41 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
         int payloadHeaderSize = 1 + CodedOutputStream.ComputeRawVarint32Size((uint)innerPayloadSize);
 
         int totalSize = payloadHeaderSize + innerPayloadSize;
-        var buffer = new byte[totalSize];
-        var cos = new CodedOutputStream(buffer);
+
+        // Reuse the cached buffer if large enough; otherwise allocate once and cache.
+        if (_cachedResponseBuffer == null || _cachedResponseBuffer.Length < totalSize)
+        {
+            _cachedResponseBuffer = new byte[totalSize];
+        }
+        else
+        {
+            // Zero the body region — reused buffer may have stale data.
+            _cachedResponseBuffer.AsSpan(0, totalSize).Clear();
+        }
+
+        var cos = new CodedOutputStream(_cachedResponseBuffer);
         cos.WriteTag(payloadTagByte);
         cos.WriteLength(innerPayloadSize);
         cos.WriteTag(bodyTagByte);
         cos.WriteLength(responseSize);
-        // Body bytes are already zeroed (new byte[]).
         cos.Flush();
-        return buffer;
+        return (_cachedResponseBuffer, totalSize);
     }
 
     server.MapUnaryRaw(
         "/grpc.testing.BenchmarkService/UnaryCall",
         (rawRequest, _) =>
         {
-            return Task.FromResult(BuildSerializedResponse(rawRequest.Span));
+            var (buf, len) = BuildSerializedResponse(rawRequest.Span);
+            return Task.FromResult<ReadOnlyMemory<byte>>(new ReadOnlyMemory<byte>(buf, 0, len));
         });
 
     server.MapDuplexStreamingRaw(
         "/grpc.testing.BenchmarkService/StreamingCall",
         (rawRequest, ct) =>
         {
-            return new ValueTask<ReadOnlyMemory<byte>>(BuildSerializedResponse(rawRequest.Span));
+            var (buf, len) = BuildSerializedResponse(rawRequest.Span);
+            return new ValueTask<ReadOnlyMemory<byte>>(new ReadOnlyMemory<byte>(buf, 0, len));
         });
 
     Console.WriteLine($"[SERVER] SHM ready on segment: {segmentName}");

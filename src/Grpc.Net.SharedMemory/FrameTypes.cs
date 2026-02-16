@@ -163,12 +163,14 @@ public static class ShmConstants
 
     /// <summary>
     /// Initial flow-control window size.
-    /// HTTP/2 over TCP uses 65 535, but shared memory is a local, high-bandwidth
-    /// transport so we use 32 MiB. Messages larger than the window are
-    /// automatically chunked by the flow-control layer in ShmGrpcStream,
-    /// so the window does not limit the maximum message size.
+    /// Shared memory is a local, high-bandwidth transport where the ring buffer
+    /// itself provides natural backpressure via WaitForSpace. A large window
+    /// avoids stop-and-wait stalls for bulk transfers: a 32 MiB window forces
+    /// 4 round-trip window-update cycles for a 128 MB message, each adding
+    /// async wait + kernel event overhead. Setting the window to 1 GiB
+    /// effectively delegates flow control to the ring.
     /// </summary>
-    public const int InitialWindowSize = 32 * 1024 * 1024;
+    public const int InitialWindowSize = 1024 * 1024 * 1024; // 1 GiB
 
     /// <summary>Maximum window size.</summary>
     public const int MaxWindowSize = int.MaxValue;

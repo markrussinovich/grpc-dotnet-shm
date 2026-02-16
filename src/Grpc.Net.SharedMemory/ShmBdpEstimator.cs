@@ -35,9 +35,11 @@ namespace Grpc.Net.SharedMemory;
 public sealed class ShmBdpEstimator
 {
     /// <summary>
-    /// Maximum BDP limit (32 MiB), matching InitialWindowSize.
+    /// Maximum BDP limit (1 GiB), matching InitialWindowSize.
+    /// For shared memory the ring buffer provides natural backpressure,
+    /// so the BDP estimator quickly settles at this limit.
     /// </summary>
-    public const uint BdpLimit = (1 << 20) * 32;
+    public const uint BdpLimit = 1024u * 1024 * 1024;
 
     /// <summary>
     /// Smoothing factor for RTT estimation (exponential moving average).
