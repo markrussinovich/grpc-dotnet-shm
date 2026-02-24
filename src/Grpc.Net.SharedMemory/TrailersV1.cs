@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
 using Grpc.Core;
@@ -43,7 +44,7 @@ public sealed class TrailersV1
     /// <summary>
     /// Encodes this trailers payload to a byte array.
     /// </summary>
-    public byte[] Encode()
+    public (byte[] Buffer, int Length) Encode()
     {
         var statusMsgLength = GrpcStatusMessage != null ? Encoding.UTF8.GetByteCount(GrpcStatusMessage) : 0;
 
@@ -60,7 +61,7 @@ public sealed class TrailersV1
             }
         }
 
-        var buffer = new byte[size];
+        var buffer = ArrayPool<byte>.Shared.Rent(size);
         var offset = 0;
 
         // Version
@@ -107,7 +108,7 @@ public sealed class TrailersV1
             }
         }
 
-        return buffer;
+        return (buffer, size);
     }
 
     /// <summary>

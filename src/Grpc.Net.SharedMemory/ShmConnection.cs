@@ -592,8 +592,15 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 GrpcStatusCode = Grpc.Core.StatusCode.Unavailable,
                 GrpcStatusMessage = message
             };
-            var trailersPayload = trailers.Encode();
-            SendFrame(FrameType.Trailers, streamId, 0, trailersPayload);
+            var (trailersPayload, trailersLen) = trailers.Encode();
+            try
+            {
+                SendFrame(FrameType.Trailers, streamId, 0, trailersPayload.AsSpan(0, trailersLen));
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(trailersPayload);
+            }
         }
         catch
         {

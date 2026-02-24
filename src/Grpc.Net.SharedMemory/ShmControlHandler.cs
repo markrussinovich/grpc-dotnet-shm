@@ -265,7 +265,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
     private static Metadata? ExtractMetadata(HttpRequestHeaders headers)
     {
-        var metadata = new Metadata();
+        Metadata? metadata = null;
 
         foreach (var header in headers)
         {
@@ -282,6 +282,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
             foreach (var value in header.Value)
             {
+                metadata ??= new Metadata();
                 if (header.Key.EndsWith("-bin", StringComparison.OrdinalIgnoreCase))
                 {
                     // Binary metadata
@@ -294,7 +295,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
             }
         }
 
-        return metadata.Count > 0 ? metadata : null;
+        return metadata;
     }
 
     private static DateTime? ExtractDeadline(HttpRequestHeaders headers)

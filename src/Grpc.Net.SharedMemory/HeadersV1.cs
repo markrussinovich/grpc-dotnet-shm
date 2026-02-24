@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
 
@@ -77,7 +78,7 @@ public sealed class HeadersV1
     /// <summary>
     /// Encodes this headers payload to a byte array.
     /// </summary>
-    public byte[] Encode()
+    public (byte[] Buffer, int Length) Encode()
     {
         // Calculate size
         var methodLength = HeaderType == 0 && Method != null ? Encoding.UTF8.GetByteCount(Method) : 0;
@@ -100,7 +101,7 @@ public sealed class HeadersV1
             }
         }
 
-        var buffer = new byte[size];
+        var buffer = ArrayPool<byte>.Shared.Rent(size);
         var offset = 0;
 
         // Version
@@ -167,7 +168,7 @@ public sealed class HeadersV1
             }
         }
 
-        return buffer;
+        return (buffer, size);
     }
 
     /// <summary>

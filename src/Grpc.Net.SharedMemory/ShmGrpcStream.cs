@@ -69,7 +69,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private readonly ShmConnection _connection;
     private readonly Channel<InboundFrame> _inboundFrames;
     private readonly CancellationTokenSource _disposeCts;
-    private readonly SemaphoreSlim _sendWindowSignal;
+    private SemaphoreSlim? _sendWindowSignal;
 
     private HeadersV1? _requestHeaders;
     private HeadersV1? _responseHeaders;
@@ -137,7 +137,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             SingleWriter = true
         });
         _disposeCts = new CancellationTokenSource();
-        _sendWindowSignal = new SemaphoreSlim(0, int.MaxValue);
         _sendWindow = ShmConstants.InitialWindowSize;
     }
 
@@ -172,8 +171,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var payload = _requestHeaders.Encode();
-        await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial, payload);
+        var (reqHdrBuf, reqHdrLen) = _requestHeaders.Encode();
+        try
+        {
+            await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial, new ReadOnlyMemory<byte>(reqHdrBuf, 0, reqHdrLen));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(reqHdrBuf);
+        }
     }
 
     /// <summary>
@@ -198,13 +204,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var headersPayload = _requestHeaders.Encode();
-
+        var (headersPayload, headersLen) = _requestHeaders.Encode();
+        try
+        {
         _connection.SendFramesBatch(
             StreamId,
-            FrameType.Headers, HeadersFlags.Initial, headersPayload,
+            FrameType.Headers, HeadersFlags.Initial, headersPayload.AsSpan(0, headersLen),
             messagePayload,
             FrameType.HalfClose, 0, ReadOnlySpan<byte>.Empty);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(headersPayload);
+        }
 
         _halfCloseSent = true;
     }
@@ -227,8 +239,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var payload = _responseHeaders.Encode();
-        await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial, payload);
+        var (respHdrBuf, respHdrLen) = _responseHeaders.Encode();
+        try
+        {
+            await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial, new ReadOnlyMemory<byte>(respHdrBuf, 0, respHdrLen));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(respHdrBuf);
+        }
     }
 
     /// <summary>
@@ -264,14 +283,16 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             var currentWindow = Interlocked.Read(ref _sendWindow);
             if (currentWindow <= 0)
             {
-                await _sendWindowSignal.WaitAsync(cancellationToken);
+                LazyInitializer.EnsureInitialized(ref _sendWindowSignal, static () => new SemaphoreSlim(0, int.MaxValue));
+                await _sendWindowSignal!.WaitAsync(cancellationToken);
                 continue;
             }
 
             var chunkLength = (int)Math.Min((long)remaining.Length, Math.Min(currentWindow, maxFramePayload));
             if (chunkLength <= 0)
             {
-                await _sendWindowSignal.WaitAsync(cancellationToken);
+                LazyInitializer.EnsureInitialized(ref _sendWindowSignal, static () => new SemaphoreSlim(0, int.MaxValue));
+                await _sendWindowSignal!.WaitAsync(cancellationToken);
                 continue;
             }
 
@@ -302,8 +323,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var payload = _trailers.Encode();
-        await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream, payload);
+        var (trlBuf, trlLen) = _trailers.Encode();
+        try
+        {
+            await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream, new ReadOnlyMemory<byte>(trlBuf, 0, trlLen));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(trlBuf);
+        }
         _halfCloseSent = true;
 
         // Auto-remove from connection so the stream slot is freed.
@@ -334,13 +362,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             GrpcStatusMessage = statusMessage,
             Metadata = ConvertMetadata(metadata)
         };
-        var trailersPayload = _trailers.Encode();
-
+        var (trailersPayload, trailersLen) = _trailers.Encode();
+        try
+        {
         _connection.SendFramesBatch(
             StreamId,
             FrameType.Headers, HeadersFlags.Initial, responseHeadersPayload,
             messagePayload,
-            FrameType.Trailers, TrailersFlags.EndStream, trailersPayload);
+            FrameType.Trailers, TrailersFlags.EndStream, trailersPayload.AsSpan(0, trailersLen));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(trailersPayload);
+        }
 
         _halfCloseSent = true;
         _connection.RemoveStream(StreamId);
@@ -779,7 +813,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             try
             {
-                _sendWindowSignal.Release();
+                _sendWindowSignal?.Release();
             }
             catch (ObjectDisposedException)
             {
@@ -842,7 +876,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             _disposeCts.Cancel();
             _inboundFrames.Writer.TryComplete();
             _connection.RemoveStream(StreamId);
-            _sendWindowSignal.Dispose();
+            _sendWindowSignal?.Dispose();
             _disposeCts.Dispose();
         }
     }

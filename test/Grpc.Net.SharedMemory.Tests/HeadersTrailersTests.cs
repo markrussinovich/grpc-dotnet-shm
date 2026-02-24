@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using Grpc.Core;
 using NUnit.Framework;
 
@@ -44,8 +45,9 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = headers.Encode();
-        var decoded = HeadersV1.Decode(encoded);
+        var (encBuf, encLen) = headers.Encode();
+        var decoded = HeadersV1.Decode(encBuf.AsSpan(0, encLen));
+        ArrayPool<byte>.Shared.Return(encBuf);
 
         // Assert
         Assert.That(decoded.Version, Is.EqualTo(1));
@@ -75,8 +77,9 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = headers.Encode();
-        var decoded = HeadersV1.Decode(encoded);
+        var (encBuf, encLen) = headers.Encode();
+        var decoded = HeadersV1.Decode(encBuf.AsSpan(0, encLen));
+        ArrayPool<byte>.Shared.Return(encBuf);
 
         // Assert
         Assert.That(decoded.Version, Is.EqualTo(1));
@@ -98,8 +101,9 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = headers.Encode();
-        var decoded = HeadersV1.Decode(encoded);
+        var (encBuf, encLen) = headers.Encode();
+        var decoded = HeadersV1.Decode(encBuf.AsSpan(0, encLen));
+        ArrayPool<byte>.Shared.Return(encBuf);
 
         // Assert
         Assert.That(decoded.Metadata.Count, Is.EqualTo(0));
@@ -122,8 +126,9 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = headers.Encode();
-        var decoded = HeadersV1.Decode(encoded);
+        var (encBuf, encLen) = headers.Encode();
+        var decoded = HeadersV1.Decode(encBuf.AsSpan(0, encLen));
+        ArrayPool<byte>.Shared.Return(encBuf);
 
         // Assert
         Assert.That(decoded.Metadata[0].Values[0], Is.EqualTo(binaryValue));
@@ -142,8 +147,9 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = trailers.Encode();
-        var decoded = TrailersV1.Decode(encoded);
+        var (encBuf, encLen) = trailers.Encode();
+        var decoded = TrailersV1.Decode(encBuf.AsSpan(0, encLen));
+        ArrayPool<byte>.Shared.Return(encBuf);
 
         // Assert
         Assert.That(decoded.Version, Is.EqualTo(1));
@@ -167,8 +173,9 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = trailers.Encode();
-        var decoded = TrailersV1.Decode(encoded);
+        var (encBuf, encLen) = trailers.Encode();
+        var decoded = TrailersV1.Decode(encBuf.AsSpan(0, encLen));
+        ArrayPool<byte>.Shared.Return(encBuf);
 
         // Assert
         Assert.That(decoded.Version, Is.EqualTo(1));
@@ -210,8 +217,9 @@ public class HeadersTrailersTests
                 GrpcStatusMessage = $"Status: {code}"
             };
 
-            var encoded = trailers.Encode();
-            var decoded = TrailersV1.Decode(encoded);
+            var (encBuf, encLen) = trailers.Encode();
+            var decoded = TrailersV1.Decode(encBuf.AsSpan(0, encLen));
+            ArrayPool<byte>.Shared.Return(encBuf);
 
             Assert.That(decoded.GrpcStatusCode, Is.EqualTo(code), $"Failed for status code {code}");
         }
@@ -233,8 +241,9 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = trailers.Encode();
-        var decoded = TrailersV1.Decode(encoded);
+        var (encBuf, encLen) = trailers.Encode();
+        var decoded = TrailersV1.Decode(encBuf.AsSpan(0, encLen));
+        ArrayPool<byte>.Shared.Return(encBuf);
 
         // Assert
         Assert.That(decoded.Metadata.Count, Is.EqualTo(3));

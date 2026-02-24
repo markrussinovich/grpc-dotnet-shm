@@ -343,7 +343,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // Batch response: headers + message + trailers in a single lock
             // acquisition, cutting per-RPC lock overhead from 3 to 1.
             var responseHeadersV1 = new HeadersV1 { Version = 1, HeaderType = 1 };
-            var headersPayload = responseHeadersV1.Encode();
+            var (hdBuf, hdLen) = responseHeadersV1.Encode();
 
             var msgSize = response.CalculateSize();
             var msgBuffer = msgSize > 0 ? ArrayPool<byte>.Shared.Rent(msgSize) : Array.Empty<byte>();
@@ -356,13 +356,14 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 }
 
                 stream.SendUnaryResponseBatch(
-                    headersPayload,
+                    hdBuf.AsSpan(0, hdLen),
                     msgBuffer.AsSpan(0, msgSize),
                     context.Status.StatusCode,
                     context.Status.Detail);
             }
             finally
             {
+                ArrayPool<byte>.Shared.Return(hdBuf);
                 if (msgSize > 0) ArrayPool<byte>.Shared.Return(msgBuffer);
             }
         }
@@ -469,13 +470,19 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
             // Batch response: headers + raw message bytes + trailers
             var responseHeadersV1 = new HeadersV1 { Version = 1, HeaderType = 1 };
-            var headersPayload = responseHeadersV1.Encode();
-
-            stream.SendUnaryResponseBatch(
-                headersPayload,
-                rawResponse.Span,
-                context.Status.StatusCode,
-                context.Status.Detail);
+            var (hdBuf, hdLen) = responseHeadersV1.Encode();
+            try
+            {
+                stream.SendUnaryResponseBatch(
+                    hdBuf.AsSpan(0, hdLen),
+                    rawResponse.Span,
+                    context.Status.StatusCode,
+                    context.Status.Detail);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(hdBuf);
+            }
         }
     }
 

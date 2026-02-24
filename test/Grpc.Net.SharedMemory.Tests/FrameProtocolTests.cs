@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using NUnit.Framework;
 
 namespace Grpc.Net.SharedMemory.Tests;
@@ -30,7 +31,7 @@ public class FrameProtocolTests
         var name = $"grpc_test_{Guid.NewGuid():N}";
         using var seg = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
 
-        var headersPayload = new HeadersV1
+        var (hdBuf, hdLen) = new HeadersV1
         {
             Version = 1,
             HeaderType = 0,
@@ -39,10 +40,10 @@ public class FrameProtocolTests
             Metadata = Array.Empty<MetadataKV>()
         }.Encode();
 
-        var header = new FrameHeader(FrameType.Headers, streamId: 1, length: (uint)headersPayload.Length, flags: HeadersFlags.Initial);
+        var header = new FrameHeader(FrameType.Headers, streamId: 1, length: (uint)hdLen, flags: HeadersFlags.Initial);
 
         // Act
-        FrameProtocol.WriteFrame(seg.RingA, header, headersPayload.AsSpan());
+        FrameProtocol.WriteFrame(seg.RingA, header, hdBuf.AsSpan(0, hdLen));
 
         // Read the frame
         var (readHeader, payload) = FrameProtocol.ReadFrame(seg.RingA);
@@ -50,11 +51,12 @@ public class FrameProtocolTests
         // Assert
         Assert.That(readHeader.Type, Is.EqualTo(FrameType.Headers));
         Assert.That(readHeader.StreamId, Is.EqualTo(1));
-        Assert.That(payload.Length, Is.EqualTo(headersPayload.Length));
+        Assert.That(payload.Length, Is.EqualTo(hdLen));
 
         // Verify headers decode
         var decoded = HeadersV1.Decode(payload);
         Assert.That(decoded.Method, Is.EqualTo("/test/Method"));
+        ArrayPool<byte>.Shared.Return(hdBuf);
     }
 
     [Test]
@@ -89,17 +91,17 @@ public class FrameProtocolTests
         var name = $"grpc_test_{Guid.NewGuid():N}";
         using var seg = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
 
-        var trailersPayload = new TrailersV1
+        var (trlBuf, trlLen) = new TrailersV1
         {
             GrpcStatusCode = Grpc.Core.StatusCode.OK,
             GrpcStatusMessage = "",
             Metadata = Array.Empty<MetadataKV>()
         }.Encode();
 
-        var header = new FrameHeader(FrameType.Trailers, streamId: 1, length: (uint)trailersPayload.Length, flags: TrailersFlags.EndStream);
+        var header = new FrameHeader(FrameType.Trailers, streamId: 1, length: (uint)trlLen, flags: TrailersFlags.EndStream);
 
         // Act
-        FrameProtocol.WriteFrame(seg.RingA, header, trailersPayload.AsSpan());
+        FrameProtocol.WriteFrame(seg.RingA, header, trlBuf.AsSpan(0, trlLen));
 
         var (readHeader, payload) = FrameProtocol.ReadFrame(seg.RingA);
 
@@ -109,6 +111,7 @@ public class FrameProtocolTests
 
         var decoded = TrailersV1.Decode(payload);
         Assert.That(decoded.GrpcStatusCode, Is.EqualTo(Grpc.Core.StatusCode.OK));
+        ArrayPool<byte>.Shared.Return(trlBuf);
     }
 
     [Test]

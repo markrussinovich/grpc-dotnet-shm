@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Text;
@@ -247,19 +248,20 @@ public class InteropTests
             Metadata = new[] { new MetadataKV("custom-key", "value1") }
         };
 
-        var encoded = headers.Encode();
+        var (encBuf, _) = headers.Encode();
 
         // Verify format
-        Assert.That(encoded[0], Is.EqualTo(1), "Version byte");
-        Assert.That(encoded[1], Is.EqualTo(0), "HeaderType byte (client)");
+        Assert.That(encBuf[0], Is.EqualTo(1), "Version byte");
+        Assert.That(encBuf[1], Is.EqualTo(0), "HeaderType byte (client)");
 
         // Method length at offset 2 (4 bytes little-endian)
-        var methodLen = BinaryPrimitives.ReadUInt32LittleEndian(encoded.AsSpan(2, 4));
+        var methodLen = BinaryPrimitives.ReadUInt32LittleEndian(encBuf.AsSpan(2, 4));
         Assert.That(methodLen, Is.EqualTo((uint)headers.Method.Length));
 
         // Method string starts at offset 6
-        var methodBytes = Encoding.UTF8.GetString(encoded.AsSpan(6, (int)methodLen));
+        var methodBytes = Encoding.UTF8.GetString(encBuf.AsSpan(6, (int)methodLen));
         Assert.That(methodBytes, Is.EqualTo("/test.Service/Method"));
+        ArrayPool<byte>.Shared.Return(encBuf);
     }
 
     /// <summary>
@@ -276,18 +278,19 @@ public class InteropTests
             Metadata = Array.Empty<MetadataKV>()
         };
 
-        var encoded = trailers.Encode();
+        var (encBuf, _) = trailers.Encode();
 
         // Verify format
-        Assert.That(encoded[0], Is.EqualTo(1), "Version byte");
+        Assert.That(encBuf[0], Is.EqualTo(1), "Version byte");
 
         // Status code at offset 1 (4 bytes little-endian)
-        var statusCode = BinaryPrimitives.ReadInt32LittleEndian(encoded.AsSpan(1, 4));
+        var statusCode = BinaryPrimitives.ReadInt32LittleEndian(encBuf.AsSpan(1, 4));
         Assert.That(statusCode, Is.EqualTo(0), "OK status code");
 
         // Message length at offset 5 (4 bytes little-endian)
-        var msgLen = BinaryPrimitives.ReadUInt32LittleEndian(encoded.AsSpan(5, 4));
+        var msgLen = BinaryPrimitives.ReadUInt32LittleEndian(encBuf.AsSpan(5, 4));
         Assert.That(msgLen, Is.EqualTo((uint)"Success".Length));
+        ArrayPool<byte>.Shared.Return(encBuf);
     }
 
     /// <summary>
@@ -341,7 +344,9 @@ public class InteropTests
             DeadlineUnixNano = 0,
             Metadata = Array.Empty<MetadataKV>()
         };
-        File.WriteAllBytes(Path.Combine(dumpPath, "headers_v1.bin"), headers.Encode());
+        var (hdBuf, hdLen) = headers.Encode();
+        File.WriteAllBytes(Path.Combine(dumpPath, "headers_v1.bin"), hdBuf.AsSpan(0, hdLen).ToArray());
+        ArrayPool<byte>.Shared.Return(hdBuf);
 
         // Dump trailers
         var trailers = new TrailersV1
@@ -351,7 +356,9 @@ public class InteropTests
             GrpcStatusMessage = "",
             Metadata = Array.Empty<MetadataKV>()
         };
-        File.WriteAllBytes(Path.Combine(dumpPath, "trailers_v1.bin"), trailers.Encode());
+        var (trlBuf, trlLen) = trailers.Encode();
+        File.WriteAllBytes(Path.Combine(dumpPath, "trailers_v1.bin"), trlBuf.AsSpan(0, trlLen).ToArray());
+        ArrayPool<byte>.Shared.Return(trlBuf);
 
         Console.WriteLine($"Binary dumps written to: {dumpPath}");
         Assert.Pass($"Binary dumps generated at {dumpPath}");
