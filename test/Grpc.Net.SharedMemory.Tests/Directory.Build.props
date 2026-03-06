@@ -1,3 +1,4 @@
 <Project>
-  <!-- Opt out of parent Directory.Build.props for this standalone test project -->
+  <!-- Import parent test Directory.Build.props for common test packages and repo settings -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
 </Project>

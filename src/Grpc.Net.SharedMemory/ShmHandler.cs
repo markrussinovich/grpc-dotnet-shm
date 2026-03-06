@@ -226,14 +226,21 @@ public sealed class ShmHandler : HttpMessageHandler
             try
             {
                 var messageBytesRead = await ReadExactlyAsync(bodyStream, messageBuffer.AsMemory(0, (int)length), cancellationToken);
-                if (messageBytesRead < length) throw new InvalidDataException("Incomplete gRPC message body");
-
-                await stream.SendMessageAsync(messageBuffer.AsMemory(0, (int)length), cancellationToken);
+                if (messageBytesRead < length)
+                    throw new InvalidDataException("Incomplete gRPC message body");
             }
-            finally
+            catch
             {
                 ArrayPool<byte>.Shared.Return(messageBuffer);
+                throw;
             }
+
+            // Zero-copy: ownership of messageBuffer transfers to the writer thread
+            // which returns it to the pool after the ring write completes.
+            await stream.SendMessageZeroCopyAsync(
+                messageBuffer.AsMemory(0, (int)length),
+                messageBuffer,
+                cancellationToken);
         }
     }
 

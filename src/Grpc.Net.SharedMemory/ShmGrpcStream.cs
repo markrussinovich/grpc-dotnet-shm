@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Threading.Channels;
 using Grpc.Core;
@@ -223,6 +224,57 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Sends a message payload using zero-copy. The <paramref name="pooledBuffer"/>
+    /// is returned to <see cref="ArrayPool{T}"/> after the data has been written
+    /// to the ring buffer, replacing the caller's <c>finally</c> block.
+    /// </summary>
+    public async Task SendMessageZeroCopyAsync(ReadOnlyMemory<byte> data, byte[] pooledBuffer, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            ThrowIfDisposed();
+            if (_halfCloseSent)
+                throw new InvalidOperationException("Cannot send after half-close");
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(pooledBuffer);
+            throw;
+        }
+
+        CancellationTokenSource? linkedCts = null;
+        try
+        {
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+
+            // Wait for send window
+            while (Interlocked.Read(ref _sendWindow) < data.Length)
+            {
+                linkedCts.Token.ThrowIfCancellationRequested();
+                await _sendWindowSignal.WaitAsync(linkedCts.Token);
+            }
+        }
+        catch
+        {
+            linkedCts?.Dispose();
+            // Buffer ownership has not yet transferred to the writer thread.
+            ArrayPool<byte>.Shared.Return(pooledBuffer);
+            throw;
+        }
+
+        Interlocked.Add(ref _sendWindow, -data.Length);
+        try
+        {
+            // SendFrameZeroCopyAsync handles its own buffer cleanup on failure.
+            await SendFrameZeroCopyAsync(FrameType.Message, 0, data, pooledBuffer, linkedCts.Token);
+        }
+        finally
+        {
+            linkedCts.Dispose();
+        }
+    }
+
+    /// <summary>
     /// Sends trailers and closes the stream (server-side).
     /// </summary>
     public async Task SendTrailersAsync(StatusCode statusCode, string? statusMessage = null, Metadata? metadata = null)
@@ -371,13 +423,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             switch (f.Type)
             {
                 case FrameType.Message:
-                    // Send window update
+                    // Send stream-level window update via the batched writer
                     var increment = (uint)f.Length;
                     if (increment > 0)
                     {
-                        Span<byte> windowUpdate = stackalloc byte[4];
-                        BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, increment);
-                        _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
+                        _connection.SendStreamWindowUpdate(StreamId, increment);
                     }
 
                     if ((f.Flags & MessageFlags.More) != 0)
@@ -453,13 +503,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 switch (f.Type)
                 {
                     case FrameType.Message:
-                        // Send window update
+                        // Send stream-level window update via the batched writer
                         var increment = (uint)f.Length;
                         if (increment > 0)
                         {
-                            Span<byte> windowUpdate = stackalloc byte[4];
-                            BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, increment);
-                            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
+                            _connection.SendStreamWindowUpdate(StreamId, increment);
                         }
 
                         if ((f.Flags & MessageFlags.More) != 0)
@@ -586,6 +634,40 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         try
         {
             _connection.SendFrame(type, StreamId, flags, payload.Span);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Zero-copy variant: enqueues without copying; the pooled buffer is returned
+    /// to <see cref="ArrayPool{T}"/> by the writer thread after the ring write.
+    /// </summary>
+    private async Task SendFrameZeroCopyAsync(FrameType type, byte flags,
+        ReadOnlyMemory<byte> payload, byte[] pooledBuffer, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _sendLock.WaitAsync(cancellationToken);
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(pooledBuffer);
+            throw;
+        }
+
+        try
+        {
+            _connection.SendFrameZeroCopy(type, StreamId, flags, payload, pooledBuffer);
+        }
+        catch
+        {
+            // If enqueue fails, we must return the buffer ourselves since the
+            // writer thread will never see this entry.
+            ArrayPool<byte>.Shared.Return(pooledBuffer);
+            throw;
         }
         finally
         {

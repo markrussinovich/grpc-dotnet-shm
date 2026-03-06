@@ -49,9 +49,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private readonly object _flowControlLock = new();
 
     // Write lock: the SPSC ring buffer requires single-producer semantics.
-    // All writes to TxRing must be serialized through this lock.
-    private readonly object _txLock = new();
+    // All writes to TxRing are serialised through the ShmFrameWriter's
+    // dedicated consumer thread (Channel SingleReader=true).
     private readonly SemaphoreSlim _quotaSignal = new(0);
+    private ShmFrameWriter? _frameWriter;
 
     // BDP estimation (A73 RFC Phase 5)
     private readonly ShmBdpEstimator _bdpEstimator;
@@ -207,6 +208,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // Start background frame reader
         _frameReaderTask = FrameReaderLoopAsync();
 
+        // Start batched frame writer
+        _frameWriter = new ShmFrameWriter(TxRing, _disposeCts);
+
         // Start keepalive task if enabled
         if (_keepaliveOptions.IsEnabled)
         {
@@ -310,14 +314,16 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         try
         {
-            lock (_txLock)
-            {
-                FrameProtocol.WriteGoAway(TxRing, GoAwayFlags.Draining, message, _disposeCts.Token);
-            }
+            var payload = message != null ? System.Text.Encoding.UTF8.GetBytes(message) : Array.Empty<byte>();
+            SendFrame(FrameType.GoAway, 0, GoAwayFlags.Draining, payload);
         }
-        catch (OperationCanceledException)
+        catch (ObjectDisposedException)
         {
             // Connection already closing
+        }
+        catch (InvalidOperationException)
+        {
+            // Frame writer already disposed
         }
     }
 
@@ -328,10 +334,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     {
         ThrowIfDisposed();
         var pingData = BitConverter.GetBytes(Environment.TickCount64);
-        lock (_txLock)
-        {
-            FrameProtocol.WritePing(TxRing, 0, pingData, _disposeCts.Token);
-        }
+        SendFrame(FrameType.Ping, 0, 0, pingData);
     }
 
     internal void RemoveStream(uint streamId)
@@ -342,19 +345,27 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     internal void SendFrame(FrameType type, uint streamId, byte flags, ReadOnlySpan<byte> payload)
     {
         ThrowIfDisposed();
+        _frameWriter!.Enqueue(type, streamId, flags, payload);
+    }
 
-        lock (_txLock)
+    /// <summary>
+    /// Enqueues a frame without copying the payload. <paramref name="pooledBuffer"/>
+    /// is returned to <see cref="ArrayPool{T}"/> after the ring write completes.
+    /// </summary>
+    internal void SendFrameZeroCopy(FrameType type, uint streamId, byte flags,
+        ReadOnlyMemory<byte> payload, byte[]? pooledBuffer)
+    {
+        ThrowIfDisposed();
+        _frameWriter!.EnqueueZeroCopy(type, streamId, flags, payload, pooledBuffer);
+    }
+
+    internal void SendStreamWindowUpdate(uint streamId, uint increment)
+    {
+        if (increment > 0)
         {
-            // MESSAGE frames may exceed ring capacity and need chunking
-            if (type == FrameType.Message)
-            {
-                var isLast = (flags & MessageFlags.More) == 0;
-                FrameProtocol.WriteMessage(TxRing, streamId, payload, isLast, _disposeCts.Token);
-                return;
-            }
-
-            var header = new FrameHeader(type, streamId, (uint)payload.Length, flags);
-            FrameProtocol.WriteFrame(TxRing, header, payload, _disposeCts.Token);
+            Span<byte> payload = stackalloc byte[4];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, increment);
+            SendFrame(FrameType.WindowUpdate, streamId, 0, payload);
         }
     }
 
@@ -849,10 +860,26 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         {
             _disposed = true;
 
-            // Send GoAway if not already sent
+            // Dispose the frame writer first: flushes any pending frames,
+            // cancels if blocked on ring, waits for writer task to exit,
+            // and drains remaining channel entries.
+            _frameWriter?.Dispose();
+
+            // Now that the writer task has exited, we can safely write
+            // GoAway directly to the ring without concurrent access.
+            // Use a short timeout to avoid blocking Dispose if the ring is full
+            // and the remote side is not consuming.
             if (!_goAwaySent)
             {
-                try { SendGoAway("Connection disposed"); } catch { }
+                _goAwaySent = true;
+                try
+                {
+                    using var goAwayCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                    var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
+                    var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
+                    FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
+                }
+                catch { /* best-effort */ }
             }
 
             _disposeCts.Cancel();
@@ -879,10 +906,21 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         {
             _disposed = true;
 
-            // Send GoAway if not already sent
+            // Dispose the frame writer first.
+            _frameWriter?.Dispose();
+
+            // Now that the writer task has exited, write GoAway directly.
             if (!_goAwaySent)
             {
-                try { SendGoAway("Connection disposed"); } catch { }
+                _goAwaySent = true;
+                try
+                {
+                    using var goAwayCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                    var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
+                    var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
+                    FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
+                }
+                catch { /* best-effort */ }
             }
 
             _disposeCts.Cancel();

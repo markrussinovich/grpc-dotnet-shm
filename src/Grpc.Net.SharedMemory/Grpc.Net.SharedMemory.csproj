@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -11,27 +11,26 @@
     <Description>Shared memory transport for gRPC .NET</Description>
     <Authors>gRPC Authors</Authors>
     <PackageTags>grpc;shared-memory;ipc;transport</PackageTags>
-
-    <!-- Sign the assembly to match other Grpc.* assemblies -->
-    <AssemblyOriginatorKeyFile>$(MSBuildThisFileDirectory)..\..\keys\Grpc.snk</AssemblyOriginatorKeyFile>
-    <SignAssembly>true</SignAssembly>
-
-    <!-- Don't use central package management for this new project for now -->
-    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
   </PropertyGroup>
 
   <PropertyGroup>
     <DefineConstants Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(DefineConstants);WINDOWS</DefineConstants>
     <DefineConstants Condition="$([MSBuild]::IsOSPlatform('Linux'))">$(DefineConstants);LINUX</DefineConstants>
-    <NoWarn>$(NoWarn);CA1305;CA1822;CA1836;CA2007;CA2014;CA1416</NoWarn>
+    <!-- CA2007: ConfigureAwait — suppressed to match Grpc.AspNetCore.Server convention -->
+    <NoWarn>$(NoWarn);CA2007</NoWarn>
+    <!-- Existing code warnings not introduced by this PR; demote from error to warning.
+         TODO: Fix these in a follow-up cleanup PR.
+         CA1305: ToString() locale, CA1416: platform compat, CA1822: static member, CA1836: IsEmpty -->
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);CA1305;CA1416;CA1822;CA1836</WarningsNotAsErrors>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Use package references for initial development, will switch to project references later -->
-    <PackageReference Include="Google.Protobuf" Version="3.28.0" />
-    <PackageReference Include="Grpc.Net.Client" Version="2.70.0" />
-    <PackageReference Include="Grpc.Core.Api" Version="2.70.0" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
+    <ProjectReference Include="..\Grpc.Net.Client\Grpc.Net.Client.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" VersionOverride="$(MicrosoftExtensionsLtsPackageVersion)" />
   </ItemGroup>
 
 </Project>
