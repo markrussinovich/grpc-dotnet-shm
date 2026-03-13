@@ -51,12 +51,12 @@ def run_ringbench() -> dict:
     print("-" * 70)
 
     try:
-        result = subprocess.run(cmd, capture_output=False, text=True, timeout=1800)
+        result = subprocess.run(cmd, capture_output=False, text=True, timeout=600)
         if result.returncode != 0:
             print(f"ERROR: Benchmark exited with code {result.returncode}")
             return None
     except subprocess.TimeoutExpired:
-        print("ERROR: Benchmark timed out after 1800s")
+        print("ERROR: Benchmark timed out after 600s")
         return None
     except Exception as e:
         print(f"ERROR: Failed to run benchmarks: {e}")
