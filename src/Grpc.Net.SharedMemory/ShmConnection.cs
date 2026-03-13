@@ -107,6 +107,26 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     public event EventHandler<StreamReceivedEventArgs>? StreamReceived;
 
     /// <summary>
+    /// Raised when a stream is removed from the connection.
+    /// </summary>
+    public event Action<uint>? StreamRemoved;
+
+    /// <summary>
+    /// Gets the number of currently active streams.
+    /// </summary>
+    public int ActiveStreamCount => _streams.Count;
+
+    /// <summary>
+    /// Gets the maximum number of concurrent streams allowed.
+    /// </summary>
+    public uint MaxConcurrentStreams => _maxConcurrentStreams;
+
+    /// <summary>
+    /// Gets the number of additional streams that can be created.
+    /// </summary>
+    public int AvailableStreams => Math.Max(0, (int)_maxConcurrentStreams - _streams.Count);
+
+    /// <summary>
     /// Creates a new client-side connection by opening an existing shared memory segment.
     /// </summary>
     /// <param name="name">The name of the shared memory segment to connect to.</param>
@@ -340,6 +360,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     internal void RemoveStream(uint streamId)
     {
         _streams.TryRemove(streamId, out _);
+        StreamRemoved?.Invoke(streamId);
     }
 
     internal void SendFrame(FrameType type, uint streamId, byte flags, ReadOnlySpan<byte> payload)
