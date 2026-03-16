@@ -37,6 +37,7 @@ internal sealed class ShmConnectionPool : IAsyncDisposable
     private readonly List<ShmPooledConnection> _connections;
     private readonly object _syncObj = new();
     private readonly SemaphoreSlim _connectLock = new(1, 1);
+    private readonly CancellationTokenSource _factoryCts = new();
     private Timer? _cleanupTimer;
     private int _disposed; // 0 = active, 1 = disposed; atomic via Interlocked
 
@@ -380,7 +381,14 @@ internal sealed class ShmConnectionPool : IAsyncDisposable
                 }
             }
 
-            var connection = await _connectionFactory(cancellationToken).ConfigureAwait(false);
+            // Link the caller's token with _factoryCts so DisposeAsync can
+            // immediately cancel in-flight factory calls. This prevents the
+            // SPSC ring violation where overlapping factory calls (from an
+            // old pool being disposed and a new pool starting) both write to
+            // the same control segment ring buffer concurrently.
+            using var linkedFactoryCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, _factoryCts.Token);
+            var connection = await _connectionFactory(linkedFactoryCts.Token).ConfigureAwait(false);
 
             // Re-check disposed after the potentially long factory call.
             // If disposed, clean up the just-created connection immediately.
@@ -439,6 +447,23 @@ internal sealed class ShmConnectionPool : IAsyncDisposable
     /// already checks <c>_waiterCount</c> internally.
     /// </summary>
     internal bool HasWaiters => Volatile.Read(ref _waiterCount) > 0;
+
+    /// <summary>
+    /// Synchronously cancels any in-flight connection factory calls.
+    /// Called by <see cref="ShmControlHandler.Dispose(bool)"/> to immediately
+    /// unblock ring reads/writes on the control segment before the handler
+    /// goes out of scope. This prevents SPSC violations when a new handler
+    /// is created for the same segment name while the old one is still
+    /// finishing factory work.
+    /// </summary>
+    internal void CancelPendingConnections()
+    {
+        // Guard: _factoryCts may already be disposed if DisposeAsync completed
+        // before this call arrives from ShmControlHandler.Dispose. Cancel() on
+        // a disposed CTS throws ObjectDisposedException.
+        try { _factoryCts.Cancel(); }
+        catch (ObjectDisposedException) { }
+    }
 
     /// <summary>
     /// Called by <see cref="ShmPooledConnection"/> when a stream completes.
@@ -600,6 +625,12 @@ internal sealed class ShmConnectionPool : IAsyncDisposable
             return;
         }
 
+        // Cancel in-flight connection factory calls immediately.
+        // This unblocks any ring read/write blocked in ConnectViaControlSegmentAsync,
+        // preventing the SPSC ring violation where overlapping factory calls from
+        // old/new pools write to the same control segment concurrently.
+        _factoryCts.Cancel();
+
         // Signal all waiters so they see _disposed and exit.
         SignalStreamAvailable();
 
@@ -646,6 +677,29 @@ internal sealed class ShmConnectionPool : IAsyncDisposable
                 Debug.WriteLine($"ShmConnectionPool: Error awaiting pending disposes: {ex.Message}");
             }
         }
+
+        // Wait for any in-flight CreateConnectionAsync to exit before returning.
+        // _factoryCts was already cancelled above, so a well-behaved factory
+        // (one that observes its CancellationToken) will unblock promptly.
+        // The 3-second timeout is a best-effort safeguard: if the factory
+        // ignores cancellation, DisposeAsync will still return rather than
+        // hang indefinitely. Callers that need a hard guarantee should ensure
+        // their factory respects the token.
+        var lockAcquired = false;
+        try
+        {
+            lockAcquired = await _connectLock.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+        }
+        catch { /* Semaphore may be disposed or faulted — proceed with cleanup. */ }
+        finally
+        {
+            if (lockAcquired)
+            {
+                try { _connectLock.Release(); } catch { }
+            }
+        }
+
+        _factoryCts.Dispose();
 
         // _connectLock is not disposed here. SemaphoreSlim.Dispose on a semaphore
         // that may still have waiters (from CreateConnectionAsync's finally block)

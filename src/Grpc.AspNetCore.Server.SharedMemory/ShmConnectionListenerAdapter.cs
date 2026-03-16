@@ -87,9 +87,10 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
                 }
 
                 // Validate CONNECT request
+                (ulong clientRingA, ulong clientRingB) clientPreferred;
                 try
                 {
-                    ControlWire.DecodeConnectRequest(payload.Span);
+                    clientPreferred = ControlWire.DecodeConnectRequest(payload.Span);
                 }
                 catch (Exception ex)
                 {
@@ -98,7 +99,13 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
                     continue;
                 }
 
+                // Negotiate ring capacity: Min(clientPreferred, serverMax).
+                var negotiatedRing = ControlWire.NegotiateRingCapacity(
+                    clientPreferred.clientRingA, _options.RingCapacity);
+
                 // Create a data segment for this connection
+                // First, purge any closed/stale segments from previous tests.
+                PurgeClosedSegments();
                 var connId = Interlocked.Increment(ref _connectionId);
                 var segName = $"{_baseName}_conn_{connId}";
                 Segment.TryRemoveSegment(segName);
@@ -106,7 +113,7 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
                 Segment dataSegment;
                 try
                 {
-                    dataSegment = Segment.Create(segName, _options.RingCapacity, _options.MaxStreams);
+                    dataSegment = Segment.Create(segName, negotiatedRing, _options.MaxStreams);
                     dataSegment.SetServerReady(true);
                 }
                 catch (Exception ex)
@@ -157,6 +164,25 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
     {
         _closeCts.Cancel();
         return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Removes segments whose ring buffers have been closed (connection dead).
+    /// Prevents unbounded accumulation across consecutive test runs.
+    /// </summary>
+    private void PurgeClosedSegments()
+    {
+        foreach (var (name, segment) in _activeSegments)
+        {
+            if (segment.RingA.IsClosed || segment.RingB.IsClosed)
+            {
+                if (_activeSegments.TryRemove(name, out var removed))
+                {
+                    try { removed.Dispose(); } catch { }
+                    Segment.TryRemoveSegment(name);
+                }
+            }
+        }
     }
 
     /// <inheritdoc/>

@@ -146,4 +146,38 @@ public static class ControlWire
 
         return Encoding.UTF8.GetString(data.Slice(5, msgLen));
     }
+
+    /// <summary>
+    /// Negotiates the ring buffer capacity between client preference and server maximum.
+    /// Returns <c>Min(clientPreferred, serverMax)</c>, clamped to <see cref="ShmConstants.MinRingCapacity"/>.
+    /// If the client sends 0 (no preference) or a non-power-of-2, the server default is used.
+    /// </summary>
+    /// <param name="clientPreferred">Client's preferred ring capacity from the CONNECT request.</param>
+    /// <param name="serverMax">Server's configured maximum ring capacity.</param>
+    /// <returns>The negotiated ring capacity (always a power of 2, ≥ MinRingCapacity).</returns>
+    public static ulong NegotiateRingCapacity(ulong clientPreferred, ulong serverMax)
+    {
+        // Client 0 = no preference → use server default
+        if (clientPreferred == 0)
+        {
+            return serverMax;
+        }
+
+        // Client must request a power of 2
+        if ((clientPreferred & (clientPreferred - 1)) != 0)
+        {
+            return serverMax;
+        }
+
+        // Negotiate: smaller of client preference and server max
+        var negotiated = Math.Min(clientPreferred, serverMax);
+
+        // Clamp to minimum
+        if (negotiated < ShmConstants.MinRingCapacity)
+        {
+            negotiated = ShmConstants.MinRingCapacity;
+        }
+
+        return negotiated;
+    }
 }

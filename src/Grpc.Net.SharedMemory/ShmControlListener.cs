@@ -98,9 +98,10 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             }
 
             // Decode and validate CONNECT request
+            (ulong clientRingA, ulong clientRingB) clientPreferred;
             try
             {
-                ControlWire.DecodeConnectRequest(payload.Span);
+                clientPreferred = ControlWire.DecodeConnectRequest(payload.Span);
             }
             catch (Exception ex)
             {
@@ -108,6 +109,17 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
                 await SendRejectAsync(ex.Message, ct).ConfigureAwait(false);
                 continue;
             }
+
+            // Negotiate ring capacity: Min(clientPreferred, serverMax).
+            // If client sends 0, use server default.
+            var negotiatedRing = ControlWire.NegotiateRingCapacity(
+                clientPreferred.clientRingA, _ringCapacity);
+
+            // Purge closed connections to free resources accumulated from
+            // previous test runs. Without this, _activeConnections grows
+            // unboundedly and stale connection objects leak their
+            // FrameReaderLoopAsync threads and ring buffer kernel events.
+            PurgeClosedConnections();
 
             // Create a new data segment for this connection
             var connId = Interlocked.Increment(ref _connectionId);
@@ -119,7 +131,7 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             Segment dataSegment;
             try
             {
-                dataSegment = Segment.Create(segmentName, _ringCapacity, _maxStreams);
+                dataSegment = Segment.Create(segmentName, negotiatedRing, _maxStreams);
                 dataSegment.SetServerReady(true);
             }
             catch (Exception ex)
@@ -196,6 +208,27 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         }
 
         return Task.FromResult((header, payload));
+    }
+
+    /// <summary>
+    /// Removes connections that have been closed or disposed from
+    /// <see cref="_activeConnections"/>. This prevents unbounded accumulation
+    /// of stale connection objects (and their background reader threads)
+    /// across consecutive test runs on a long-lived server.
+    /// </summary>
+    private void PurgeClosedConnections()
+    {
+        foreach (var (name, conn) in _activeConnections)
+        {
+            if (conn.IsClosed)
+            {
+                if (_activeConnections.TryRemove(name, out var removed))
+                {
+                    try { removed.Dispose(); } catch { }
+                    Segment.TryRemoveSegment(name);
+                }
+            }
+        }
     }
 
     private Task WriteControlFrameAsync(FrameType type, byte[] payload, CancellationToken ct)

@@ -531,6 +531,13 @@ public sealed class ShmControlHandler : HttpMessageHandler
             {
                 if (_pool != null)
                 {
+                    // Synchronously cancel any in-flight connection factory calls
+                    // so that ring reads/writes on the control segment unblock
+                    // immediately. This prevents SPSC violations when a new handler
+                    // is created for the same segment name while this one’s pool
+                    // is still asynchronously disposing.
+                    _pool.CancelPendingConnections();
+
                     // ShmConnectionPool.DisposeAsync is genuinely async (awaits pending
                     // connection disposes). HttpMessageHandler.Dispose is sync-only,
                     // so we schedule the async cleanup and avoid blocking the caller.
@@ -730,7 +737,7 @@ internal sealed class ShmControlResponseContent : HttpContent
 /// </summary>
 internal sealed class ShmGrpcResponseStream : Stream
 {
-    private readonly IAsyncEnumerator<ReadOnlyMemory<byte>> _enumerator;
+    private readonly ShmGrpcStream _shmStream;
     private readonly ShmControlResponseContent _content;
     // Current message being served (raw payload from SHM ring, pooled buffer).
     private ReadOnlyMemory<byte> _message;
@@ -740,9 +747,12 @@ internal sealed class ShmGrpcResponseStream : Stream
     private bool _hasMessage;
     private bool _completed;
 
+    // State for deferred buffer release across calls to ReceiveNextMessageBufferAsync.
+    private InboundFrame _previousFrame;
+
     public ShmGrpcResponseStream(ShmGrpcStream shmStream, ShmControlResponseContent content)
     {
-        _enumerator = shmStream.ReceiveMessageBuffersAsync(CancellationToken.None).GetAsyncEnumerator();
+        _shmStream = shmStream;
         _content = content;
     }
 
@@ -763,16 +773,22 @@ internal sealed class ShmGrpcResponseStream : Stream
             return ServeCurrentMessage(buffer.Span);
         }
 
-        // Advance to the next message (previous pooled buffer is returned by the enumerator).
-        if (!await _enumerator.MoveNextAsync().ConfigureAwait(false))
+        // Receive the next complete message. Each call accepts the caller's
+        // cancellation token directly — no latched enumerator token.
+        var (mem, frame, eos) = await _shmStream.ReceiveNextMessageBufferAsync(
+            _previousFrame, cancellationToken).ConfigureAwait(false);
+
+        if (eos)
         {
+            _previousFrame = default;
             _completed = true;
             _content.ApplyTrailers();
             return 0;
         }
 
-        _message = _enumerator.Current;
-        _messageLength = _message.Length;
+        _previousFrame = frame;
+        _message = mem;
+        _messageLength = mem.Length;
         _frameOffset = 0;
         _hasMessage = true;
 
@@ -837,23 +853,10 @@ internal sealed class ShmGrpcResponseStream : Stream
     {
         if (disposing)
         {
-            // Avoid sync-over-async: schedule the async enumerator dispose
-            // instead of blocking. The enumerator's MoveNextAsync will see
-            // the stream is disposed and exit cleanly.
-            _ = DisposeEnumeratorAsync();
+            // Release any held pooled buffer from the last received message.
+            _previousFrame.ReturnToPool();
+            _previousFrame = default;
         }
         base.Dispose(disposing);
-    }
-
-    private async Task DisposeEnumeratorAsync()
-    {
-        try
-        {
-            await _enumerator.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"ShmGrpcResponseStream: enumerator dispose error: {ex.Message}");
-        }
     }
 }

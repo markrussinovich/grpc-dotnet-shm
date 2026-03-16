@@ -366,7 +366,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             await context.EnsureResponseHeadersSentAsync();
 
             // Create reader and call handler
-            var reader = new ShmAsyncStreamReader<TReq>(stream);
+            using var reader = new ShmAsyncStreamReader<TReq>(stream);
             var response = await _handler(reader, context);
 
             // Send response using pooled buffer (avoids LOH allocation)
@@ -393,7 +393,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             await context.EnsureResponseHeadersSentAsync();
 
             // Create reader, writer, and call handler
-            var reader = new ShmAsyncStreamReader<TReq>(stream);
+            using var reader = new ShmAsyncStreamReader<TReq>(stream);
             var writer = new ShmServerStreamWriter<TResp>(stream, context);
             await _handler(reader, writer, context);
 
@@ -425,13 +425,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
     /// <summary>
     /// Adapts <see cref="ShmGrpcStream"/> to <see cref="IAsyncStreamReader{T}"/> for service methods.
+    /// Implements <see cref="IDisposable"/> to release any held pooled buffer
+    /// when the handler stops reading early (e.g., returns after one message
+    /// in a client-streaming or duplex call).
     /// </summary>
-    private sealed class ShmAsyncStreamReader<T> : IAsyncStreamReader<T>
+    private sealed class ShmAsyncStreamReader<T> : IAsyncStreamReader<T>, IDisposable
         where T : class, IMessage<T>, new()
     {
         private readonly ShmGrpcStream _stream;
         private readonly MessageParser<T> _parser = new(() => new T());
-        private IAsyncEnumerator<ReadOnlyMemory<byte>>? _enumerator;
+        private InboundFrame _previousFrame;
         private T? _current;
 
         public ShmAsyncStreamReader(ShmGrpcStream stream) => _stream = stream;
@@ -440,20 +443,32 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
         public async Task<bool> MoveNext(CancellationToken cancellationToken)
         {
-            // Use ReceiveMessageBuffersAsync to skip the per-message ToArray()
-            // copy.  The buffer is valid until the next MoveNextAsync;
-            // ParseFrom copies into managed protobuf objects, so the pooled
-            // buffer can be safely returned afterward.
-            _enumerator ??= _stream.ReceiveMessageBuffersAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
+            // Use ReceiveNextMessageBufferAsync with the caller's per-call
+            // cancellation token. Unlike the enumerator-based approach, this
+            // ensures every MoveNext call respects the current token — not
+            // the one from the first call.
+            var (mem, frame, eos) = await _stream.ReceiveNextMessageBufferAsync(
+                _previousFrame, cancellationToken).ConfigureAwait(false);
 
-            if (await _enumerator.MoveNextAsync().ConfigureAwait(false))
+            if (eos)
             {
-                _current = _parser.ParseFrom(new ReadOnlySequence<byte>(_enumerator.Current));
-                return true;
+                _previousFrame = default;
+                _current = default;
+                return false;
             }
 
-            _current = default;
-            return false;
+            _previousFrame = frame;
+            _current = _parser.ParseFrom(new ReadOnlySequence<byte>(mem));
+            return true;
+        }
+
+        public void Dispose()
+        {
+            // Release any held pooled buffer from the last received message.
+            // Without this, a handler that short-circuits (reads one message
+            // then returns) would leak the rented ArrayPool buffer.
+            _previousFrame.ReturnToPool();
+            _previousFrame = default;
         }
     }
 

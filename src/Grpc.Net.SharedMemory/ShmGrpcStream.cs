@@ -202,12 +202,56 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>
     /// Sends a message payload.
     /// </summary>
-    public async Task SendMessageAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    public Task SendMessageAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         if (_halfCloseSent)
             throw new InvalidOperationException("Cannot send after half-close");
 
+        // Fast path: when the send window has enough space (the common case for
+        // small payloads — 120B vs 32 MiB window), skip the async machinery and
+        // the LinkedCTS allocation entirely. Each CreateLinkedTokenSource costs
+        // ~200 bytes; at 50K+ messages/sec this dominates GC gen0 pressure.
+        //
+        // Note: the Read-then-Add is not strictly atomic, so two concurrent
+        // callers could both pass the check and drive _sendWindow negative.
+        // This is safe because (1) gRPC serializes sends per stream — concurrent
+        // SendMessageAsync on the same stream does not happen in practice, and
+        // (2) even if it did, a negative window just causes the next send to
+        // enter the slow path and wait for WINDOW_UPDATE, which is self-correcting.
+        if (Interlocked.Read(ref _sendWindow) >= data.Length)
+        {
+            Interlocked.Add(ref _sendWindow, -data.Length);
+            var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
+            var task = SendFrameAsync(FrameType.Message, 0, data, ct);
+            // Sync completion (the common case): no restore needed.
+            if (task.IsCompletedSuccessfully)
+            {
+                return task;
+            }
+            // Async or failed: restore window on failure.
+            return SendMessageWithWindowRestoreAsync(task, data.Length);
+        }
+
+        // Slow path: need to wait for send window — requires linked CTS.
+        return SendMessageSlowAsync(data, cancellationToken);
+    }
+
+    private async Task SendMessageWithWindowRestoreAsync(Task sendTask, int dataLength)
+    {
+        try
+        {
+            await sendTask.ConfigureAwait(false);
+        }
+        catch
+        {
+            Interlocked.Add(ref _sendWindow, dataLength);
+            throw;
+        }
+    }
+
+    private async Task SendMessageSlowAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
+    {
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
 
         // Wait for send window
@@ -218,9 +262,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
 
         Interlocked.Add(ref _sendWindow, -data.Length);
-        // Pass ReadOnlyMemory<byte> directly — no .ToArray() copy.
-        // The previous .ToArray() allocated a new byte[] (LOH at ≥85KB) on every send.
-        await SendFrameAsync(FrameType.Message, 0, data, linkedCts.Token);
+        try
+        {
+            await SendFrameAsync(FrameType.Message, 0, data, linkedCts.Token);
+        }
+        catch
+        {
+            Interlocked.Add(ref _sendWindow, data.Length);
+            throw;
+        }
     }
 
     /// <summary>
@@ -228,7 +278,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// is returned to <see cref="ArrayPool{T}"/> after the data has been written
     /// to the ring buffer, replacing the caller's <c>finally</c> block.
     /// </summary>
-    public async Task SendMessageZeroCopyAsync(ReadOnlyMemory<byte> data, byte[] pooledBuffer, CancellationToken cancellationToken = default)
+    public Task SendMessageZeroCopyAsync(ReadOnlyMemory<byte> data, byte[] pooledBuffer, CancellationToken cancellationToken = default)
     {
         try
         {
@@ -242,6 +292,39 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             throw;
         }
 
+        // Fast path: window available — skip LinkedCTS allocation.
+        // See SendMessageAsync for the Read-then-Add safety rationale.
+        if (Interlocked.Read(ref _sendWindow) >= data.Length)
+        {
+            Interlocked.Add(ref _sendWindow, -data.Length);
+            var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
+            var task = SendFrameZeroCopyAsync(FrameType.Message, 0, data, pooledBuffer, ct);
+            if (task.IsCompletedSuccessfully)
+            {
+                return task;
+            }
+            return SendZeroCopyWithWindowRestoreAsync(task, data.Length);
+        }
+
+        // Slow path: need to wait for window.
+        return SendMessageZeroCopySlowAsync(data, pooledBuffer, cancellationToken);
+    }
+
+    private async Task SendZeroCopyWithWindowRestoreAsync(Task sendTask, int dataLength)
+    {
+        try
+        {
+            await sendTask.ConfigureAwait(false);
+        }
+        catch
+        {
+            Interlocked.Add(ref _sendWindow, dataLength);
+            throw;
+        }
+    }
+
+    private async Task SendMessageZeroCopySlowAsync(ReadOnlyMemory<byte> data, byte[] pooledBuffer, CancellationToken cancellationToken)
+    {
         CancellationTokenSource? linkedCts = null;
         try
         {
@@ -257,7 +340,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         catch
         {
             linkedCts?.Dispose();
-            // Buffer ownership has not yet transferred to the writer thread.
             ArrayPool<byte>.Shared.Return(pooledBuffer);
             throw;
         }
@@ -265,12 +347,16 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         Interlocked.Add(ref _sendWindow, -data.Length);
         try
         {
-            // SendFrameZeroCopyAsync handles its own buffer cleanup on failure.
-            await SendFrameZeroCopyAsync(FrameType.Message, 0, data, pooledBuffer, linkedCts.Token);
+            await SendFrameZeroCopyAsync(FrameType.Message, 0, data, pooledBuffer, linkedCts!.Token);
+        }
+        catch
+        {
+            Interlocked.Add(ref _sendWindow, data.Length);
+            throw;
         }
         finally
         {
-            linkedCts.Dispose();
+            linkedCts!.Dispose();
         }
     }
 
@@ -329,14 +415,40 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// Receives the next frame from the stream.
     /// </summary>
     /// <returns>The frame, or null if the stream is closed.</returns>
-    public async Task<InboundFrame?> ReceiveFrameAsync(CancellationToken cancellationToken = default)
+    public Task<InboundFrame?> ReceiveFrameAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+
+        // Fast path: if a frame is already queued, return it immediately
+        // without allocating a LinkedCTS or async state machine.
+        if (_inboundFrames.Reader.TryRead(out var frame))
+        {
+            return Task.FromResult<InboundFrame?>(frame);
+        }
+
+        // Slow path: need to wait for a frame.
+        return ReceiveFrameSlowAsync(cancellationToken);
+    }
+
+    private async Task<InboundFrame?> ReceiveFrameSlowAsync(CancellationToken cancellationToken)
+    {
+        // Only create LinkedCTS when the caller provided a cancellable token.
+        // In streaming steady state, grpc-dotnet typically passes default.
+        CancellationToken ct;
+        CancellationTokenSource? linkedCts = null;
+        if (cancellationToken.CanBeCanceled)
+        {
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+            ct = linkedCts.Token;
+        }
+        else
+        {
+            ct = _disposeCts.Token;
+        }
 
         try
         {
-            if (await _inboundFrames.Reader.WaitToReadAsync(linkedCts.Token))
+            if (await _inboundFrames.Reader.WaitToReadAsync(ct))
             {
                 if (_inboundFrames.Reader.TryRead(out var frame))
                 {
@@ -350,6 +462,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
         catch (ChannelClosedException)
         {
+        }
+        finally
+        {
+            linkedCts?.Dispose();
         }
 
         return null;
@@ -488,6 +604,107 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 default:
                     f.ReturnToPool();
                     break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Receives the next complete message from the stream, accepting a per-call
+    /// cancellation token. Unlike <see cref="ReceiveMessageBuffersAsync"/> (which
+    /// binds a token at enumerator-creation time and ignores subsequent tokens),
+    /// this method propagates the caller's <paramref name="cancellationToken"/>
+    /// on every call, so client-side cancel/deadline always takes effect — even
+    /// on a long-blocked read.
+    /// <para>
+    /// The returned <see cref="ReadOnlyMemory{T}"/> is backed by a pooled buffer.
+    /// The caller must release <paramref name="previousFrame"/> (the frame from
+    /// the prior call) before calling again — or pass <c>default</c> on first call.
+    /// </para>
+    /// </summary>
+    /// <param name="previousFrame">
+    /// The <see cref="InboundFrame"/> from the previous call. Its pooled buffer
+    /// is released at the start of this call (deferred release for zero-copy).
+    /// Pass <c>default</c> on the first call.
+    /// </param>
+    /// <param name="cancellationToken">Per-call cancellation token.</param>
+    /// <returns>
+    /// A tuple of (memory, frame, endOfStream). When <c>endOfStream</c> is true,
+    /// the stream is complete and no more calls should be made.
+    /// </returns>
+    internal async Task<(ReadOnlyMemory<byte> Memory, InboundFrame Frame, bool EndOfStream)> ReceiveNextMessageBufferAsync(
+        InboundFrame previousFrame,
+        CancellationToken cancellationToken = default)
+    {
+        previousFrame.ReturnToPool();
+        MemoryStream? messageAccumulator = null;
+
+        while (true)
+        {
+            if (_cancelled)
+            {
+                return (default, default, true);
+            }
+
+            var frame = await ReceiveFrameAsync(cancellationToken).ConfigureAwait(false);
+            if (frame == null)
+            {
+                return (default, default, true);
+            }
+
+            var f = frame.Value;
+            switch (f.Type)
+            {
+                case FrameType.Message:
+                    // Send stream-level window update via the batched writer
+                    var increment = (uint)f.Length;
+                    if (increment > 0)
+                    {
+                        _connection.SendStreamWindowUpdate(StreamId, increment);
+                    }
+
+                    if ((f.Flags & MessageFlags.More) != 0)
+                    {
+                        // Multi-fragment: accumulate and continue reading
+                        messageAccumulator ??= new MemoryStream();
+                        messageAccumulator.Write(f.Memory.Span);
+                        f.ReturnToPool();
+                        continue;
+                    }
+
+                    if (messageAccumulator != null && messageAccumulator.Length > 0)
+                    {
+                        // Last fragment of multi-fragment message
+                        messageAccumulator.Write(f.Memory.Span);
+                        f.ReturnToPool();
+                        var assembled = messageAccumulator.ToArray();
+                        messageAccumulator.SetLength(0);
+                        return (assembled, default, false);
+                    }
+
+                    // Single-frame message: return zero-copy view.
+                    // Caller must hold onto 'f' and pass it back as previousFrame
+                    // on the next call so the pooled buffer can be released.
+                    return (f.Memory, f, false);
+
+                case FrameType.HalfClose:
+                    f.ReturnToPool();
+                    _halfCloseReceived = true;
+                    return (default, default, true);
+
+                case FrameType.Trailers:
+                    _trailers = TrailersV1.Decode(f.Memory.Span);
+                    f.ReturnToPool();
+                    _halfCloseReceived = true;
+                    return (default, default, true);
+
+                case FrameType.Cancel:
+                    f.ReturnToPool();
+                    _cancelled = true;
+                    return (default, default, true);
+
+                default:
+                    f.ReturnToPool();
+                    continue;
             }
         }
     }

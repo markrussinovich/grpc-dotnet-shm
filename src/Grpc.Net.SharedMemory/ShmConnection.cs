@@ -42,6 +42,13 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private uint _maxConcurrentStreams;
     private readonly bool _zeroCopyReads;
 
+    // Atomic counter for client-side max-stream enforcement.
+    // Incremented in CreateStream BEFORE adding to _streams, decremented in
+    // RemoveStream AFTER removing. This eliminates the TOCTOU race where
+    // N threads pass a _streams.Count check simultaneously and all succeed
+    // in creating streams, exceeding the server's maxConcurrentStreams limit.
+    private int _clientStreamCount;
+
     // Connection-level flow control (matches grpc-go-shmem)
     private long _connSendQuota;
     private uint _connInFlowLimit;
@@ -105,6 +112,28 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// Raised when a new stream is received from a client (server-side only).
     /// </summary>
     public event EventHandler<StreamReceivedEventArgs>? StreamReceived;
+
+    /// <summary>
+    /// Raised when a stream is removed from this connection.
+    /// </summary>
+    public event Action<uint>? StreamRemoved;
+
+    /// <summary>
+    /// Gets the number of active streams on this connection.
+    /// </summary>
+    public int ActiveStreamCount => _isClient
+        ? Volatile.Read(ref _clientStreamCount)
+        : _streams.Count;
+
+    /// <summary>
+    /// Gets the maximum number of concurrent streams allowed.
+    /// </summary>
+    public uint MaxConcurrentStreams => _maxConcurrentStreams;
+
+    /// <summary>
+    /// Gets the number of additional streams that can be created.
+    /// </summary>
+    public int AvailableStreams => (int)_maxConcurrentStreams - ActiveStreamCount;
 
     /// <summary>
     /// Creates a new client-side connection by opening an existing shared memory segment.
@@ -193,8 +222,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _bdpEstimator = new ShmBdpEstimator((uint)ShmConstants.InitialWindowSize, UpdateFlowControlWindows);
 
         // Create channel for incoming streams (server-side)
-        // Limit to a reasonable max for the bounded channel
-        var channelCapacity = Math.Min((int)_maxConcurrentStreams, 10000);
+        // Use 2x maxConcurrentStreams capacity to absorb transient bursts:
+        // RemoveStream decrements _streams.Count (allowing a new stream to pass
+        // the count check) before the old stream is consumed from the channel.
+        var channelCapacity = Math.Min((int)_maxConcurrentStreams * 2, 10000);
         _incomingStreamsChannel = Channel.CreateBounded<ShmGrpcStream>(new BoundedChannelOptions(channelCapacity)
         {
             FullMode = BoundedChannelFullMode.Wait,
@@ -205,11 +236,14 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // Client uses odd stream IDs (1, 3, 5, ...), server uses even (2, 4, 6, ...)
         _nextStreamId = isClient ? 1u : 2u;
 
+        // Initialize the frame writer BEFORE the reader. The reader thread
+        // can process inbound frames immediately (e.g., Ping) which trigger
+        // SendFrame → _frameWriter.Enqueue. If the writer isn't initialized
+        // yet, that's a NullReferenceException.
+        _frameWriter = new ShmFrameWriter(TxRing, _disposeCts);
+
         // Start background frame reader
         _frameReaderTask = FrameReaderLoopAsync();
-
-        // Start batched frame writer
-        _frameWriter = new ShmFrameWriter(TxRing, _disposeCts);
 
         // Start keepalive task if enabled
         if (_keepaliveOptions.IsEnabled)
@@ -222,21 +256,36 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// Creates a new stream for a gRPC call (client-side).
     /// </summary>
     /// <returns>A new gRPC stream.</returns>
+    /// <exception cref="ShmStreamCapacityExceededException">
+    /// Thrown when the connection has reached <see cref="MaxConcurrentStreams"/>.
+    /// The caller should retry on a different connection via the pool.
+    /// </exception>
     public ShmGrpcStream CreateStream()
     {
         ThrowIfDisposed();
         ThrowIfGoAway();
 
-        if (_zeroCopyReads && _streams.Count > 0)
+        // Atomically reserve a stream slot BEFORE creating the stream object.
+        // Increment-then-check eliminates the TOCTOU race where N threads all
+        // read _streams.Count < max, then all TryAdd successfully, exceeding
+        // the server's limit and causing REJECTs that hang streaming calls.
+        // This also enforces the zero-copy single-stream invariant: when
+        // _maxConcurrentStreams == 1 (_zeroCopyReads), only one thread can
+        // increment from 0 to 1; the second sees reserved > 1 and fails.
+        var reserved = Interlocked.Increment(ref _clientStreamCount);
+        if (reserved > (int)_maxConcurrentStreams)
         {
-            throw new InvalidOperationException("Zero-copy mode supports only one active stream");
+            Interlocked.Decrement(ref _clientStreamCount);
+            throw new ShmStreamCapacityExceededException(
+                $"Connection '{Name}' has reached max concurrent streams ({_maxConcurrentStreams})");
         }
 
-        var streamId = Interlocked.Add(ref _nextStreamId, 2) - 2; // Increment by 2, return previous value
+        var streamId = Interlocked.Add(ref _nextStreamId, 2) - 2;
         var stream = new ShmGrpcStream(streamId, this, isServerStream: false);
 
         if (!_streams.TryAdd(streamId, stream))
         {
+            Interlocked.Decrement(ref _clientStreamCount);
             throw new InvalidOperationException($"Stream ID {streamId} already exists");
         }
 
@@ -339,7 +388,15 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
     internal void RemoveStream(uint streamId)
     {
-        _streams.TryRemove(streamId, out _);
+        if (_streams.TryRemove(streamId, out _))
+        {
+            if (_isClient)
+            {
+                Interlocked.Decrement(ref _clientStreamCount);
+            }
+
+            StreamRemoved?.Invoke(streamId);
+        }
     }
 
     internal void SendFrame(FrameType type, uint streamId, byte flags, ReadOnlySpan<byte> payload)
@@ -371,37 +428,56 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
     private Task FrameReaderLoopAsync()
     {
-        // Run blocking ReadFramePayload on a dedicated thread.
-        return Task.Factory.StartNew(async () =>
+        // Run the blocking ReadFramePayload loop on a dedicated thread.
+        // Previous implementation used Task.Factory.StartNew(async () => {...}, LongRunning)
+        // which loses the dedicated thread after the first await in the async lambda,
+        // causing the continuation to run on the ThreadPool. Under high concurrency
+        // (e.g., 256 sessions), ThreadPool starvation can delay the frame reader
+        // indefinitely, causing hangs: the remote ring fills up, the remote writer
+        // blocks, and no progress is made.
+        //
+        // Using a real Thread ensures the frame reader never competes with application
+        // tasks for ThreadPool threads.
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
         {
             try
             {
                 while (!_disposeCts.Token.IsCancellationRequested)
                 {
                     var (header, payload) = FrameProtocol.ReadFramePayload(RxRing, _zeroCopyReads, _disposeCts.Token);
-                    await ProcessFrameAsync(header, payload).ConfigureAwait(false);
+                    ProcessFrame(header, payload);
                 }
+
+                tcs.TrySetResult();
             }
             catch (OperationCanceledException)
             {
-                // Normal shutdown
+                tcs.TrySetResult(); // Normal shutdown
             }
-            catch (ObjectDisposedException ex)
+            catch (ObjectDisposedException)
             {
-                System.Diagnostics.Debug.WriteLine($"Frame reader disposed: {ex.Message}");
+                tcs.TrySetResult(); // Normal shutdown
             }
             catch (RingClosedException)
             {
-                // Normal shutdown
+                tcs.TrySetResult(); // Normal shutdown
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"Frame reader error: {ex.Message}");
+                tcs.TrySetException(ex);
             }
-        }, _disposeCts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        })
+        {
+            IsBackground = true,
+            Name = $"ShmFrameReader-{Name}"
+        };
+        thread.Start();
+        return tcs.Task;
     }
 
-    private async Task ProcessFrameAsync(FrameHeader header, FramePayload payload)
+    private void ProcessFrame(FrameHeader header, FramePayload payload)
     {
         var payloadLength = payload.Length;
         var payloadMemory = payload.Memory;
@@ -409,7 +485,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         switch (header.Type)
         {
             case FrameType.Headers:
-                await HandleHeadersFrameAsync(header, payload);
+                HandleHeadersFrame(header, payload);
                 break;
 
             case FrameType.Message:
@@ -481,7 +557,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// For server: creates a new stream from client request.
     /// For client: routes to existing stream (response headers).
     /// </summary>
-    private async Task HandleHeadersFrameAsync(FrameHeader header, FramePayload payload)
+    private void HandleHeadersFrame(FrameHeader header, FramePayload payload)
     {
         var streamId = header.StreamId;
 
@@ -548,10 +624,38 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 return;
             }
 
-            // Publish to incoming streams channel
+            // Publish to incoming streams channel.
+            // Channel capacity is 2x maxConcurrentStreams to absorb the window
+            // between RemoveStream (which decrements _streams.Count, allowing
+            // new streams past the count check) and the consumer draining the
+            // channel. TryWrite should always succeed with this capacity.
             if (!_incomingStreamsChannel.Writer.TryWrite(newStream))
             {
-                await _incomingStreamsChannel.Writer.WriteAsync(newStream, _disposeCts.Token);
+                // Should not happen with 2x capacity. If it does, wait briefly
+                // then fail-fast: reject the stream so the client gets an error
+                // instead of hanging in an orphaned state.
+                // Use a dedicated CTS with timeout so the WriteAsync is cancelled
+                // on timeout — not left orphaned. An uncancelled WriteAsync could
+                // enqueue the stream later, after we've already rejected it.
+                var written = false;
+                try
+                {
+                    using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_disposeCts.Token);
+                    timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(500));
+                    _incomingStreamsChannel.Writer.WriteAsync(newStream, timeoutCts.Token)
+                        .AsTask().GetAwaiter().GetResult();
+                    written = true;
+                }
+                catch { /* disposed, cancelled, or timed out */ }
+
+                if (!written)
+                {
+                    // Remove from _streams and reject — the stream was accepted
+                    // into _streams but never delivered to AcceptStreamsAsync.
+                    _streams.TryRemove(streamId, out _);
+                    RejectStream(streamId, "server overloaded");
+                    return;
+                }
             }
 
             StreamReceived?.Invoke(this, new StreamReceivedEventArgs(newStream));
@@ -874,7 +978,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 _goAwaySent = true;
                 try
                 {
-                    using var goAwayCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                    using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
                     var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
                     var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
                     FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
@@ -885,7 +989,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             _disposeCts.Cancel();
 
             // Wait for reader to finish
-            try { _frameReaderTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
+            try { _frameReaderTask.Wait(TimeSpan.FromMilliseconds(500)); } catch { }
 
             // Dispose all streams
             foreach (var stream in _streams.Values)
@@ -915,7 +1019,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 _goAwaySent = true;
                 try
                 {
-                    using var goAwayCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                    using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
                     var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
                     var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
                     FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
@@ -926,7 +1030,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             _disposeCts.Cancel();
 
             // Wait for reader to finish
-            try { await _frameReaderTask.WaitAsync(TimeSpan.FromSeconds(1)); } catch { }
+            try { await _frameReaderTask.WaitAsync(TimeSpan.FromMilliseconds(500)); } catch { }
 
             // Dispose all streams
             foreach (var stream in _streams.Values)

@@ -224,7 +224,7 @@ internal sealed class ShmFrameWriter : IDisposable
             var writerDone = false;
             try
             {
-                writerDone = _writerTask.Wait(TimeSpan.FromSeconds(2));
+                writerDone = _writerTask.Wait(TimeSpan.FromMilliseconds(500));
             }
             catch (AggregateException)
             {
@@ -238,7 +238,7 @@ internal sealed class ShmFrameWriter : IDisposable
                 _cts.Cancel();
                 try
                 {
-                    _writerTask.Wait(TimeSpan.FromSeconds(2));
+                    _writerTask.Wait(TimeSpan.FromMilliseconds(500));
                 }
                 catch (AggregateException)
                 {

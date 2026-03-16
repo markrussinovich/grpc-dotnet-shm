@@ -107,8 +107,11 @@ public class ShmConnectionPoolConcurrencyTests
     public async Task GetConnection_DisposeWhileFactoryBlocked_FailsFastAndNoLeak()
     {
         // This test verifies that when DisposeAsync() races with a slow
-        // connection factory, the caller gets ObjectDisposedException promptly
-        // (not after ConnectTimeout), and no connection is leaked into the pool.
+        // connection factory that respects cancellation, the caller gets
+        // ObjectDisposedException promptly and no connection is leaked.
+        // The pool's shutdown is best-effort: it cancels _factoryCts and
+        // waits up to 3 seconds for the factory to exit. Factories that
+        // ignore cancellation may still be running when DisposeAsync returns.
 
         var name = $"conc_test_{Guid.NewGuid():N}";
         using var serverConn = ShmConnection.CreateAsServer(name, ringCapacity: 4096, maxStreams: 100);
@@ -121,8 +124,9 @@ public class ShmConnectionPoolConcurrencyTests
         {
             // Signal that the factory has been entered.
             factoryEntered.TrySetResult();
-            // Block until the test releases us.
-            await factoryGate.Task;
+            // Block until the test releases us OR cancellation is requested.
+            // A well-behaved factory must observe the token.
+            await factoryGate.Task.WaitAsync(ct);
             return ShmConnection.ConnectAsClient(name);
         });
         await using var __ = pool;
@@ -136,11 +140,16 @@ public class ShmConnectionPoolConcurrencyTests
         // Dispose the pool while the factory is blocked.
         await pool.DisposeAsync();
 
-        // Release the factory — connection will be created but pool is disposed.
+        // Release the factory gate (in case cancellation arrived before the
+        // wait — prevents the factory Task from leaking).
         factoryGate.TrySetResult();
 
-        // The GetConnectionAsync call should fail with ObjectDisposedException.
-        Assert.ThrowsAsync<ObjectDisposedException>(async () => await getTask);
+        // The GetConnectionAsync call should fail — either with
+        // ObjectDisposedException (pool detected disposed state) or
+        // OperationCanceledException (factory's WaitAsync observed _factoryCts).
+        var ex = Assert.CatchAsync(async () => await getTask);
+        Assert.That(ex, Is.InstanceOf<ObjectDisposedException>()
+            .Or.InstanceOf<OperationCanceledException>());
 
         // Pool should have no residual connections.
         Assert.That(pool.ConnectionCount, Is.EqualTo(0));

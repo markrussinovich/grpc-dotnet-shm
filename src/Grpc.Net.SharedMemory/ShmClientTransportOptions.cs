@@ -81,7 +81,12 @@ public sealed class ShmClientTransportOptions
     /// actual capacity as <c>Min(clientPreferred, serverMax)</c>. A value of <c>0</c>
     /// means the client has no preference and the server will use its default.
     /// </para>
-    /// Default is 64 MB (67,108,864 bytes).
+    /// <para>
+    /// Smaller rings improve CPU cache locality — a 4 MiB ring fits in most L3 caches,
+    /// while a 64 MiB ring causes TLB thrashing and frequent cache evictions. Use larger
+    /// rings only for workloads with very large messages (e.g., &gt;1 MiB) or high pipeline depth.
+    /// </para>
+    /// Default is 64 MiB (67,108,864 bytes).
     /// </summary>
     public ulong RingCapacity { get; set; } = 64 * 1024 * 1024;
 

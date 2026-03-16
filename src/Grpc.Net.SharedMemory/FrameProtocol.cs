@@ -27,6 +27,14 @@ using System.Buffers;
 public static class FrameProtocol
 {
     /// <summary>
+    /// Maximum allowed frame payload size (128 MiB). Any frame header claiming a
+    /// payload larger than this is treated as data corruption (e.g., from a SPSC
+    /// ring buffer violation or stale shared memory) and will throw rather than
+    /// attempting a huge allocation that would hang or OOM.
+    /// </summary>
+    internal const int MaxFramePayloadSize = 128 * 1024 * 1024;
+
+    /// <summary>
     /// Reads a frame and returns a payload wrapper that can either borrow ring memory
     /// (when contiguous and allowed) or use a pooled buffer fallback.
     /// </summary>
@@ -45,6 +53,22 @@ public static class FrameProtocol
             ring.CommitRead(headerReservation, ShmConstants.FrameHeaderSize);
 
             var header = FrameHeader.DecodeFrom(headerBytes);
+
+            // Guard against corrupted frame headers that could cause huge
+            // allocations or block forever trying to read from the ring.
+            if (header.Length > MaxFramePayloadSize)
+            {
+                throw new InvalidDataException(
+                    $"Frame payload length {header.Length} exceeds maximum {MaxFramePayloadSize}. " +
+                    "This may indicate data corruption in the shared memory ring buffer.");
+            }
+
+            if (!Enum.IsDefined(header.Type) && header.Type != FrameType.Pad)
+            {
+                throw new InvalidDataException(
+                    $"Unknown frame type 0x{(byte)header.Type:X2} with length {header.Length}. " +
+                    "This may indicate data corruption in the shared memory ring buffer.");
+            }
 
             // Skip PAD frames
             if (header.Type == FrameType.Pad)
@@ -194,6 +218,19 @@ public static class FrameProtocol
 
             var header = FrameHeader.DecodeFrom(headerBytes);
 
+            // Guard against corrupted frame headers
+            if (header.Length > MaxFramePayloadSize)
+            {
+                throw new InvalidDataException(
+                    $"Frame payload length {header.Length} exceeds maximum {MaxFramePayloadSize}.");
+            }
+
+            if (!Enum.IsDefined(header.Type) && header.Type != FrameType.Pad)
+            {
+                throw new InvalidDataException(
+                    $"Unknown frame type 0x{(byte)header.Type:X2} with length {header.Length}.");
+            }
+
             // Skip PAD frames
             if (header.Type == FrameType.Pad)
             {
@@ -245,6 +282,19 @@ public static class FrameProtocol
 
             var header = FrameHeader.DecodeFrom(headerBytes);
 
+            // Guard against corrupted frame headers
+            if (header.Length > MaxFramePayloadSize)
+            {
+                throw new InvalidDataException(
+                    $"Frame payload length {header.Length} exceeds maximum {MaxFramePayloadSize}.");
+            }
+
+            if (!Enum.IsDefined(header.Type) && header.Type != FrameType.Pad)
+            {
+                throw new InvalidDataException(
+                    $"Unknown frame type 0x{(byte)header.Type:X2} with length {header.Length}.");
+            }
+
             // Skip PAD frames
             if (header.Type == FrameType.Pad)
             {
@@ -294,6 +344,19 @@ public static class FrameProtocol
             ring.CommitRead(headerReservation, ShmConstants.FrameHeaderSize);
 
             var header = FrameHeader.DecodeFrom(headerBytes);
+
+            // Guard against corrupted frame headers
+            if (header.Length > MaxFramePayloadSize)
+            {
+                throw new InvalidDataException(
+                    $"Frame payload length {header.Length} exceeds maximum {MaxFramePayloadSize}.");
+            }
+
+            if (!Enum.IsDefined(header.Type) && header.Type != FrameType.Pad)
+            {
+                throw new InvalidDataException(
+                    $"Unknown frame type 0x{(byte)header.Type:X2} with length {header.Length}.");
+            }
 
             // Skip PAD frames
             if (header.Type == FrameType.Pad)
