@@ -181,29 +181,6 @@ public class ConnectionLifecycleTests
 
     [Test]
     [Platform("Win")]
-    public void ConnectionSendQuota_InitialValue()
-    {
-        var segmentName = $"lifecycle_test_{Guid.NewGuid():N}";
-        
-        using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
-        
-        Assert.That(server.ConnectionSendQuota, Is.EqualTo(ShmConstants.InitialWindowSize));
-    }
-
-    [Test]
-    [Platform("Win")]
-    public void BdpEstimator_IsInitialized()
-    {
-        var segmentName = $"lifecycle_test_{Guid.NewGuid():N}";
-        
-        using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
-        
-        Assert.That(server.BdpEstimator, Is.Not.Null);
-        Assert.That(server.BdpEstimator.CurrentBdp, Is.EqualTo(ShmConstants.InitialWindowSize));
-    }
-
-    [Test]
-    [Platform("Win")]
     public void MultipleServerConnections_IndependentSegments()
     {
         var segment1 = $"lifecycle_test_1_{Guid.NewGuid():N}";

@@ -117,8 +117,21 @@ internal sealed class ShmPooledConnection
     /// timer does not need per-RPC precision.
     /// </summary>
     /// <returns>A new <see cref="ShmGrpcStream"/>.</returns>
+    /// <exception cref="ShmStreamCapacityExceededException">
+    /// Thrown if the connection was closed by the idle cleanup timer between
+    /// <see cref="ShmConnectionPool.TryGetConnection"/> and this call.
+    /// </exception>
     public ShmGrpcStream CreateStream()
     {
+        // Guard against the race where idle cleanup marks this connection
+        // as Closed (setting _active = false) between TryGetConnection
+        // returning it and the caller invoking CreateStream.
+        if (!_active)
+        {
+            throw new ShmStreamCapacityExceededException(
+                "Connection was closed by idle cleanup before stream could be created");
+        }
+
         // Only update tick when going from idle → active. This avoids a
         // Volatile.Write + Environment.TickCount64 syscall on every RPC.
         if (_connection.ActiveStreamCount == 0)

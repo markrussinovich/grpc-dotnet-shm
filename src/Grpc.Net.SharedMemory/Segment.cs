@@ -128,7 +128,7 @@ public sealed partial class Segment : IDisposable
     private readonly MappedMemoryManager _memoryManager;
     private readonly Memory<byte> _memory;
     private readonly bool _isServer;
-    private bool _disposed;
+    private int _disposed;
 
     /// <summary>Gets the segment name.</summary>
     public string Name { get; }
@@ -197,7 +197,12 @@ public sealed partial class Segment : IDisposable
         }
         catch
         {
-            // Sync primitives are optional - fall back to polling if not available
+            // Sync primitives are optional — fall back to polling.
+            // Dispose any partially created sync to avoid OS handle leak.
+            syncA?.Dispose();
+            syncA = null;
+            syncB?.Dispose();
+            syncB = null;
         }
 
         // Create ring buffers operating directly on mapped memory (zero-copy)
@@ -250,18 +255,45 @@ public sealed partial class Segment : IDisposable
 
         // Create memory-mapped file from the backing file
         var backingFile = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
-        var mappedFile = MemoryMappedFile.CreateFromFile(
-            backingFile,
-            mapName: null, // No kernel name for file-backed
-            (long)totalSize,
-            MemoryMappedFileAccess.ReadWrite,
-            HandleInheritability.None,
-            leaveOpen: false);
+        MemoryMappedFile mappedFile;
+        MemoryMappedViewAccessor accessor;
+        MappedMemoryManager memoryManager;
+        try
+        {
+            mappedFile = MemoryMappedFile.CreateFromFile(
+                backingFile,
+                mapName: null,
+                (long)totalSize,
+                MemoryMappedFileAccess.ReadWrite,
+                HandleInheritability.None,
+                leaveOpen: false);
+        }
+        catch
+        {
+            backingFile.Dispose();
+            throw;
+        }
 
-        var accessor = mappedFile.CreateViewAccessor(0, (long)totalSize, MemoryMappedFileAccess.ReadWrite);
+        try
+        {
+            accessor = mappedFile.CreateViewAccessor(0, (long)totalSize, MemoryMappedFileAccess.ReadWrite);
+        }
+        catch
+        {
+            mappedFile.Dispose();
+            throw;
+        }
 
-        // Create zero-copy memory manager over the mapped region
-        var memoryManager = new MappedMemoryManager(accessor);
+        try
+        {
+            memoryManager = new MappedMemoryManager(accessor);
+        }
+        catch
+        {
+            accessor.Dispose();
+            mappedFile.Dispose();
+            throw;
+        }
         var memory = memoryManager.Memory;
 
         // Initialize segment header with grpc-go-shmem compatible magic
@@ -327,20 +359,37 @@ public sealed partial class Segment : IDisposable
         }
 
         // Create memory-mapped file from the backing file (temporarily for header read)
-        var mappedFile = MemoryMappedFile.CreateFromFile(
-            backingFile,
-            mapName: null,
-            backingFile.Length,
-            MemoryMappedFileAccess.ReadWrite,
-            HandleInheritability.None,
-            leaveOpen: false);
+        MemoryMappedFile mappedFile;
+        try
+        {
+            mappedFile = MemoryMappedFile.CreateFromFile(
+                backingFile,
+                mapName: null,
+                backingFile.Length,
+                MemoryMappedFileAccess.ReadWrite,
+                HandleInheritability.None,
+                leaveOpen: false);
+        }
+        catch
+        {
+            backingFile.Dispose();
+            throw;
+        }
 
         // Read and validate header
-        using var headerAccessor = mappedFile.CreateViewAccessor(0, ShmConstants.SegmentHeaderSize, MemoryMappedFileAccess.Read);
-        var headerBuffer = new byte[ShmConstants.SegmentHeaderSize];
-        headerAccessor.ReadArray(0, headerBuffer, 0, headerBuffer.Length);
-
-        var header = ReadSegmentHeader(headerBuffer);
+        SegmentHeader header;
+        try
+        {
+            using var headerAccessor = mappedFile.CreateViewAccessor(0, ShmConstants.SegmentHeaderSize, MemoryMappedFileAccess.Read);
+            var headerBuffer = new byte[ShmConstants.SegmentHeaderSize];
+            headerAccessor.ReadArray(0, headerBuffer, 0, headerBuffer.Length);
+            header = ReadSegmentHeader(headerBuffer);
+        }
+        catch
+        {
+            mappedFile.Dispose();
+            throw;
+        }
 
         // Validate magic - check for grpc-go-shmem compatible "GRPCSHM\0"
         var expectedMagic = BitConverter.ToUInt64(ShmConstants.SegmentMagicBytes);
@@ -360,10 +409,29 @@ public sealed partial class Segment : IDisposable
         var totalSize = header.TotalSize > 0
             ? header.TotalSize
             : header.RingBOffset + (ulong)ShmConstants.RingHeaderSize + header.RingBCapacity;
-        var accessor = mappedFile.CreateViewAccessor(0, (long)totalSize, MemoryMappedFileAccess.ReadWrite);
 
-        // Create zero-copy memory manager over the mapped region
-        var memoryManager = new MappedMemoryManager(accessor);
+        MemoryMappedViewAccessor accessor;
+        MappedMemoryManager memoryManager;
+        try
+        {
+            accessor = mappedFile.CreateViewAccessor(0, (long)totalSize, MemoryMappedFileAccess.ReadWrite);
+        }
+        catch
+        {
+            mappedFile.Dispose();
+            throw;
+        }
+
+        try
+        {
+            memoryManager = new MappedMemoryManager(accessor);
+        }
+        catch
+        {
+            accessor.Dispose();
+            mappedFile.Dispose();
+            throw;
+        }
 
         return new Segment(name, filePath, mappedFile, accessor, memoryManager, false,
             header.RingAOffset, header.RingACapacity, header.RingBOffset, header.RingBCapacity);
@@ -422,7 +490,7 @@ public sealed partial class Segment : IDisposable
     /// </summary>
     public void Flush()
     {
-        if (_disposed) return;
+        if (Volatile.Read(ref _disposed) != 0) return;
         _accessor.Flush();
     }
 
@@ -749,8 +817,7 @@ public sealed partial class Segment : IDisposable
     /// </summary>
     public void UnmapWithoutClose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
         RingA.Dispose();
         RingB.Dispose();
@@ -762,8 +829,7 @@ public sealed partial class Segment : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
         RingA.Dispose();
         RingB.Dispose();

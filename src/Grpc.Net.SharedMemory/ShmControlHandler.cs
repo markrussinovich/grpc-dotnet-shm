@@ -125,10 +125,11 @@ public sealed class ShmControlHandler : HttpMessageHandler
             {
                 stream = pooledConn.CreateStream();
             }
-            catch (ShmStreamCapacityExceededException) when (!cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (
+                !cancellationToken.IsCancellationRequested &&
+                (ex is ShmStreamCapacityExceededException or ObjectDisposedException or InvalidOperationException))
             {
-                // Capacity race: another thread took the last slot.
-                // Enter slow retry path with timeout.
+                // Connection closed, draining, or at capacity — retry on another connection.
                 stream = await CreateStreamWithRetryAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (ShmStreamCapacityExceededException) when (cancellationToken.IsCancellationRequested)
@@ -143,7 +144,12 @@ public sealed class ShmControlHandler : HttpMessageHandler
         {
             // === Pool-bypass path ===
             // Zero pool overhead: direct connection.CreateStream().
-            var conn = _directConnection ?? await EnsureDirectConnectionAsync(cancellationToken).ConfigureAwait(false);
+            var conn = _directConnection;
+            if (conn == null || conn.IsClosed)
+            {
+                conn = await EnsureDirectConnectionAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             stream = conn.CreateStream();
         }
 
@@ -178,9 +184,11 @@ public sealed class ShmControlHandler : HttpMessageHandler
             {
                 return pooledConn.CreateStream();
             }
-            catch (ShmStreamCapacityExceededException) when (!linkedCts.IsCancellationRequested)
+            catch (Exception ex) when (
+                !linkedCts.IsCancellationRequested &&
+                (ex is ShmStreamCapacityExceededException or ObjectDisposedException or InvalidOperationException))
             {
-                // Keep retrying from pool.
+                // Connection closed, draining, or at capacity — retry from pool.
             }
             catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
@@ -281,16 +289,18 @@ public sealed class ShmControlHandler : HttpMessageHandler
         catch (Exception ex)
         {
             // Unexpected exception from HttpContent.CopyToAsync (user-supplied
-            // content) or SendHalfCloseAsync. Log it so it doesn't become an
-            // unobserved Task exception.
+            // content) or SendHalfCloseAsync. Cancel the stream so that
+            // ReceiveResponseHeadersAsync (which may be waiting concurrently)
+            // fails fast instead of hanging until timeout.
             System.Diagnostics.Debug.WriteLine(
                 $"ShmControlHandler: unexpected error sending request body: {ex.GetType().Name}: {ex.Message}");
+            try { await stream.CancelAsync().ConfigureAwait(false); }
+            catch { /* best effort */ }
         }
     }
 
     private async Task<ShmConnection> ConnectViaControlSegmentAsync(CancellationToken cancellationToken)
     {
-        // Timeout is handled by ShmConnectionPool (via ShmClientTransportOptions.ConnectTimeout).
         var ct = cancellationToken;
 
         // Open the control segment
@@ -330,13 +340,21 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
                     // Open the data segment
                     var dataSegment = Segment.Open(dataSegmentName);
-                    await dataSegment.WaitForServerAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        await dataSegment.WaitForServerAsync(ct).ConfigureAwait(false);
 
-                    // Signal that client has mapped the segment
-                    dataSegment.SetClientReady(true);
+                        // Signal that client has mapped the segment
+                        dataSegment.SetClientReady(true);
 
-                    // Create and return the connection
-                    return ShmConnection.FromClientSegment(dataSegmentName, dataSegment);
+                        // Create and return the connection
+                        return ShmConnection.FromClientSegment(dataSegmentName, dataSegment);
+                    }
+                    catch
+                    {
+                        dataSegment.Dispose();
+                        throw;
+                    }
 
                 case FrameType.Reject:
                     var message = ControlWire.DecodeConnectReject(responsePayload.Span);
@@ -385,6 +403,11 @@ public sealed class ShmControlHandler : HttpMessageHandler
         Memory<byte> payload = Memory<byte>.Empty;
         if (header.Length > 0)
         {
+            if (header.Length > ShmConstants.MinRingCapacity)
+            {
+                throw new InvalidDataException($"Control frame payload {header.Length} exceeds maximum.");
+            }
+
             var payloadBuffer = new byte[header.Length];
             ReadExact(ring, payloadBuffer, ct);
             payload = payloadBuffer;
@@ -463,16 +486,23 @@ public sealed class ShmControlHandler : HttpMessageHandler
         if (!long.TryParse(timeout[..^1], out var value))
             return false;
 
-        duration = unit switch
+        try
         {
-            'H' => TimeSpan.FromHours(value),
-            'M' => TimeSpan.FromMinutes(value),
-            'S' => TimeSpan.FromSeconds(value),
-            'm' => TimeSpan.FromMilliseconds(value),
-            'u' => TimeSpan.FromMicroseconds(value),
-            'n' => TimeSpan.FromTicks(value / 100), // nanoseconds
-            _ => TimeSpan.Zero
-        };
+            duration = unit switch
+            {
+                'H' => TimeSpan.FromHours(value),
+                'M' => TimeSpan.FromMinutes(value),
+                'S' => TimeSpan.FromSeconds(value),
+                'm' => TimeSpan.FromMilliseconds(value),
+                'u' => TimeSpan.FromMicroseconds(value),
+                'n' => TimeSpan.FromTicks(value / 100),
+                _ => TimeSpan.Zero
+            };
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
 
         return duration > TimeSpan.Zero;
     }
@@ -494,9 +524,16 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
             // Double-check after acquiring the lock.
             var existing = _directConnection;
-            if (existing != null)
+            if (existing != null && !existing.IsClosed)
             {
                 return existing;
+            }
+
+            // Dispose the stale connection if it was closed.
+            if (existing != null)
+            {
+                _directConnection = null;
+                try { await existing.DisposeAsync().ConfigureAwait(false); } catch { }
             }
 
             var conn = await ConnectViaControlSegmentAsync(cancellationToken).ConfigureAwait(false);
@@ -587,14 +624,21 @@ public sealed class ShmControlHandler : HttpMessageHandler
 }
 
 /// <summary>
-/// Write-through stream that forwards each gRPC-framed message written by
-/// grpc-dotnet directly to ShmGrpcStream.SendMessageAsync — no intermediate
-/// Pipe or buffer copy.  grpc-dotnet always writes each gRPC message as a
-/// single WriteAsync call: [compressed:1][length:4][data].
+/// Write-through stream that reassembles gRPC-framed messages from
+/// arbitrary WriteAsync chunks and forwards each complete message to
+/// <see cref="ShmGrpcStream.SendMessageAsync"/>.  Although grpc-dotnet
+/// typically writes a full [compressed:1][length:4][data] frame per call,
+/// <see cref="Stream.WriteAsync"/> does not guarantee frame alignment,
+/// so this class buffers partial headers and bodies defensively.
 /// </summary>
 internal sealed class ShmGrpcRequestStream : Stream
 {
     private readonly ShmGrpcStream _shmStream;
+    private byte[]? _headerBuf;
+    private int _headerBufLen;
+    private byte[]? _bodyBuf;
+    private int _bodyBufLen;
+    private int _bodyExpected;
 
     public ShmGrpcRequestStream(ShmGrpcStream shmStream)
     {
@@ -609,18 +653,95 @@ internal sealed class ShmGrpcRequestStream : Stream
 
     public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        if (buffer.Length < 5) return; // ignore empty/partial writes
+        // grpc-dotnet typically writes one complete gRPC frame per WriteAsync call:
+        // [compressed:1][length:4][payload].  However, Stream.WriteAsync does not
+        // guarantee frame-aligned writes, so we buffer partial headers and bodies
+        // defensively to handle arbitrary split points.
+        var remaining = buffer;
 
-        // Parse gRPC frame header
-        var span = buffer.Span;
-        var compressed = span[0] != 0;
-        if (compressed) throw new NotSupportedException("Compression not yet supported");
+        // Resume partial body from previous write
+        if (_bodyExpected > 0 && _bodyBufLen < _bodyExpected)
+        {
+            var needed = _bodyExpected - _bodyBufLen;
+            var toCopy = Math.Min(needed, remaining.Length);
+            remaining.Slice(0, toCopy).CopyTo(_bodyBuf.AsMemory(_bodyBufLen));
+            _bodyBufLen += toCopy;
+            remaining = remaining.Slice(toCopy);
 
-        var length = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(span.Slice(1));
+            if (_bodyBufLen < _bodyExpected)
+            {
+                return; // Still incomplete
+            }
 
-        // Pass message body directly as a memory slice — no copy.
-        // The previous .ToArray() allocated a new byte[] (LOH at ≥85KB) on every send.
-        await _shmStream.SendMessageAsync(buffer.Slice(5, length), cancellationToken).ConfigureAwait(false);
+            await _shmStream.SendMessageAsync(_bodyBuf.AsMemory(0, _bodyExpected), cancellationToken).ConfigureAwait(false);
+            _bodyBufLen = 0;
+            _bodyExpected = 0;
+        }
+
+        // Resume partial header from previous write
+        if (_headerBufLen > 0)
+        {
+            var needed = 5 - _headerBufLen;
+            if (remaining.Length < needed)
+            {
+                remaining.CopyTo(_headerBuf.AsMemory(_headerBufLen));
+                _headerBufLen += remaining.Length;
+                return;
+            }
+
+            remaining.Slice(0, needed).CopyTo(_headerBuf.AsMemory(_headerBufLen));
+            _headerBufLen = 0;
+            remaining = remaining.Slice(needed);
+
+            var hdrSpan = _headerBuf.AsSpan(0, 5);
+            if (hdrSpan[0] != 0) throw new NotSupportedException("Compression not yet supported");
+            var length = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(hdrSpan.Slice(1));
+
+            if (remaining.Length < length)
+            {
+                // Partial body — buffer it
+                _bodyBuf ??= new byte[length];
+                if (_bodyBuf.Length < length) _bodyBuf = new byte[length];
+                remaining.CopyTo(_bodyBuf);
+                _bodyBufLen = remaining.Length;
+                _bodyExpected = length;
+                return;
+            }
+
+            await _shmStream.SendMessageAsync(remaining.Slice(0, length), cancellationToken).ConfigureAwait(false);
+            remaining = remaining.Slice(length);
+        }
+
+        // Process complete frames in the remaining buffer
+        while (remaining.Length > 0)
+        {
+            if (remaining.Length < 5)
+            {
+                _headerBuf ??= new byte[5];
+                remaining.CopyTo(_headerBuf);
+                _headerBufLen = remaining.Length;
+                return;
+            }
+
+            var span = remaining.Span;
+            if (span[0] != 0) throw new NotSupportedException("Compression not yet supported");
+            var msgLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(span.Slice(1));
+
+            if (remaining.Length < 5 + msgLen)
+            {
+                // Partial body — buffer header + available body
+                _bodyExpected = msgLen;
+                _bodyBuf ??= new byte[msgLen];
+                if (_bodyBuf.Length < msgLen) _bodyBuf = new byte[msgLen];
+                var available = remaining.Length - 5;
+                remaining.Slice(5, available).CopyTo(_bodyBuf);
+                _bodyBufLen = available;
+                return;
+            }
+
+            await _shmStream.SendMessageAsync(remaining.Slice(5, msgLen), cancellationToken).ConfigureAwait(false);
+            remaining = remaining.Slice(5 + msgLen);
+        }
     }
 
     public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)

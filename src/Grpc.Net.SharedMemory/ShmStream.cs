@@ -27,28 +27,32 @@ public sealed class ShmStream : Stream
     private readonly ShmRing _readRing;
     private readonly ShmRing _writeRing;
     private readonly CancellationTokenSource _disposeCts;
-    private bool _disposed;
+    private readonly Segment? _ownedSegment;
+    private int _disposed;
+    private int _inflightOps; // Tracks in-flight Task.Run operations
 
     /// <summary>
     /// Creates a new ShmStream with separate read and write ring buffers.
     /// </summary>
     /// <param name="readRing">Ring buffer for reading (receiving data).</param>
     /// <param name="writeRing">Ring buffer for writing (sending data).</param>
-    public ShmStream(ShmRing readRing, ShmRing writeRing)
+    /// <param name="ownedSegment">Optional segment to dispose when the stream is disposed.</param>
+    public ShmStream(ShmRing readRing, ShmRing writeRing, Segment? ownedSegment = null)
     {
         _readRing = readRing ?? throw new ArgumentNullException(nameof(readRing));
         _writeRing = writeRing ?? throw new ArgumentNullException(nameof(writeRing));
+        _ownedSegment = ownedSegment;
         _disposeCts = new CancellationTokenSource();
     }
 
     /// <inheritdoc/>
-    public override bool CanRead => !_disposed;
+    public override bool CanRead => Volatile.Read(ref _disposed) == 0;
 
     /// <inheritdoc/>
     public override bool CanSeek => false;
 
     /// <inheritdoc/>
-    public override bool CanWrite => !_disposed;
+    public override bool CanWrite => Volatile.Read(ref _disposed) == 0;
 
     /// <inheritdoc/>
     public override long Length => throw new NotSupportedException();
@@ -89,21 +93,33 @@ public sealed class ShmStream : Stream
     /// <inheritdoc/>
     public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
-        ThrowIfDisposed();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-
-        // Run read on thread pool to avoid blocking
-        return await Task.Run(() => _readRing.Read(buffer.AsSpan(offset, count), linkedCts.Token), linkedCts.Token);
+        Interlocked.Increment(ref _inflightOps);
+        try
+        {
+            ThrowIfDisposed();
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+            return await Task.Run(() => _readRing.Read(buffer.AsSpan(offset, count), linkedCts.Token), linkedCts.Token);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _inflightOps);
+        }
     }
 
     /// <inheritdoc/>
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-
-        // Run read on thread pool to avoid blocking
-        return await Task.Run(() => _readRing.Read(buffer.Span, linkedCts.Token), linkedCts.Token);
+        Interlocked.Increment(ref _inflightOps);
+        try
+        {
+            ThrowIfDisposed();
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+            return await Task.Run(() => _readRing.Read(buffer.Span, linkedCts.Token), linkedCts.Token);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _inflightOps);
+        }
     }
 
     /// <inheritdoc/>
@@ -123,21 +139,33 @@ public sealed class ShmStream : Stream
     /// <inheritdoc/>
     public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
-        ThrowIfDisposed();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-
-        // Run write on thread pool to avoid blocking
-        await Task.Run(() => _writeRing.Write(buffer.AsSpan(offset, count), linkedCts.Token), linkedCts.Token);
+        Interlocked.Increment(ref _inflightOps);
+        try
+        {
+            ThrowIfDisposed();
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+            await Task.Run(() => _writeRing.Write(buffer.AsSpan(offset, count), linkedCts.Token), linkedCts.Token);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _inflightOps);
+        }
     }
 
     /// <inheritdoc/>
     public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-
-        // Run write on thread pool to avoid blocking
-        await Task.Run(() => _writeRing.Write(buffer.Span, linkedCts.Token), linkedCts.Token);
+        Interlocked.Increment(ref _inflightOps);
+        try
+        {
+            ThrowIfDisposed();
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+            await Task.Run(() => _writeRing.Write(buffer.Span, linkedCts.Token), linkedCts.Token);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _inflightOps);
+        }
     }
 
     /// <inheritdoc/>
@@ -155,32 +183,49 @@ public sealed class ShmStream : Stream
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) == 0 && disposing)
         {
-            _disposed = true;
-            if (disposing)
+            _disposeCts.Cancel();
+
+            // Wait for in-flight Task.Run operations to exit before
+            // unmapping segment memory.  SpinWait is acceptable here
+            // because the ring operations check the CancellationToken
+            // frequently and exit quickly after cancel.
+            var spin = new SpinWait();
+            while (Volatile.Read(ref _inflightOps) > 0)
             {
-                _disposeCts.Cancel();
-                _disposeCts.Dispose();
+                spin.SpinOnce();
             }
+
+            _disposeCts.Dispose();
+            _ownedSegment?.Dispose();
         }
+
         base.Dispose(disposing);
     }
 
     /// <inheritdoc/>
     public override async ValueTask DisposeAsync()
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
         {
-            _disposed = true;
             _disposeCts.Cancel();
+
+            // Wait for in-flight Task.Run operations to exit.
+            while (Volatile.Read(ref _inflightOps) > 0)
+            {
+                await Task.Delay(1).ConfigureAwait(false);
+            }
+
             _disposeCts.Dispose();
+            _ownedSegment?.Dispose();
         }
+
         await base.DisposeAsync();
     }
 
     private void ThrowIfDisposed()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
     }
 }

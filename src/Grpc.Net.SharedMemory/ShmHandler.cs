@@ -352,16 +352,23 @@ public sealed class ShmHandler : HttpMessageHandler
         if (!long.TryParse(timeout[..^1], out var value))
             return false;
 
-        duration = unit switch
+        try
         {
-            'H' => TimeSpan.FromHours(value),
-            'M' => TimeSpan.FromMinutes(value),
-            'S' => TimeSpan.FromSeconds(value),
-            'm' => TimeSpan.FromMilliseconds(value),
-            'u' => TimeSpan.FromMicroseconds(value),
-            'n' => TimeSpan.FromTicks(value / 100), // nanoseconds
-            _ => TimeSpan.Zero
-        };
+            duration = unit switch
+            {
+                'H' => TimeSpan.FromHours(value),
+                'M' => TimeSpan.FromMinutes(value),
+                'S' => TimeSpan.FromSeconds(value),
+                'm' => TimeSpan.FromMilliseconds(value),
+                'u' => TimeSpan.FromMicroseconds(value),
+                'n' => TimeSpan.FromTicks(value / 100),
+                _ => TimeSpan.Zero
+            };
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
 
         return duration > TimeSpan.Zero;
     }

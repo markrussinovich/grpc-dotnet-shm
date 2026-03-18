@@ -45,17 +45,6 @@ public class FlowControlTests
 
     [Test]
     [Platform("Win")]
-    public void Connection_InitialSendQuota_IsInitialWindowSize()
-    {
-        var segmentName = $"flow_test_{Guid.NewGuid():N}";
-
-        using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
-
-        Assert.That(server.ConnectionSendQuota, Is.EqualTo(ShmConstants.InitialWindowSize));
-    }
-
-    [Test]
-    [Platform("Win")]
     public async Task Stream_InitialSendWindow_IsCorrect()
     {
         var segmentName = $"flow_test_{Guid.NewGuid():N}";

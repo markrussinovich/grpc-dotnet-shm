@@ -38,9 +38,8 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
     private readonly Segment _controlSegment;
     private readonly ShmRing _controlRx;  // Ring A: client→server
     private readonly ShmRing _controlTx;  // Ring B: server→client
-    private readonly ConcurrentDictionary<string, Segment> _activeSegments;
     private int _connectionId;
-    private bool _disposed;
+    private int _disposed;
 
     public ShmConnectionListenerAdapter(string baseName, ShmTransportOptions options)
     {
@@ -48,7 +47,6 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
         _options = options;
         _endPoint = new ShmEndPoint(baseName);
         _closeCts = new CancellationTokenSource();
-        _activeSegments = new ConcurrentDictionary<string, Segment>();
 
         // Create the control segment (grpc-go-shmem compatible)
         _controlSegment = Segment.CreateControlSegment(baseName);
@@ -65,7 +63,7 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
     /// <inheritdoc/>
     public async ValueTask<ConnectionContext?> AcceptAsync(CancellationToken cancellationToken = default)
     {
-        if (_disposed)
+        if (Volatile.Read(ref _disposed) != 0)
         {
             return null;
         }
@@ -103,9 +101,7 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
                 var negotiatedRing = ControlWire.NegotiateRingCapacity(
                     clientPreferred.clientRingA, _options.RingCapacity);
 
-                // Create a data segment for this connection
-                // First, purge any closed/stale segments from previous tests.
-                PurgeClosedSegments();
+                // Create a data segment for this connection.
                 var connId = Interlocked.Increment(ref _connectionId);
                 var segName = $"{_baseName}_conn_{connId}";
                 Segment.TryRemoveSegment(segName);
@@ -137,13 +133,15 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
                 catch (OperationCanceledException)
                 {
                     dataSegment.Dispose();
+                    Segment.TryRemoveSegment(segName);
                     continue;
                 }
 
-                _activeSegments[segName] = dataSegment;
-
-                // Server reads from RingA (client→server), writes to RingB (server→client)
-                var shmStream = new ShmStream(dataSegment.RingA, dataSegment.RingB);
+                // Server reads from RingA (client→server), writes to RingB (server→client).
+                // Transfer segment ownership to ShmStream so the segment is disposed
+                // when the connection closes.  DisposeAsync uses _connectionId to
+                // enumerate and clean up any remaining backing files.
+                var shmStream = new ShmStream(dataSegment.RingA, dataSegment.RingB, ownedSegment: dataSegment);
 
                 return new ShmConnectionContext(
                     connectionId: segName,
@@ -166,33 +164,13 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
         return ValueTask.CompletedTask;
     }
 
-    /// <summary>
-    /// Removes segments whose ring buffers have been closed (connection dead).
-    /// Prevents unbounded accumulation across consecutive test runs.
-    /// </summary>
-    private void PurgeClosedSegments()
-    {
-        foreach (var (name, segment) in _activeSegments)
-        {
-            if (segment.RingA.IsClosed || segment.RingB.IsClosed)
-            {
-                if (_activeSegments.TryRemove(name, out var removed))
-                {
-                    try { removed.Dispose(); } catch { }
-                    Segment.TryRemoveSegment(name);
-                }
-            }
-        }
-    }
-
     /// <inheritdoc/>
     public ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return ValueTask.CompletedTask;
         }
-        _disposed = true;
         _closeCts.Cancel();
 
         // Clean up control segment
@@ -201,13 +179,14 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
         _controlSegment.Dispose();
         Segment.TryRemoveSegment(_baseName + ShmConstants.ControlSegmentSuffix);
 
-        // Clean up all data segments
-        foreach (var (name, segment) in _activeSegments)
+        // Clean up backing files for data segments.
+        // Segment objects are owned by ShmStream instances and already
+        // disposed when connections close; we only remove the files here.
+        var maxId = Volatile.Read(ref _connectionId);
+        for (var i = 1; i <= maxId; i++)
         {
-            segment.Dispose();
-            Segment.TryRemoveSegment(name);
+            Segment.TryRemoveSegment($"{_baseName}_conn_{i}");
         }
-        _activeSegments.Clear();
 
         _closeCts.Dispose();
         return ValueTask.CompletedTask;
@@ -253,6 +232,11 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
         Memory<byte> payload = Memory<byte>.Empty;
         if (header.Length > 0)
         {
+            if (header.Length > ShmConstants.MinRingCapacity)
+            {
+                throw new InvalidDataException($"Control frame payload {header.Length} exceeds maximum.");
+            }
+
             while (!_controlRx.TryPeek((int)header.Length, out _))
             {
                 ct.ThrowIfCancellationRequested();

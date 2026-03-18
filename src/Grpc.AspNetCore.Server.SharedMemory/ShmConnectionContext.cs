@@ -33,6 +33,7 @@ internal sealed class ShmConnectionContext : ConnectionContext
 {
     private readonly ShmStream _shmStream;
     private readonly CancellationTokenSource _connectionClosedCts;
+    private int _disposed;
 
     public ShmConnectionContext(string connectionId, ShmStream shmStream, EndPoint localEndPoint)
     {
@@ -74,16 +75,26 @@ internal sealed class ShmConnectionContext : ConnectionContext
     /// <inheritdoc/>
     public override async ValueTask DisposeAsync()
     {
-        _connectionClosedCts.Cancel();
-
-        if (Transport is DuplexPipe duplexPipe)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            await duplexPipe.Input.CompleteAsync().ConfigureAwait(false);
-            await duplexPipe.Output.CompleteAsync().ConfigureAwait(false);
+            return;
         }
 
-        await _shmStream.DisposeAsync().ConfigureAwait(false);
-        _connectionClosedCts.Dispose();
+        _connectionClosedCts.Cancel();
+
+        try
+        {
+            if (Transport is DuplexPipe duplexPipe)
+            {
+                await duplexPipe.Input.CompleteAsync().ConfigureAwait(false);
+                await duplexPipe.Output.CompleteAsync().ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            await _shmStream.DisposeAsync().ConfigureAwait(false);
+            _connectionClosedCts.Dispose();
+        }
     }
 
     /// <summary>

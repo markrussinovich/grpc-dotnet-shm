@@ -202,20 +202,6 @@ public class KeepaliveIntegrationTests
 
     [Test]
     [Platform("Win")]
-    public void Connection_HasBdpEstimator()
-    {
-        var segmentName = $"bdp_test_{Guid.NewGuid():N}";
-        
-        using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
-        using var client = ShmConnection.ConnectAsClient(segmentName);
-        
-        Assert.That(server.BdpEstimator, Is.Not.Null);
-        Assert.That(client.BdpEstimator, Is.Not.Null);
-        Assert.That(server.BdpEstimator.CurrentBdp, Is.EqualTo(ShmConstants.InitialWindowSize));
-    }
-
-    [Test]
-    [Platform("Win")]
     public void Connection_WithEnforcementPolicy_Created()
     {
         var segmentName = $"enforcement_test_{Guid.NewGuid():N}";

@@ -30,7 +30,7 @@ public sealed class ShmConnectionListener : IDisposable, IAsyncDisposable
     private readonly string _segmentName;
     private readonly ShmConnection _serverConnection;
     private readonly CancellationTokenSource _disposeCts;
-    private bool _disposed;
+    private int _disposed;
 
     /// <summary>
     /// Gets the endpoint name for this listener.
@@ -91,25 +91,27 @@ public sealed class ShmConnectionListener : IDisposable, IAsyncDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _disposed = true;
-            _disposeCts.Cancel();
-            _serverConnection.Dispose();
-            _disposeCts.Dispose();
+            return;
         }
+
+        _disposeCts.Cancel();
+        _serverConnection.Dispose();
+        _disposeCts.Dispose();
     }
 
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _disposed = true;
-            _disposeCts.Cancel();
-            await _serverConnection.DisposeAsync();
-            _disposeCts.Dispose();
+            return;
         }
+
+        _disposeCts.Cancel();
+        await _serverConnection.DisposeAsync();
+        _disposeCts.Dispose();
     }
 }
 

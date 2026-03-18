@@ -238,22 +238,23 @@ internal sealed class ShmFrameWriter : IDisposable
                 _cts.Cancel();
                 try
                 {
-                    _writerTask.Wait(TimeSpan.FromMilliseconds(500));
+                    writerDone = _writerTask.Wait(TimeSpan.FromMilliseconds(500));
                 }
                 catch (AggregateException)
                 {
-                    // Expected — OperationCanceledException / RingClosedException.
+                    writerDone = true; // task faulted — it's done
                 }
             }
 
-            // 4. Writer task is now guaranteed to have exited.
-            //    Drain any remaining entries so pooled buffers are returned.
-            //    This is safe because the channel was created with
-            //    SingleReader=true and the sole reader (writer task) has exited.
-            while (_channel.Reader.TryRead(out var entry))
+            // 4. Drain remaining entries only if the writer task has exited,
+            //    to avoid concurrent reads on the SingleReader channel.
+            if (writerDone)
             {
-                if (entry.ReturnToPool != null)
-                    ArrayPool<byte>.Shared.Return(entry.ReturnToPool);
+                while (_channel.Reader.TryRead(out var entry))
+                {
+                    if (entry.ReturnToPool != null)
+                        ArrayPool<byte>.Shared.Return(entry.ReturnToPool);
+                }
             }
         }
     }

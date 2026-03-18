@@ -79,7 +79,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private bool _halfCloseSent;
     private bool _halfCloseReceived;
     private bool _cancelled;
-    private bool _disposed;
+    private int _disposed;
 
     /// <summary>
     /// Gets the stream ID.
@@ -173,8 +173,24 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var payload = _requestHeaders.Encode();
-        await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial, payload);
+        var (payload, payloadLength) = _requestHeaders.Encode();
+        if (payloadLength <= 512)
+        {
+            try
+            {
+                await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
+                    payload.AsMemory(0, payloadLength));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(payload);
+            }
+        }
+        else
+        {
+            await SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
+                payload.AsMemory(0, payloadLength), payload);
+        }
     }
 
     /// <summary>
@@ -195,8 +211,24 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var payload = _responseHeaders.Encode();
-        await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial, payload);
+        var (payload, payloadLength) = _responseHeaders.Encode();
+        if (payloadLength <= 512)
+        {
+            try
+            {
+                await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
+                    payload.AsMemory(0, payloadLength));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(payload);
+            }
+        }
+        else
+        {
+            await SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
+                payload.AsMemory(0, payloadLength), payload);
+        }
     }
 
     /// <summary>
@@ -377,8 +409,24 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var payload = _trailers.Encode();
-        await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream, payload);
+        var (payload, payloadLength) = _trailers.Encode();
+        if (payloadLength <= 512)
+        {
+            try
+            {
+                await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream,
+                    payload.AsMemory(0, payloadLength));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(payload);
+            }
+        }
+        else
+        {
+            await SendFrameZeroCopyAsync(FrameType.Trailers, TrailersFlags.EndStream,
+                payload.AsMemory(0, payloadLength), payload);
+        }
         _halfCloseSent = true;
     }
 
@@ -399,7 +447,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public async Task CancelAsync()
     {
-        if (_cancelled || _disposed) return;
+        if (_cancelled || Volatile.Read(ref _disposed) != 0) return;
         _cancelled = true;
 
         try
@@ -616,7 +664,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// on every call, so client-side cancel/deadline always takes effect — even
     /// on a long-blocked read.
     /// <para>
-    /// The returned <see cref="ReadOnlyMemory{T}"/> is backed by a pooled buffer.
+    /// The returned <see cref="ReadOnlyMemory{T}"/> may be backed by a pooled
+    /// buffer (single-frame fast path) or by an owned array assembled from
+    /// multiple fragments (multi-frame path via <see cref="MemoryStream.ToArray"/>).
     /// The caller must release <paramref name="previousFrame"/> (the frame from
     /// the prior call) before calling again — or pass <c>default</c> on first call.
     /// </para>
@@ -802,7 +852,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     internal void OnFrameReceived(InboundFrame frame)
     {
-        if (_disposed || _cancelled)
+        if (Volatile.Read(ref _disposed) != 0 || _cancelled)
         {
             frame.ReturnToPool();
             return;
@@ -819,12 +869,18 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
             case FrameType.HalfClose:
                 _halfCloseReceived = true;
-                _inboundFrames.Writer.TryWrite(frame);
+                if (!_inboundFrames.Writer.TryWrite(frame))
+                {
+                    frame.ReturnToPool();
+                }
                 break;
 
             case FrameType.Trailers:
                 _halfCloseReceived = true;
-                _inboundFrames.Writer.TryWrite(frame);
+                if (!_inboundFrames.Writer.TryWrite(frame))
+                {
+                    frame.ReturnToPool();
+                }
                 _inboundFrames.Writer.TryComplete();
                 // Auto-remove from connection to prevent accumulation when
                 // callers don't dispose the stream (e.g., undisposed AsyncUnaryCall).
@@ -833,7 +889,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 break;
 
             default:
-                _inboundFrames.Writer.TryWrite(frame);
+                if (!_inboundFrames.Writer.TryWrite(frame))
+                {
+                    frame.ReturnToPool();
+                }
                 break;
         }
     }
@@ -844,20 +903,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (increment > 0)
         {
             _sendWindowSignal.Release();
-        }
-    }
-
-    /// <summary>
-    /// Updates the flow control window based on BDP estimation.
-    /// </summary>
-    /// <param name="newWindow">The new window size.</param>
-    internal void UpdateFlowControlWindow(uint newWindow)
-    {
-        var currentWindow = Interlocked.Read(ref _sendWindow);
-        if (newWindow > currentWindow)
-        {
-            var delta = (long)newWindow - currentWindow;
-            Interlocked.Add(ref _sendWindow, delta);
         }
     }
 
@@ -992,22 +1037,30 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     private void ThrowIfDisposed()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
     }
 
     /// <inheritdoc/>
     public void Dispose()
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _disposed = true;
-            _disposeCts.Cancel();
-            _inboundFrames.Writer.TryComplete();
-            _connection.RemoveStream(StreamId);
-            _sendLock.Dispose();
-            _sendWindowSignal.Dispose();
-            _disposeCts.Dispose();
+            return;
         }
+
+        _disposeCts.Cancel();
+        _inboundFrames.Writer.TryComplete();
+
+        // Drain any remaining queued frames to return pooled buffers.
+        while (_inboundFrames.Reader.TryRead(out var frame))
+        {
+            frame.ReturnToPool();
+        }
+
+        _connection.RemoveStream(StreamId);
+        _sendLock.Dispose();
+        _sendWindowSignal.Dispose();
+        _disposeCts.Dispose();
     }
 
     /// <inheritdoc/>

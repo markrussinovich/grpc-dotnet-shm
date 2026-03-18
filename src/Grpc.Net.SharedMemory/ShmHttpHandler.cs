@@ -101,13 +101,24 @@ public sealed class ShmHttpHandler : DelegatingHandler
 
                     // Open the data segment
                     var dataSegment = Segment.Open(dataSegmentName);
-                    await dataSegment.WaitForServerAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await dataSegment.WaitForServerAsync(cancellationToken).ConfigureAwait(false);
 
-                    // Signal that client has mapped the segment
-                    dataSegment.SetClientReady(true);
+                        // Signal that client has mapped the segment
+                        dataSegment.SetClientReady(true);
 
-                    // Client reads from RingB (server→client), writes to RingA (client→server)
-                    return new ShmStream(dataSegment.RingB, dataSegment.RingA);
+                        // Client reads from RingB (server→client), writes to RingA (client→server)
+                        // Pass dataSegment ownership to ShmStream so it gets disposed
+                        // when the stream is closed, preventing memory-mapped file +
+                        // kernel event handle leaks.
+                        return new ShmStream(dataSegment.RingB, dataSegment.RingA, dataSegment);
+                    }
+                    catch
+                    {
+                        dataSegment.Dispose();
+                        throw;
+                    }
 
                 case FrameType.Reject:
                     var message = ControlWire.DecodeConnectReject(payload.Span);
@@ -168,6 +179,11 @@ public sealed class ShmHttpHandler : DelegatingHandler
         Memory<byte> payload = Memory<byte>.Empty;
         if (header.Length > 0)
         {
+            if (header.Length > ShmConstants.MinRingCapacity)
+            {
+                throw new InvalidDataException($"Control frame payload {header.Length} exceeds maximum.");
+            }
+
             while (!ring.TryPeek((int)header.Length, out _))
             {
                 ct.ThrowIfCancellationRequested();

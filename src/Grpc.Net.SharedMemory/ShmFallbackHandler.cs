@@ -49,7 +49,7 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
     private HttpMessageHandler? _tcpHandler;
 
     private volatile bool _shmFailed;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     // Counters for observability
     private long _shmAttempts;
@@ -166,13 +166,32 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
 
     private ShmHandler EnsureShmHandler()
     {
-        if (_shmHandler != null)
+        var existing = Volatile.Read(ref _shmHandler);
+        if (existing != null)
         {
-            return _shmHandler;
+            return existing;
         }
 
-        _shmHandler = new ShmHandler(_segmentName);
-        return _shmHandler;
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var newHandler = new ShmHandler(_segmentName);
+        var prev = Interlocked.CompareExchange(ref _shmHandler, newHandler, null);
+        if (prev != null)
+        {
+            newHandler.Dispose();
+            return prev;
+        }
+
+        // Re-check: if Dispose raced between our disposed check and the CAS,
+        // the new handler was published into an already-disposed parent.
+        if (_disposed)
+        {
+            Interlocked.CompareExchange(ref _shmHandler, null, newHandler);
+            newHandler.Dispose();
+            throw new ObjectDisposedException(nameof(ShmFallbackHandler));
+        }
+
+        return newHandler;
     }
 
     private async Task<HttpResponseMessage> SendViaTcpAsync(
@@ -183,22 +202,39 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
         ShmTelemetry.RecordTransportSelected("tcp", _tcpFallbackAddress);
 
         var tcpHandler = EnsureTcpHandler();
-        var invoker = new HttpMessageInvoker(tcpHandler);
+        var invoker = new HttpMessageInvoker(tcpHandler, disposeHandler: false);
         return await invoker.SendAsync(request, cancellationToken).ConfigureAwait(false);
     }
 
     private HttpMessageHandler EnsureTcpHandler()
     {
-        if (_tcpHandler != null)
+        var existing = Volatile.Read(ref _tcpHandler);
+        if (existing != null)
         {
-            return _tcpHandler;
+            return existing;
         }
 
-        _tcpHandler = new SocketsHttpHandler
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var newHandler = new SocketsHttpHandler
         {
             EnableMultipleHttp2Connections = true
         };
-        return _tcpHandler;
+        var prev = Interlocked.CompareExchange(ref _tcpHandler, newHandler, null);
+        if (prev != null)
+        {
+            newHandler.Dispose();
+            return prev;
+        }
+
+        if (_disposed)
+        {
+            Interlocked.CompareExchange(ref _tcpHandler, null, newHandler);
+            newHandler.Dispose();
+            throw new ObjectDisposedException(nameof(ShmFallbackHandler));
+        }
+
+        return newHandler;
     }
 
     /// <summary>

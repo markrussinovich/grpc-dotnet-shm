@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
 
@@ -75,10 +76,17 @@ public sealed class HeadersV1
     public IReadOnlyList<MetadataKV> Metadata { get; init; } = Array.Empty<MetadataKV>();
 
     /// <summary>
-    /// Encodes this headers payload to a byte array.
+    /// Encodes this headers payload into a pooled buffer.
+    /// The caller takes ownership of the returned buffer and must return it
+    /// to <see cref="ArrayPool{T}.Shared"/> after use (or transfer ownership
+    /// to <see cref="ShmFrameWriter.EnqueueZeroCopy"/>).
     /// </summary>
-    public byte[] Encode()
+    /// <returns>A tuple of the pooled buffer and the actual encoded length.</returns>
+    public (byte[] Buffer, int Length) Encode()
     {
+        if (Metadata.Count > ushort.MaxValue)
+            throw new InvalidOperationException($"Metadata count {Metadata.Count} exceeds maximum {ushort.MaxValue}");
+
         // Calculate size
         var methodLength = HeaderType == 0 && Method != null ? Encoding.UTF8.GetByteCount(Method) : 0;
         var authorityLength = Authority != null ? Encoding.UTF8.GetByteCount(Authority) : 0;
@@ -100,7 +108,7 @@ public sealed class HeadersV1
             }
         }
 
-        var buffer = new byte[size];
+        var buffer = ArrayPool<byte>.Shared.Rent(size);
         var offset = 0;
 
         // Version
@@ -167,7 +175,19 @@ public sealed class HeadersV1
             }
         }
 
-        return buffer;
+        return (buffer, size);
+    }
+
+    /// <summary>
+    /// Encodes this headers payload to an owned byte array.
+    /// Use <see cref="Encode"/> for the pooled-buffer variant on hot paths.
+    /// </summary>
+    public byte[] EncodeToArray()
+    {
+        var (buffer, length) = Encode();
+        var result = buffer.AsSpan(0, length).ToArray();
+        ArrayPool<byte>.Shared.Return(buffer);
+        return result;
     }
 
     /// <summary>

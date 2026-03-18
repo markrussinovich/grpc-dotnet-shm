@@ -38,7 +38,7 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
     private readonly ulong _ringCapacity;
     private readonly uint _maxStreams;
     private int _connectionId;
-    private bool _disposed;
+    private int _disposed;
 
     /// <summary>
     /// Gets the base segment name.
@@ -153,11 +153,23 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             catch (OperationCanceledException)
             {
                 dataSegment.Dispose();
+                Segment.TryRemoveSegment(segmentName);
                 continue;
             }
 
             // Create and return the connection
-            var connection = new ShmConnection(segmentName, dataSegment);
+            ShmConnection connection;
+            try
+            {
+                connection = new ShmConnection(segmentName, dataSegment);
+            }
+            catch
+            {
+                dataSegment.Dispose();
+                Segment.TryRemoveSegment(segmentName);
+                throw;
+            }
+
             _activeConnections[segmentName] = connection;
             return connection;
         }
@@ -171,7 +183,7 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
     public async IAsyncEnumerable<ShmConnection> AcceptConnectionsAsync(
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        while (!cancellationToken.IsCancellationRequested && !_disposed)
+        while (!cancellationToken.IsCancellationRequested && Volatile.Read(ref _disposed) == 0)
         {
             ShmConnection? connection = null;
             try
@@ -202,6 +214,11 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         Memory<byte> payload = Memory<byte>.Empty;
         if (header.Length > 0)
         {
+            if (header.Length > ShmConstants.MinRingCapacity)
+            {
+                throw new InvalidDataException($"Control frame payload {header.Length} exceeds maximum.");
+            }
+
             var payloadBuffer = new byte[header.Length];
             ReadExact(_controlRx, payloadBuffer, ct);
             payload = payloadBuffer;
@@ -220,7 +237,10 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
     {
         foreach (var (name, conn) in _activeConnections)
         {
-            if (conn.IsClosed)
+            // Only purge connections that are fully closed AND have no
+            // in-flight streams.  IsClosed becomes true on GoAway, but
+            // a draining connection may still have active RPCs.
+            if (conn.IsClosed && conn.ActiveStreamCount == 0)
             {
                 if (_activeConnections.TryRemove(name, out var removed))
                 {
@@ -276,8 +296,7 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
         _disposeCts.Cancel();
 
@@ -302,8 +321,7 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
         _disposeCts.Cancel();
 

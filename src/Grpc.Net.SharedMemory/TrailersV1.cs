@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
 using Grpc.Core;
@@ -41,10 +42,17 @@ public sealed class TrailersV1
     public IReadOnlyList<MetadataKV> Metadata { get; init; } = Array.Empty<MetadataKV>();
 
     /// <summary>
-    /// Encodes this trailers payload to a byte array.
+    /// Encodes this trailers payload into a pooled buffer.
+    /// The caller takes ownership of the returned buffer and must return it
+    /// to <see cref="ArrayPool{T}.Shared"/> after use (or transfer ownership
+    /// to <see cref="ShmFrameWriter.EnqueueZeroCopy"/>).
     /// </summary>
-    public byte[] Encode()
+    /// <returns>A tuple of the pooled buffer and the actual encoded length.</returns>
+    public (byte[] Buffer, int Length) Encode()
     {
+        if (Metadata.Count > ushort.MaxValue)
+            throw new InvalidOperationException($"Metadata count {Metadata.Count} exceeds maximum {ushort.MaxValue}");
+
         var statusMsgLength = GrpcStatusMessage != null ? Encoding.UTF8.GetByteCount(GrpcStatusMessage) : 0;
 
         var size = 1 + 4 + 4 + statusMsgLength + 2; // version + statusCode + msgLen + msg + metadataCount
@@ -60,7 +68,7 @@ public sealed class TrailersV1
             }
         }
 
-        var buffer = new byte[size];
+        var buffer = ArrayPool<byte>.Shared.Rent(size);
         var offset = 0;
 
         // Version
@@ -107,7 +115,19 @@ public sealed class TrailersV1
             }
         }
 
-        return buffer;
+        return (buffer, size);
+    }
+
+    /// <summary>
+    /// Encodes this trailers payload to an owned byte array.
+    /// Use <see cref="Encode"/> for the pooled-buffer variant on hot paths.
+    /// </summary>
+    public byte[] EncodeToArray()
+    {
+        var (buffer, length) = Encode();
+        var result = buffer.AsSpan(0, length).ToArray();
+        ArrayPool<byte>.Shared.Return(buffer);
+        return result;
     }
 
     /// <summary>

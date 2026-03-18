@@ -35,6 +35,27 @@ public static class FrameProtocol
     internal const int MaxFramePayloadSize = 128 * 1024 * 1024;
 
     /// <summary>
+    /// Minimum payload size for zero-copy (borrowed) reads. Below this threshold,
+    /// ArrayPool.Rent + memcpy is cheaper than the deferred-commit overhead of the
+    /// borrow path.
+    /// </summary>
+    internal const int ZeroCopyMinPayloadSize = 256 * 1024;
+
+    /// <summary>
+    /// Minimum fraction of ring capacity that must be free (from the writer’s
+    /// perspective) before a zero-copy borrow is allowed.  During a borrow,
+    /// ReadIdx is frozen and deferred commits accumulate, so the writer sees
+    /// space shrinking without any reclamation.  If too little headroom exists
+    /// when the borrow starts, a high-throughput writer can fill the remaining
+    /// space before the app thread releases the borrow, deadlocking the ring.
+    ///
+    /// 50% guarantees at least capacity/2 bytes of headroom.  At 3 GB/s write
+    /// throughput and a typical borrow hold of &lt;10 ms, the writer can produce
+    /// at most ~30 MB — well within 32 MB headroom on a 64 MB ring.
+    /// </summary>
+    private const int BorrowFreeSpacePercent = 50;
+
+    /// <summary>
     /// Reads a frame and returns a payload wrapper that can either borrow ring memory
     /// (when contiguous and allowed) or use a pooled buffer fallback.
     /// </summary>
@@ -89,8 +110,22 @@ public static class FrameProtocol
             var payloadLength = (int)header.Length;
             var payloadReservation = ring.ReserveRead(payloadLength, cancellationToken);
 
-            if (allowBorrowed && payloadReservation.Second.IsEmpty)
+            // Zero-copy (borrowed) path: return a direct view of ring memory.
+            // Only used when:
+            // - Caller allows borrowing (allowBorrowed)
+            // - Payload is contiguous (no ring wrap-around)
+            // - No other borrow is outstanding (single-borrow safety)
+            // - Payload is large enough to justify the overhead
+            // - Writer has >= 50% ring capacity free (deadlock prevention:
+            //   borrow freezes ReadIdx, so the writer cannot reclaim space
+            //   until the app thread releases the borrow)
+            if (allowBorrowed
+                && payloadLength >= ZeroCopyMinPayloadSize
+                && payloadReservation.Second.IsEmpty
+                && !ring.HasOutstandingBorrow
+                && ring.WriterFreeSpace >= ring.Capacity * (ulong)BorrowFreeSpacePercent / 100)
             {
+                ring.SetBorrowActive();
                 return (header, FramePayload.FromReservation(payloadReservation, payloadLength));
             }
 
@@ -442,15 +477,14 @@ public static class FrameProtocol
     {
         var flags = isLast ? (byte)0 : MessageFlags.More;
 
-        // Calculate max payload per frame: half of ring capacity minus header, min 1KB
         var cap = (int)ring.Capacity;
-        var maxFramePayload = cap / 2 - ShmConstants.FrameHeaderSize;
-        if (maxFramePayload < 1024)
+        var maxFramePayload = Math.Max(1, cap / 2 - ShmConstants.FrameHeaderSize);
+        // Ensure frame + header fits in the ring
+        if (maxFramePayload + ShmConstants.FrameHeaderSize > cap)
         {
-            maxFramePayload = 1024;
+            maxFramePayload = Math.Max(1, cap - ShmConstants.FrameHeaderSize);
         }
 
-        // Fast path: payload fits in a single frame
         if (data.Length <= maxFramePayload)
         {
             var header = new FrameHeader(FrameType.Message, streamId, (uint)data.Length, flags);
@@ -458,7 +492,6 @@ public static class FrameProtocol
             return;
         }
 
-        // Slow path: chunk the payload into multiple frames with MORE flag
         var remaining = data;
         while (remaining.Length > 0)
         {
@@ -469,12 +502,10 @@ public static class FrameProtocol
             byte chunkFlags;
             if (remaining.Length > 0)
             {
-                // More chunks follow
                 chunkFlags = MessageFlags.More;
             }
             else
             {
-                // Last chunk - use the original flags
                 chunkFlags = flags;
             }
 

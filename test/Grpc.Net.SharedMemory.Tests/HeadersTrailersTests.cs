@@ -44,7 +44,7 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = headers.Encode();
+        var encoded = headers.EncodeToArray();
         var decoded = HeadersV1.Decode(encoded);
 
         // Assert
@@ -75,7 +75,7 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = headers.Encode();
+        var encoded = headers.EncodeToArray();
         var decoded = HeadersV1.Decode(encoded);
 
         // Assert
@@ -98,7 +98,7 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = headers.Encode();
+        var encoded = headers.EncodeToArray();
         var decoded = HeadersV1.Decode(encoded);
 
         // Assert
@@ -122,7 +122,7 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = headers.Encode();
+        var encoded = headers.EncodeToArray();
         var decoded = HeadersV1.Decode(encoded);
 
         // Assert
@@ -142,7 +142,7 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = trailers.Encode();
+        var encoded = trailers.EncodeToArray();
         var decoded = TrailersV1.Decode(encoded);
 
         // Assert
@@ -167,7 +167,7 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = trailers.Encode();
+        var encoded = trailers.EncodeToArray();
         var decoded = TrailersV1.Decode(encoded);
 
         // Assert
@@ -210,7 +210,7 @@ public class HeadersTrailersTests
                 GrpcStatusMessage = $"Status: {code}"
             };
 
-            var encoded = trailers.Encode();
+            var encoded = trailers.EncodeToArray();
             var decoded = TrailersV1.Decode(encoded);
 
             Assert.That(decoded.GrpcStatusCode, Is.EqualTo(code), $"Failed for status code {code}");
@@ -233,7 +233,7 @@ public class HeadersTrailersTests
         };
 
         // Act
-        var encoded = trailers.Encode();
+        var encoded = trailers.EncodeToArray();
         var decoded = TrailersV1.Decode(encoded);
 
         // Assert

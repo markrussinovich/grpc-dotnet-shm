@@ -247,7 +247,7 @@ public class InteropTests
             Metadata = new[] { new MetadataKV("custom-key", "value1") }
         };
 
-        var encoded = headers.Encode();
+        var encoded = headers.EncodeToArray();
 
         // Verify format
         Assert.That(encoded[0], Is.EqualTo(1), "Version byte");
@@ -276,7 +276,7 @@ public class InteropTests
             Metadata = Array.Empty<MetadataKV>()
         };
 
-        var encoded = trailers.Encode();
+        var encoded = trailers.EncodeToArray();
 
         // Verify format
         Assert.That(encoded[0], Is.EqualTo(1), "Version byte");
@@ -341,7 +341,7 @@ public class InteropTests
             DeadlineUnixNano = 0,
             Metadata = Array.Empty<MetadataKV>()
         };
-        File.WriteAllBytes(Path.Combine(dumpPath, "headers_v1.bin"), headers.Encode());
+        File.WriteAllBytes(Path.Combine(dumpPath, "headers_v1.bin"), headers.EncodeToArray());
 
         // Dump trailers
         var trailers = new TrailersV1
@@ -351,7 +351,7 @@ public class InteropTests
             GrpcStatusMessage = "",
             Metadata = Array.Empty<MetadataKV>()
         };
-        File.WriteAllBytes(Path.Combine(dumpPath, "trailers_v1.bin"), trailers.Encode());
+        File.WriteAllBytes(Path.Combine(dumpPath, "trailers_v1.bin"), trailers.EncodeToArray());
 
         Console.WriteLine($"Binary dumps written to: {dumpPath}");
         Assert.Pass($"Binary dumps generated at {dumpPath}");

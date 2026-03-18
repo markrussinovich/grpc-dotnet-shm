@@ -64,7 +64,7 @@ public readonly struct FramePayload
     {
         if (_hasReservation)
         {
-            _reservation.Ring?.CommitRead(_reservation, Length);
+            _reservation.Ring?.ReleaseBorrow(Length);
             return;
         }
 

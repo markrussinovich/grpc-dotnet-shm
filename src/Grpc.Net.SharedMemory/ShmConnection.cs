@@ -35,12 +35,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private readonly Task _frameReaderTask;
     private readonly Channel<ShmGrpcStream> _incomingStreamsChannel;
     private uint _nextStreamId;
-    private bool _disposed;
+    private int _disposed;
     private bool _goAwaySent;
     private bool _goAwayReceived;
     private bool _draining;
     private uint _maxConcurrentStreams;
-    private readonly bool _zeroCopyReads;
 
     // Atomic counter for client-side max-stream enforcement.
     // Incremented in CreateStream BEFORE adding to _streams, decremented in
@@ -49,20 +48,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     // in creating streams, exceeding the server's maxConcurrentStreams limit.
     private int _clientStreamCount;
 
-    // Connection-level flow control (matches grpc-go-shmem)
-    private long _connSendQuota;
-    private uint _connInFlowLimit;
-    private uint _connInFlowUnacked;
-    private readonly object _flowControlLock = new();
+    // Accumulated connection-level window update bytes. Sent when threshold
+    // is reached to reduce frame overhead. Uses Min(1MB, InitialWindowSize/4)
+    // to maintain the 25% window replenishment ratio from the original design.
+    private long _connWindowDebt;
+    private static readonly long ConnWindowUpdateThreshold =
+        Math.Min(1_048_576, ShmConstants.InitialWindowSize / 4);
 
     // Write lock: the SPSC ring buffer requires single-producer semantics.
     // All writes to TxRing are serialised through the ShmFrameWriter's
     // dedicated consumer thread (Channel SingleReader=true).
-    private readonly SemaphoreSlim _quotaSignal = new(0);
     private ShmFrameWriter? _frameWriter;
-
-    // BDP estimation (A73 RFC Phase 5)
-    private readonly ShmBdpEstimator _bdpEstimator;
 
     // Keepalive (A73 RFC)
     private readonly ShmKeepaliveOptions _keepaliveOptions;
@@ -72,16 +68,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private DateTime _lastPingSentAt;
     private bool _pendingPing;
     private int _pingStrikes;
-
-    /// <summary>
-    /// Gets the connection-level send quota remaining.
-    /// </summary>
-    public long ConnectionSendQuota => Interlocked.Read(ref _connSendQuota);
-
-    /// <summary>
-    /// Gets the BDP estimator for this connection.
-    /// </summary>
-    public ShmBdpEstimator BdpEstimator => _bdpEstimator;
 
     /// <summary>
     /// Gets the connection name (shared memory segment name).
@@ -96,7 +82,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <summary>
     /// Gets whether the connection has been closed.
     /// </summary>
-    public bool IsClosed => _disposed || _goAwaySent || _goAwayReceived;
+    public bool IsClosed => Volatile.Read(ref _disposed) != 0 || _goAwaySent || _goAwayReceived;
 
     /// <summary>
     /// Gets whether the connection is draining (not accepting new streams).
@@ -145,7 +131,15 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null)
     {
         var segment = Segment.Open(name);
-        return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
+        try
+        {
+            return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
+        }
+        catch
+        {
+            segment.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -165,7 +159,15 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
     {
         var segment = Segment.Create(name, ringCapacity, maxStreams);
-        return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy);
+        try
+        {
+            return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy);
+        }
+        catch
+        {
+            segment.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -209,17 +211,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         {
             _maxConcurrentStreams = headerMaxStreams;
         }
-
-        // Zero-copy reads are only safe with a single active stream.
-        _zeroCopyReads = _maxConcurrentStreams == 1;
-
-        // Initialize connection-level flow control (matches grpc-go-shmem)
-        _connSendQuota = ShmConstants.InitialWindowSize;
-        _connInFlowLimit = (uint)ShmConstants.InitialWindowSize;
-        _connInFlowUnacked = 0;
-
-        // Initialize BDP estimator
-        _bdpEstimator = new ShmBdpEstimator((uint)ShmConstants.InitialWindowSize, UpdateFlowControlWindows);
 
         // Create channel for incoming streams (server-side)
         // Use 2x maxConcurrentStreams capacity to absorb transient bursts:
@@ -269,9 +260,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // Increment-then-check eliminates the TOCTOU race where N threads all
         // read _streams.Count < max, then all TryAdd successfully, exceeding
         // the server's limit and causing REJECTs that hang streaming calls.
-        // This also enforces the zero-copy single-stream invariant: when
-        // _maxConcurrentStreams == 1 (_zeroCopyReads), only one thread can
-        // increment from 0 to 1; the second sees reserved > 1 and fails.
         var reserved = Interlocked.Increment(ref _clientStreamCount);
         if (reserved > (int)_maxConcurrentStreams)
         {
@@ -286,6 +274,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         if (!_streams.TryAdd(streamId, stream))
         {
             Interlocked.Decrement(ref _clientStreamCount);
+            stream.Dispose();
             throw new InvalidOperationException($"Stream ID {streamId} already exists");
         }
 
@@ -445,7 +434,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             {
                 while (!_disposeCts.Token.IsCancellationRequested)
                 {
-                    var (header, payload) = FrameProtocol.ReadFramePayload(RxRing, _zeroCopyReads, _disposeCts.Token);
+                    var (header, payload) = FrameProtocol.ReadFramePayload(
+                        RxRing, allowBorrowed: true, _disposeCts.Token);
                     ProcessFrame(header, payload);
                 }
 
@@ -497,25 +487,27 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 {
                     var frame = new InboundFrame(header.Type, payload, header.Flags);
                     stream.OnFrameReceived(frame);
-
-                    // BDP estimation: track bytes received
-                    if (header.Type == FrameType.Message)
-                    {
-                        var sendBdpPing = _bdpEstimator.Add((uint)payloadLength);
-                        var windowUpdate = OnConnectionDataReceived((uint)payloadLength);
-                        if (windowUpdate > 0)
-                        {
-                            SendConnectionWindowUpdate(windowUpdate);
-                        }
-                        if (sendBdpPing)
-                        {
-                            SendBdpPing();
-                        }
-                    }
                 }
                 else
                 {
                     payload.Release();
+                }
+
+                // Batch connection-level window update: accumulate bytes and
+                // send when threshold is reached. Uses the smaller of 1 MB and
+                // InitialWindowSize/4 as threshold, matching the original 25%
+                // window replenishment ratio while bounding the absolute delay.
+                if (header.Type == FrameType.Message && payloadLength > 0)
+                {
+                    var debt = Interlocked.Add(ref _connWindowDebt, payloadLength);
+                    if (debt >= ConnWindowUpdateThreshold)
+                    {
+                        var toSend = Interlocked.Exchange(ref _connWindowDebt, 0);
+                        if (toSend > 0)
+                        {
+                            SendConnectionWindowUpdate((uint)Math.Min(toSend, uint.MaxValue));
+                        }
+                    }
                 }
                 break;
 
@@ -539,6 +531,14 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 break;
 
             case FrameType.WindowUpdate:
+                if (payloadLength < 4)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"Invalid WindowUpdate frame: payload length {payloadLength} < 4");
+                    payload.Release();
+                    break;
+                }
+
                 var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
                     payloadMemory.Span.Slice(0, payloadLength));
                 AddSendQuota(header.StreamId, increment);
@@ -621,6 +621,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
             if (!_streams.TryAdd(streamId, newStream))
             {
+                newStream.Dispose();
                 return;
             }
 
@@ -650,9 +651,15 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
                 if (!written)
                 {
-                    // Remove from _streams and reject — the stream was accepted
-                    // into _streams but never delivered to AcceptStreamsAsync.
-                    _streams.TryRemove(streamId, out _);
+                    // Remove from _streams, dispose, and reject — the stream was
+                    // accepted into _streams but never delivered to AcceptStreamsAsync.
+                    // Dispose drains queued inbound frames and releases any borrowed
+                    // ring space they may hold.
+                    if (_streams.TryRemove(streamId, out var orphaned))
+                    {
+                        orphaned.Dispose();
+                    }
+
                     RejectStream(streamId, "server overloaded");
                     return;
                 }
@@ -679,7 +686,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 GrpcStatusCode = Grpc.Core.StatusCode.Unavailable,
                 GrpcStatusMessage = message
             };
-            var trailersPayload = trailers.Encode();
+            // Use EncodeToArray + SendFrame (copy) instead of Encode + SendFrameZeroCopy
+            // to avoid buffer leak: if enqueue fails (writer disposed/closed), the catch
+            // swallows the exception but SendFrameZeroCopy would leave the pooled buffer
+            // unreturned. SendFrame copies the payload, so there's no ownership transfer.
+            var trailersPayload = trailers.EncodeToArray();
             SendFrame(FrameType.Trailers, streamId, 0, trailersPayload);
         }
         catch
@@ -700,128 +711,38 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     #region Connection-Level Flow Control
 
     /// <summary>
-    /// Adds send quota for a stream or connection (when receiving WINDOW_UPDATE).
+    /// Routes a WINDOW_UPDATE frame to the appropriate stream.
+    /// Connection-level updates (streamId=0) are accepted but not enforced
+    /// locally — the ring buffer's physical capacity provides natural
+    /// backpressure. We still send connection-level WINDOW_UPDATEs to the
+    /// remote side (see ProcessFrame) for interop with implementations
+    /// that enforce connection-level send quota.
     /// </summary>
-    /// <param name="streamId">Stream ID (0 for connection-level).</param>
-    /// <param name="delta">The window size increment.</param>
     internal void AddSendQuota(uint streamId, uint delta)
     {
         if (streamId == 0)
         {
-            // Connection-level
-            var oldQuota = Interlocked.Add(ref _connSendQuota, delta) - delta;
-            if (oldQuota <= 0 && oldQuota + delta > 0)
-            {
-                // Quota became positive - signal waiters
-                _quotaSignal.Release();
-            }
-        }
-        else
-        {
-            // Stream-level - route to stream
-            if (_streams.TryGetValue(streamId, out var stream))
-            {
-                stream.OnWindowUpdate(delta);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Acquires send quota from both connection and stream levels.
-    /// Blocks until quota is available or cancelled.
-    /// </summary>
-    /// <param name="streamId">The stream ID.</param>
-    /// <param name="n">Number of bytes to acquire.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    internal async Task AcquireSendQuotaAsync(uint streamId, int n, CancellationToken cancellationToken)
-    {
-        // Acquire connection-level quota first
-        while (true)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            var current = Interlocked.Read(ref _connSendQuota);
-            if (current >= n)
-            {
-                if (Interlocked.CompareExchange(ref _connSendQuota, current - n, current) == current)
-                {
-                    break;
-                }
-                continue;
-            }
-
-            // Wait for quota update
-            await _quotaSignal.WaitAsync(cancellationToken);
-        }
-    }
-
-    /// <summary>
-    /// Updates connection inflow accounting when data is received.
-    /// Returns the window update to send (if any).
-    /// </summary>
-    internal uint OnConnectionDataReceived(uint size)
-    {
-        lock (_flowControlLock)
-        {
-            _connInFlowUnacked += size;
-            if (_connInFlowUnacked >= _connInFlowLimit / 4)
-            {
-                var windowUpdate = _connInFlowUnacked;
-                _connInFlowUnacked = 0;
-                return windowUpdate;
-            }
-            return 0;
-        }
-    }
-
-    /// <summary>
-    /// Sends a connection-level window update.
-    /// </summary>
-    internal void SendConnectionWindowUpdate(uint increment)
-    {
-        if (increment > 0)
-        {
-            Span<byte> payload = stackalloc byte[4];
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, increment);
-            SendFrame(FrameType.WindowUpdate, 0, 0, payload);
-        }
-    }
-
-    /// <summary>
-    /// Updates flow control windows based on BDP estimation.
-    /// Called by the BDP estimator when it calculates a new estimate.
-    /// </summary>
-    private void UpdateFlowControlWindows(uint newBdp)
-    {
-        lock (_flowControlLock)
-        {
-            if (newBdp > _connInFlowLimit)
-            {
-                var delta = newBdp - _connInFlowLimit;
-                _connInFlowLimit = newBdp;
-                SendConnectionWindowUpdate(delta);
-            }
-        }
-
-        // Also update stream-level windows
-        foreach (var stream in _streams.Values)
-        {
-            stream.UpdateFlowControlWindow(newBdp);
-        }
-    }
-
-    /// <summary>
-    /// Sends a BDP ping to estimate bandwidth-delay product.
-    /// </summary>
-    internal void SendBdpPing()
-    {
-        if (_disposed || IsClosed)
-        {
+            // Connection-level: accepted but not enforced locally.
             return;
         }
 
-        _bdpEstimator.Timesnap();
-        SendFrame(FrameType.Ping, 0, PingFlags.Bdp, ShmBdpEstimator.BdpPingData);
+        // Stream-level - route to stream
+        if (_streams.TryGetValue(streamId, out var stream))
+        {
+            stream.OnWindowUpdate(delta);
+        }
+    }
+
+    /// <summary>
+    /// Sends a connection-level window update to the remote side.
+    /// This keeps the remote's connection send quota replenished for interop
+    /// with implementations that enforce connection-level flow control.
+    /// </summary>
+    private void SendConnectionWindowUpdate(uint increment)
+    {
+        Span<byte> payload = stackalloc byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, increment);
+        SendFrame(FrameType.WindowUpdate, 0, 0, payload);
     }
 
     #endregion
@@ -930,14 +851,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// </summary>
     private void HandlePong(FrameHeader header, ReadOnlySpan<byte> payload)
     {
-        // Check for BDP pong
-        if ((header.Flags & PingFlags.Bdp) != 0 && payload.Length == 8 &&
-            payload.SequenceEqual(ShmBdpEstimator.BdpPingData))
-        {
-            _bdpEstimator.Calculate();
-            return;
-        }
-
         // Regular keepalive pong - clear pending ping
         _pendingPing = false;
     }
@@ -946,7 +859,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
     private void ThrowIfDisposed()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
     }
 
     private void ThrowIfGoAway()
@@ -960,88 +873,87 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _disposed = true;
-
-            // Dispose the frame writer first: flushes any pending frames,
-            // cancels if blocked on ring, waits for writer task to exit,
-            // and drains remaining channel entries.
-            _frameWriter?.Dispose();
-
-            // Now that the writer task has exited, we can safely write
-            // GoAway directly to the ring without concurrent access.
-            // Use a short timeout to avoid blocking Dispose if the ring is full
-            // and the remote side is not consuming.
-            if (!_goAwaySent)
-            {
-                _goAwaySent = true;
-                try
-                {
-                    using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
-                    var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
-                    var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
-                    FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
-                }
-                catch { /* best-effort */ }
-            }
-
-            _disposeCts.Cancel();
-
-            // Wait for reader to finish
-            try { _frameReaderTask.Wait(TimeSpan.FromMilliseconds(500)); } catch { }
-
-            // Dispose all streams
-            foreach (var stream in _streams.Values)
-            {
-                try { stream.Dispose(); } catch { }
-            }
-            _streams.Clear();
-
-            _segment.Dispose();
-            _disposeCts.Dispose();
+            return;
         }
+
+        _frameWriter?.Dispose();
+
+        if (!_goAwaySent)
+        {
+            _goAwaySent = true;
+            try
+            {
+                using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+                var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
+                var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
+                FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
+            }
+            catch { /* best-effort */ }
+        }
+
+        _incomingStreamsChannel.Writer.TryComplete();
+        _disposeCts.Cancel();
+
+        try { _frameReaderTask.Wait(TimeSpan.FromMilliseconds(500)); } catch { }
+
+        if (_keepaliveTask != null)
+        {
+            try { _keepaliveTask.Wait(TimeSpan.FromMilliseconds(200)); } catch { }
+        }
+
+        foreach (var stream in _streams.Values)
+        {
+            try { stream.Dispose(); } catch { }
+        }
+        _streams.Clear();
+
+        _segment.Dispose();
+        _disposeCts.Dispose();
     }
 
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _disposed = true;
-
-            // Dispose the frame writer first.
-            _frameWriter?.Dispose();
-
-            // Now that the writer task has exited, write GoAway directly.
-            if (!_goAwaySent)
-            {
-                _goAwaySent = true;
-                try
-                {
-                    using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
-                    var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
-                    var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
-                    FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
-                }
-                catch { /* best-effort */ }
-            }
-
-            _disposeCts.Cancel();
-
-            // Wait for reader to finish
-            try { await _frameReaderTask.WaitAsync(TimeSpan.FromMilliseconds(500)); } catch { }
-
-            // Dispose all streams
-            foreach (var stream in _streams.Values)
-            {
-                try { await stream.DisposeAsync(); } catch { }
-            }
-            _streams.Clear();
-
-            _segment.Dispose();
-            _disposeCts.Dispose();
+            return;
         }
+
+        _frameWriter?.Dispose();
+
+        if (!_goAwaySent)
+        {
+            _goAwaySent = true;
+            try
+            {
+                using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+                var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
+                var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
+                FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
+            }
+            catch { /* best-effort */ }
+        }
+
+        _incomingStreamsChannel.Writer.TryComplete();
+        _disposeCts.Cancel();
+
+        try { await _frameReaderTask.WaitAsync(TimeSpan.FromMilliseconds(500)); } catch { }
+
+        if (_keepaliveTask != null)
+        {
+            try { await _keepaliveTask.WaitAsync(TimeSpan.FromMilliseconds(200)); } catch { }
+        }
+
+        foreach (var stream in _streams.Values)
+        {
+            try { await stream.DisposeAsync(); } catch { }
+        }
+        _streams.Clear();
+
+        _segment.Dispose();
+        _disposeCts.Dispose();
     }
 }
 

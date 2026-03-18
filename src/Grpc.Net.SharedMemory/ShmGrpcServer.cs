@@ -47,7 +47,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     private readonly Dictionary<string, IMethodHandler> _methods = new(StringComparer.Ordinal);
     private ShmControlListener? _listener;
     private readonly CancellationTokenSource _shutdownCts = new();
-    private bool _disposed;
+    private int _disposed;
 
     /// <summary>
     /// Creates a new SHM gRPC server.
@@ -120,7 +120,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     /// <param name="cancellationToken">Token to trigger graceful shutdown.</param>
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownCts.Token);
         var ct = linkedCts.Token;
@@ -201,15 +201,18 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             }
             catch (RpcException ex)
             {
-                await SendErrorTrailersAsync(stream, ex.StatusCode, ex.Status.Detail);
+                await SendErrorTrailersAsync(stream, ex.StatusCode, ex.Status.Detail,
+                    ex.Trailers?.Count > 0 ? ex.Trailers : context.ResponseTrailers);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                await SendErrorTrailersAsync(stream, StatusCode.Cancelled, "Server shutting down");
+                await SendErrorTrailersAsync(stream, StatusCode.Cancelled, "Server shutting down",
+                    context.ResponseTrailers);
             }
             catch (Exception ex)
             {
-                await SendErrorTrailersAsync(stream, StatusCode.Internal, ex.Message);
+                await SendErrorTrailersAsync(stream, StatusCode.Internal, ex.Message,
+                    context.ResponseTrailers);
             }
         }
         catch
@@ -222,16 +225,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         }
     }
 
-    private static async Task SendErrorTrailersAsync(ShmGrpcStream stream, StatusCode code, string? message)
+    private static async Task SendErrorTrailersAsync(ShmGrpcStream stream, StatusCode code, string? message,
+        Metadata? metadata = null)
     {
         try
         {
-            // Ensure response headers are sent (required before trailers)
             if (stream.ResponseHeaders == null)
             {
                 await stream.SendResponseHeadersAsync();
             }
-            await stream.SendTrailersAsync(code, message);
+            await stream.SendTrailersAsync(code, message, metadata);
         }
         catch
         {
@@ -244,14 +247,13 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     /// stream.  Avoids the per-message heap allocation (and LOH pressure for
     /// payloads &ge; 85 KB) that <c>IMessage.ToByteArray()</c> causes.
     /// </summary>
-    private static async Task SendProtobufMessageAsync(
+    private static Task SendProtobufMessageAsync(
         ShmGrpcStream stream, IMessage message, CancellationToken ct)
     {
         var size = message.CalculateSize();
         if (size == 0)
         {
-            await stream.SendMessageAsync(ReadOnlyMemory<byte>.Empty, ct);
-            return;
+            return stream.SendMessageAsync(ReadOnlyMemory<byte>.Empty, ct);
         }
 
         var buffer = ArrayPool<byte>.Shared.Rent(size);
@@ -262,29 +264,33 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             {
                 message.WriteTo(cos);
             }
-            await stream.SendMessageAsync(buffer.AsMemory(0, size), ct);
         }
-        finally
+        catch
         {
             ArrayPool<byte>.Shared.Return(buffer);
+            throw;
         }
+        // Transfer buffer ownership to SendMessageZeroCopyAsync — it returns
+        // the buffer to ArrayPool after the ring write completes.
+        return stream.SendMessageZeroCopyAsync(buffer.AsMemory(0, size), buffer, ct);
     }
 
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _disposed = true;
-            _shutdownCts.Cancel();
-
-            if (_listener != null)
-            {
-                await _listener.DisposeAsync();
-            }
-
-            _shutdownCts.Dispose();
+            return;
         }
+
+        _shutdownCts.Cancel();
+
+        if (_listener != null)
+        {
+            await _listener.DisposeAsync();
+        }
+
+        _shutdownCts.Dispose();
     }
 
     #region Method Handlers
@@ -314,13 +320,14 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // Call handler
             var response = await _handler(request, context);
 
-            // Send response using pooled buffer (avoids LOH allocation)
+            // Send response using zero-copy pooled buffer
             await SendProtobufMessageAsync(stream, response, ct);
 
             // Send trailers
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
-                context.Status.Detail);
+                context.Status.Detail,
+                context.ResponseTrailers);
         }
     }
 
@@ -348,7 +355,8 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // Send trailers
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
-                context.Status.Detail);
+                context.Status.Detail,
+                context.ResponseTrailers);
         }
     }
 
@@ -375,7 +383,8 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // Send trailers
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
-                context.Status.Detail);
+                context.Status.Detail,
+                context.ResponseTrailers);
         }
     }
 
@@ -400,7 +409,8 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // Send trailers
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
-                context.Status.Detail);
+                context.Status.Detail,
+                context.ResponseTrailers);
         }
     }
 
