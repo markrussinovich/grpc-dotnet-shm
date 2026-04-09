@@ -97,6 +97,8 @@ public static class MessageFlags
 {
     /// <summary>Indicates more data follows (chunked message).</summary>
     public const byte More = 0x01;
+    /// <summary>Indicates this is the last message (implicit half-close).</summary>
+    public const byte EndStream = 0x02;
 }
 
 /// <summary>
@@ -185,14 +187,24 @@ public static class ShmConstants
     /// <summary>Maximum stream ID for client (odd numbers).</summary>
     public const uint MaxStreamId = uint.MaxValue - 1;
 
-    /// <summary>Default spin iterations before falling back to blocking.</summary>
-    public const int SpinIterationsDefault = 300;
+    /// <summary>Default spin iterations before falling back to blocking.
+    /// Tuned high enough to cover writer response latency in streaming
+    /// ping-pong (~40µs at 3000 × ~35ns/spin). The adaptive algorithm
+    /// adjusts downward to SpinIterationsMin when data arrives quickly,
+    /// so idle CPU burn is minimal in practice.</summary>
+    public const int SpinIterationsDefault = 3000;
 
-    /// <summary>Minimum spin iterations for adaptive adjustment.</summary>
-    public const int SpinIterationsMin = 50;
+    /// <summary>Minimum spin iterations for adaptive adjustment.
+    /// Must be high enough to cover writer response latency in streaming
+    /// ping-pong (~40µs). At ~35ns/spin, 2000 iterations = ~70µs window,
+    /// sufficient for the writer to process and commit a response frame.
+    /// Lower values cause the adaptive algorithm to drop the cutoff below
+    /// the writer's response time, forcing unnecessary OS-level waits
+    /// (~80µs penalty per wait).</summary>
+    public const int SpinIterationsMin = 2000;
 
     /// <summary>Maximum spin iterations to prevent excessive CPU use.</summary>
-    public const int SpinIterationsMax = 2000;
+    public const int SpinIterationsMax = 10000;
 
     /// <summary>Suffix for control segment names.</summary>
     public const string ControlSegmentSuffix = "_ctl";

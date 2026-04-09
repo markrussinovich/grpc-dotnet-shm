@@ -18,6 +18,7 @@
 
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 
 namespace Grpc.Net.SharedMemory;
 
@@ -38,8 +39,10 @@ internal sealed class ShmFrameWriter : IDisposable
         public uint StreamId;
         public byte Flags;
         public int Length;
-        public ReadOnlyMemory<byte> Payload; // payload data (both paths)
-        public byte[]? ReturnToPool;          // buffer to return to ArrayPool after ring write
+        public ReadOnlyMemory<byte> Payload;
+        public byte[]? ReturnToPool;
+        public ManualResetEventSlim? CompletionSignal; // set after ring write; caller waits if non-null
+        public StrongBox<bool>? CancelFlag; // shared with caller; true = skip this entry
     }
 
     private readonly ShmRing _ring;
@@ -59,6 +62,10 @@ internal sealed class ShmFrameWriter : IDisposable
         _ct = cts.Token;
         _queue = new ConcurrentQueue<FrameEntry>();
         _readySignal = new ManualResetEventSlim(false);
+
+        // Register drain callback so WaitForSpace can flush control frames
+        // (WindowUpdate) before blocking, preventing bidirectional deadlock.
+        _ring.WaitForSpaceDrainCallback = DrainControlFrames;
 
         _writerTask = Task.Factory.StartNew(
             WriterLoop, _ct,
@@ -139,6 +146,58 @@ internal sealed class ShmFrameWriter : IDisposable
         }
     }
 
+    /// <summary>
+    /// Enqueues a frame without copying and waits for the WriterLoop to finish
+    /// writing it to the ring. This is safe for callers that may reuse the
+    /// payload buffer immediately after this method returns (e.g., streaming RPCs
+    /// where grpc-dotnet reuses serialization buffers across WriteAsync calls).
+    /// </summary>
+    public void EnqueueZeroCopyAndWait(FrameType type, uint streamId, byte flags,
+        ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
+    {
+        if (_completed)
+        {
+            throw new InvalidOperationException("Frame writer has been disposed.");
+        }
+
+        var signal = new ManualResetEventSlim(false);
+        var cancelFlag = new StrongBox<bool>(false);
+        _queue.Enqueue(new FrameEntry
+        {
+            Type = type, StreamId = streamId, Flags = flags,
+            Length = payload.Length, Payload = payload,
+            ReturnToPool = null,
+            CompletionSignal = signal,
+            CancelFlag = cancelFlag
+        });
+
+        if (Volatile.Read(ref _waiting) != 0 && !_disposed)
+        {
+            try { _readySignal.Set(); } catch (ObjectDisposedException) { }
+        }
+
+        // Block until WriterLoop has written the data to the ring.
+        try
+        {
+            if (!signal.Wait(5000, cancellationToken))
+            {
+                signal.Wait(cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Mark the queued entry so the writer thread skips it.
+            // This prevents a cancelled message from hitting the wire
+            // and avoids flow-control skew (caller restores _sendWindow).
+            Volatile.Write(ref cancelFlag.Value, true);
+            throw;
+        }
+        finally
+        {
+            signal.Dispose();
+        }
+    }
+
     private void WriterLoop()
     {
         const int maxBatch = 512;
@@ -158,12 +217,15 @@ internal sealed class ShmFrameWriter : IDisposable
                     continue;
                 }
 
-                // Phase 2: adaptive spin
-                var spinWait = new SpinWait();
+                // Phase 2: spin-wait for data.
+                // In streaming ping-pong, the consumer typically enqueues the
+                // next frame within ~30-50µs (one full cross-ring round-trip).
+                // A brief spin here avoids falling through to the heavier
+                // ManualResetEventSlim.Wait (~80µs OS penalty).
                 var found = false;
-                while (!spinWait.NextSpinWillYield)
+                for (int spin = 0; spin < ShmConstants.SpinIterationsMin; spin++)
                 {
-                    spinWait.SpinOnce(sleep1Threshold: -1);
+                    Thread.SpinWait(1);
                     if (_queue.TryDequeue(out batch[0]))
                     {
                         var count = 1;
@@ -236,12 +298,36 @@ internal sealed class ShmFrameWriter : IDisposable
                 for (var i = 0; i < count; i++)
                 {
                     ref var entry = ref batch[i];
+
+                    // Skip entries cancelled by the caller (e.g. OperationCanceledException
+                    // in EnqueueZeroCopyAndWait). Writing a cancelled entry would cause
+                    // flow-control skew since the caller already restored _sendWindow.
+                    if (entry.CancelFlag != null && Volatile.Read(ref entry.CancelFlag.Value))
+                        continue;
+
                     var payload = entry.Payload.Span;
+
+                    // Before writing a large message that may block in
+                    // WaitForSpace, drain any newly queued control frames
+                    // (WindowUpdate, Ping, Pong). These are tiny (20-30 bytes)
+                    // and always fit. WindowUpdate is critical: it tells the
+                    // remote side to advance its ReadIdx, freeing ring space
+                    // that this write needs. Without this drain, 16+ concurrent
+                    // streams can deadlock: both sides' WriterLoops block on
+                    // WaitForSpace while WindowUpdates sit in the queue behind
+                    // the large message being written.
+                    if (entry.Type == FrameType.Message && payload.Length >= 65536)
+                    {
+                        _ring.EndBatchWrite();
+                        DrainControlFrames();
+                        _ring.BeginBatchWrite();
+                    }
 
                     if (entry.Type == FrameType.Message)
                     {
                         var isLast = (entry.Flags & MessageFlags.More) == 0;
-                        FrameProtocol.WriteMessage(_ring, entry.StreamId, payload, isLast, _ct);
+                        var extraFlags = (byte)(entry.Flags & ~MessageFlags.More); // preserve EndStream etc.
+                        FrameProtocol.WriteMessage(_ring, entry.StreamId, payload, isLast, _ct, extraFlags);
                     }
                     else
                     {
@@ -257,13 +343,45 @@ internal sealed class ShmFrameWriter : IDisposable
         }
         finally
         {
-            // Always return pooled buffers, even if a ring write threw.
             for (var i = 0; i < count; i++)
             {
                 if (batch[i].ReturnToPool != null)
                     ArrayPool<byte>.Shared.Return(batch[i].ReturnToPool!);
+                batch[i].CompletionSignal?.Set();
                 batch[i] = default;
             }
+        }
+    }
+
+    /// <summary>
+    /// Drain non-Message frames from the queue and write them to the ring.
+    /// Called before a large ring write to ensure WindowUpdate/Ping/Pong
+    /// frames are delivered promptly, preventing bidirectional ring deadlock.
+    /// Stops at the first Message frame (leaves it queued for the caller).
+    /// </summary>
+    private void DrainControlFrames()
+    {
+        while (_queue.TryPeek(out var peeked))
+        {
+            // Only drain pure control frames (WindowUpdate, Ping, Pong).
+            // Message and Trailers are stream-semantic and must preserve
+            // their queue ordering relative to each other.
+            if (peeked.Type == FrameType.Message
+                || peeked.Type == FrameType.Trailers
+                || peeked.Type == FrameType.Headers
+                || peeked.Type == FrameType.HalfClose
+                || peeked.Type == FrameType.Cancel
+                || peeked.Type == FrameType.GoAway)
+                break;
+
+            if (!_queue.TryDequeue(out var entry))
+                break;
+
+            var header = new FrameHeader(entry.Type, entry.StreamId, (uint)entry.Length, entry.Flags);
+            FrameProtocol.WriteFrame(_ring, header, entry.Payload.Span, _ct);
+            if (entry.ReturnToPool != null)
+                ArrayPool<byte>.Shared.Return(entry.ReturnToPool);
+            entry.CompletionSignal?.Set();
         }
     }
 
@@ -311,6 +429,7 @@ internal sealed class ShmFrameWriter : IDisposable
                 {
                     if (entry.ReturnToPool != null)
                         ArrayPool<byte>.Shared.Return(entry.ReturnToPool);
+                    entry.CompletionSignal?.Set();
                 }
             }
 
@@ -323,6 +442,7 @@ internal sealed class ShmFrameWriter : IDisposable
             {
                 if (lateEntry.ReturnToPool != null)
                     ArrayPool<byte>.Shared.Return(lateEntry.ReturnToPool);
+                lateEntry.CompletionSignal?.Set();
             }
         }
     }

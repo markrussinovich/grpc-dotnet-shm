@@ -57,6 +57,7 @@ string? serverTransport = null;
 int serverPort = 0;
 string? serverSegment = null;
 int parentPid = 0;
+string? onlyTransport = null;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -74,6 +75,8 @@ for (int i = 0; i < args.Length; i++)
         serverSegment = args[++i];
     if (args[i] == "--parent-pid")
         parentPid = int.Parse(args[++i], CultureInfo.InvariantCulture);
+    if (args[i] == "--only")
+        onlyTransport = args[++i].ToLowerInvariant();
 }
 
 if (serverMode)
@@ -125,6 +128,14 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv }
         Console.Error.Flush();
         continue;
     }
+
+    // --only tcp|shm: skip transports that don't match
+    if (onlyTransport != null && env.Transport != onlyTransport)
+    {
+        await env.DisposeAsync();
+        continue;
+    }
+
     await using var envDisposable = env;
 
     Console.WriteLine($"=== {env.Transport.ToUpper()} Transport ===");

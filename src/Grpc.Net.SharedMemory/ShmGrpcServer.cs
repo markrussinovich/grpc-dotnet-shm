@@ -445,6 +445,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         private readonly MessageParser<T> _parser = new(() => new T());
         private InboundFrame _previousFrame;
         private T? _current;
+        private bool _endOfStream;
 
         public ShmAsyncStreamReader(ShmGrpcStream stream) => _stream = stream;
 
@@ -452,6 +453,14 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
         public async Task<bool> MoveNext(CancellationToken cancellationToken)
         {
+            if (_endOfStream)
+            {
+                _previousFrame.ReturnToPool();
+                _previousFrame = default;
+                _current = default;
+                return false;
+            }
+
             // Use ReceiveNextMessageBufferAsync with the caller's per-call
             // cancellation token. Unlike the enumerator-based approach, this
             // ensures every MoveNext call respects the current token — not
@@ -461,9 +470,19 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
             if (eos)
             {
-                _previousFrame = default;
-                _current = default;
-                return false;
+                if (mem.Length == 0)
+                {
+                    _previousFrame = default;
+                    _current = default;
+                    return false;
+                }
+
+                // EndStream with a final message: parse it, then signal
+                // end-of-stream on the *next* MoveNext call.
+                _previousFrame = frame;
+                _current = _parser.ParseFrom(new ReadOnlySequence<byte>(mem));
+                _endOfStream = true;
+                return true;
             }
 
             _previousFrame = frame;

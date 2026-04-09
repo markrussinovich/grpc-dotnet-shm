@@ -214,10 +214,9 @@ public class FrameProtocolTests
     }
 
     [Test]
-    public void ReadFramePayload_Borrowed_DeferredCommit_PreservesData()
+    public void ReadFramePayload_LargePayload_PreservesData()
     {
-        // Verifies that zero-copy (borrowed) reads work correctly.
-        // Payloads must be >= ZeroCopyMinPayloadSize (256KB) to trigger borrow.
+        // Verifies that large payload reads preserve data correctly.
         const int PayloadSize1 = 260_000;
         const int PayloadSize2 = 270_000;
         var name = $"grpc_test_{Guid.NewGuid():N}";
@@ -232,13 +231,13 @@ public class FrameProtocolTests
         FrameProtocol.WriteMessage(ring, streamId: 1, msg1, isLast: false);
         FrameProtocol.WriteMessage(ring, streamId: 1, msg2, isLast: true);
 
-        // Read first frame — should be borrowed (zero-copy)
-        var (h1, p1) = FrameProtocol.ReadFramePayload(ring, allowBorrowed: true);
+        // Read first frame
+        var (h1, p1) = FrameProtocol.ReadFramePayload(ring);
         Assert.That(p1.Length, Is.EqualTo(PayloadSize1));
         Assert.That(p1.Memory.Span[0], Is.EqualTo(0xAA));
 
-        // Second read: borrow still outstanding → should be copy
-        var (h2, p2) = FrameProtocol.ReadFramePayload(ring, allowBorrowed: true);
+        // Second read
+        var (h2, p2) = FrameProtocol.ReadFramePayload(ring);
         Assert.That(p2.Length, Is.EqualTo(PayloadSize2));
         Assert.That(p2.Memory.Span[0], Is.EqualTo(0xBB));
 
@@ -248,12 +247,10 @@ public class FrameProtocolTests
     }
 
     [Test]
-    public void ReadFramePayload_Borrowed_MixedRelease_Safe()
+    public void ReadFramePayload_LargePayload_MixedRelease_Safe()
     {
-        // Verifies that releasing a mix of borrowed and copied payloads
-        // (in any order) leaves the ring in a consistent state.
-        // p1 is borrowed (first borrow); p2 is the copy path because
-        // HasOutstandingBorrow blocks a second concurrent borrow.
+        // Verifies that releasing payloads in any order leaves
+        // the ring in a consistent state.
         const int PayloadSize = 260_000;
         var name = $"grpc_test_{Guid.NewGuid():N}";
         using var seg = Segment.Create(name, ringCapacity: 2 * 1024 * 1024, maxStreams: 100);
@@ -267,8 +264,8 @@ public class FrameProtocolTests
         FrameProtocol.WriteMessage(ring, streamId: 1, msg1, isLast: false);
         FrameProtocol.WriteMessage(ring, streamId: 1, msg2, isLast: true);
 
-        var (_, p1) = FrameProtocol.ReadFramePayload(ring, allowBorrowed: true);
-        var (_, p2) = FrameProtocol.ReadFramePayload(ring, allowBorrowed: true);
+        var (_, p1) = FrameProtocol.ReadFramePayload(ring);
+        var (_, p2) = FrameProtocol.ReadFramePayload(ring);
 
         // Release out of order — p2 first
         p2.Release();
@@ -279,16 +276,16 @@ public class FrameProtocolTests
         Array.Fill(msg3, (byte)0x33);
         FrameProtocol.WriteMessage(ring, streamId: 1, msg3, isLast: true);
 
-        var (h3, p3) = FrameProtocol.ReadFramePayload(ring, allowBorrowed: true);
+        var (h3, p3) = FrameProtocol.ReadFramePayload(ring);
         Assert.That(p3.Memory.Span[0], Is.EqualTo(0x33));
         p3.Release();
     }
 
     [Test]
-    public void ReadFramePayload_Borrowed_ProducerDoesNotOverwrite()
+    public void ReadFramePayload_LargePayload_ProducerWriteAfterRelease()
     {
-        // Verifies that the producer cannot overwrite borrowed memory.
-        // Uses a tight ring where the borrowed payload occupies most of capacity.
+        // Verifies that the producer can write after a large payload
+        // is released and the ring space is reclaimed.
         const int PayloadSize = 260_000;
         var name = $"grpc_test_{Guid.NewGuid():N}";
         using var seg = Segment.Create(name, ringCapacity: 512 * 1024, maxStreams: 100);
@@ -298,8 +295,8 @@ public class FrameProtocolTests
         Array.Fill(largeMsg, (byte)0xAA);
         FrameProtocol.WriteMessage(ring, streamId: 1, largeMsg, isLast: true);
 
-        // Read zero-copy — hold onto payload
-        var (_, payload) = FrameProtocol.ReadFramePayload(ring, allowBorrowed: true);
+        // Read payload and verify
+        var (_, payload) = FrameProtocol.ReadFramePayload(ring);
         Assert.That(payload.Memory.Span[0], Is.EqualTo(0xAA));
         Assert.That(payload.Length, Is.EqualTo(PayloadSize));
 
@@ -311,7 +308,7 @@ public class FrameProtocolTests
         Array.Fill(msg2, (byte)0xBB);
         FrameProtocol.WriteMessage(ring, streamId: 1, msg2, isLast: true);
 
-        var (_, p2) = FrameProtocol.ReadFramePayload(ring, allowBorrowed: true);
+        var (_, p2) = FrameProtocol.ReadFramePayload(ring);
         Assert.That(p2.Memory.Span[0], Is.EqualTo(0xBB));
         p2.Release();
     }
@@ -364,7 +361,7 @@ public class ShmGrpcRequestStreamTests
 
         while (true)
         {
-            var (header, payload) = FrameProtocol.ReadFramePayload(txRing, allowBorrowed: false, readCts.Token);
+            var (header, payload) = FrameProtocol.ReadFramePayload(txRing, readCts.Token);
             if (header.Type == FrameType.Headers)
             {
                 payload.Release();

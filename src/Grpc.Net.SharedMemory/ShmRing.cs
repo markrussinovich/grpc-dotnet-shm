@@ -90,17 +90,6 @@ public sealed class ShmRing : IDisposable
     private volatile bool _localClosed;
     private ulong _pendingReadIdx;
 
-    // Zero-copy borrow state machine (reader thread + app thread):
-    //   1. SetBorrowActive()      [reader]  → _hasOutstandingBorrow = true
-    //   2. CommitRead() w/ borrow [reader]  → accumulates _deferredReadBytes
-    //   3. ReleaseBorrow()        [app]     → _borrowReleasePending = true, ReadIdx += borrow
-    //   4. FlushDeferredReads()   [reader]  → ReadIdx += deferred, clears both flags
-    // Invariant: ReadIdx must not advance past the borrowed region until
-    // ReleaseBorrow, because ReadIdx = "everything before is free for writer".
-    private volatile bool _hasOutstandingBorrow;
-    private volatile bool _borrowReleasePending;
-    private long _deferredReadBytes;
-
     // Adaptive spin state
     private int _dataSpinCutoff = ShmConstants.SpinIterationsDefault;
     private int _spaceSpinCutoff = ShmConstants.SpinIterationsDefault;
@@ -108,6 +97,12 @@ public sealed class ShmRing : IDisposable
     // Batch write: suppress OS-level data signals until EndBatchWrite.
     // DataSeq is still incremented per-frame so spin waiters see updates.
     private int _batchWriteDepth;
+
+    // Callback invoked during WaitForSpace before blocking, allowing the
+    // WriterLoop to drain control frames (e.g. WindowUpdate) that can
+    // free space on the remote side and break bidirectional deadlocks.
+    internal Action? WaitForSpaceDrainCallback;
+    private int _drainRecursionDepth;
 
     /// <summary>
     /// Creates a new ShmRing from a memory region.
@@ -482,50 +477,9 @@ public sealed class ShmRing : IDisposable
 
         ref var header = ref GetHeader();
 
-        // Flush any deferred read commits from zero-copy payload releases.
-        // This advances ReadIdx for payloads that were borrowed by the consumer
-        // and released on a different thread. Must happen before checking
-        // available space so the writer sees the freed ring space.
-        FlushDeferredReads(ref header);
-
-        // Deferred-bytes backpressure: during a zero-copy borrow, CommitRead
-        // accumulates bytes without advancing ReadIdx.  If the writer is
-        // running low on ring space, pause the frame reader until the app
-        // thread releases the borrow.
-        //
-        // Two-phase check to avoid expensive shared-memory reads:
-        //   Phase 1 (cheap): _deferredReadBytes > capacity/4 (≥ 25% of ring
-        //     deferred → writer has lost visibility of that much space)
-        //   Phase 2 (shared): WriterFreeSpace < capacity/8 (writer has
-        //     < 12.5% headroom → genuinely at risk of blocking)
-        // Only spin-waits when both conditions are true.
-        if (_hasOutstandingBorrow && _deferredReadBytes > (long)(_capacity / 4))
-        {
-            var writerFree = _capacity - (Volatile.Read(ref header.WriteIdx) - Volatile.Read(ref header.ReadIdx));
-            if (writerFree < _capacity / 8)
-            {
-                SpinWait spinner = default;
-                while (!_borrowReleasePending && _hasOutstandingBorrow && !_localClosed)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    spinner.SpinOnce();
-                }
-
-                FlushDeferredReads(ref header);
-            }
-        }
-
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            // Re-check for borrow releases that happened while we were
-            // in WaitForData.  ReleaseBorrow signals a spurious data
-            // wakeup, but the deferred bytes are only flushed here.
-            if (_borrowReleasePending)
-            {
-                FlushDeferredReads(ref header);
-            }
 
             var writeIdx = Volatile.Read(ref header.WriteIdx);
             var pendingIdx = Volatile.Read(ref _pendingReadIdx);
@@ -581,13 +535,6 @@ public sealed class ShmRing : IDisposable
 
     /// <summary>
     /// Commits a read reservation, freeing space for the writer.
-    /// When a borrowed (zero-copy) payload is outstanding, bytes are
-    /// deferred (not written to ReadIdx) because ReadIdx must not advance
-    /// past the borrowed region — a monotonic ReadIdx means "everything
-    /// before this offset is free", so advancing it past the borrow start
-    /// would let the writer overwrite the borrowed data.
-    /// Deferred bytes are flushed by <see cref="FlushDeferredReads"/> on
-    /// the next <see cref="ReserveRead"/> after the borrow is released.
     /// </summary>
     public void CommitRead(ReadReservation reservation, int bytesConsumed)
     {
@@ -613,18 +560,23 @@ public sealed class ShmRing : IDisposable
 
         ref var header = ref GetHeader();
 
-        if (_hasOutstandingBorrow)
-        {
-            // A zero-copy borrow is active. DO NOT advance ReadIdx —
-            // it must stay behind the borrowed region to prevent the
-            // writer from overwriting the borrowed data. Accumulate
-            // the bytes; they'll be flushed in FlushDeferredReads.
-            _deferredReadBytes += bytesConsumed;
-            return;
-        }
-
-        // No borrow active: use the captured CommitReadIdx snapshot (fastest).
         Volatile.Write(ref header.ReadIdx, reservation.CommitReadIdx + (ulong)bytesConsumed);
+        SignalSpaceAvailability(ref header);
+    }
+
+    /// <summary>
+    /// Batched commit: advances ReadIdx by <paramref name="totalBytesConsumed"/>
+    /// from a saved base index. Used by ReadFramePayload to commit both header
+    /// and payload reads in a single shared-memory write, halving the per-frame
+    /// write traffic on the read path.
+    /// </summary>
+    internal void CommitReadRaw(ulong baseCommitReadIdx, int totalBytesConsumed)
+    {
+        if (_localClosed || totalBytesConsumed == 0)
+            return;
+
+        ref var header = ref GetHeader();
+        Volatile.Write(ref header.ReadIdx, baseCommitReadIdx + (ulong)totalBytesConsumed);
         SignalSpaceAvailability(ref header);
     }
 
@@ -643,94 +595,6 @@ public sealed class ShmRing : IDisposable
         {
             Interlocked.Increment(ref header.SpaceSeq);
             _sync?.SignalSpace();
-        }
-    }
-
-    /// <summary>
-    /// Gets whether a borrowed (zero-copy) payload is currently outstanding.
-    /// </summary>
-    internal bool HasOutstandingBorrow => _hasOutstandingBorrow;
-
-    /// <summary>
-    /// Returns the number of free bytes visible to the writer.
-    /// This is capacity minus the distance between WriteIdx and ReadIdx.
-    /// Used by the zero-copy borrow guard to avoid borrowing when the
-    /// ring is too full for the writer to make progress.
-    /// </summary>
-    internal ulong WriterFreeSpace
-    {
-        get
-        {
-            ref var header = ref GetHeader();
-            var writeIdx = Volatile.Read(ref header.WriteIdx);
-            var readIdx = Volatile.Read(ref header.ReadIdx);
-            return _capacity - (writeIdx - readIdx);
-        }
-    }
-
-    /// <summary>
-    /// Marks that a payload has been borrowed from the ring for zero-copy reading.
-    /// </summary>
-    internal void SetBorrowActive()
-    {
-        _hasOutstandingBorrow = true;
-    }
-
-    /// <summary>
-    /// Releases a borrowed payload. Advances ReadIdx by the
-    /// borrowed bytes and signals both space and data availability.
-    /// The data signal causes a spurious wakeup of the frame reader,
-    /// which then calls <see cref="FlushDeferredReads"/> to advance
-    /// ReadIdx for any deferred CommitRead bytes accumulated during
-    /// the borrow.  Without this wakeup, the writer could see
-    /// insufficient free space (because deferred bytes are not yet
-    /// reflected in ReadIdx) and block in WaitForSpace, while the
-    /// frame reader blocks in WaitForData — a deadlock.
-    /// </summary>
-    internal void ReleaseBorrow(int bytesConsumed)
-    {
-        // Set the pending flag BEFORE signaling so the reader always sees it
-        // when woken.  If we signaled first, the reader could wake, check
-        // _borrowReleasePending (still false), and go back to sleep before
-        // we set it — a lost-wakeup deadlock.
-        _borrowReleasePending = true;
-
-        if (!_localClosed)
-        {
-            ref var header = ref GetHeader();
-            if (bytesConsumed > 0)
-            {
-                Volatile.Write(ref header.ReadIdx, Volatile.Read(ref header.ReadIdx) + (ulong)bytesConsumed);
-                SignalSpaceAvailability(ref header);
-            }
-
-            // Wake the frame reader so it calls ReserveRead → FlushDeferredReads.
-            Interlocked.Increment(ref header.DataSeq);
-            if (Volatile.Read(ref header.DataWaiters) > 0)
-            {
-                _sync?.SignalData();
-            }
-        }
-    }
-
-    private void FlushDeferredReads(ref RingHeader header)
-    {
-        if (_borrowReleasePending)
-        {
-            var deferred = _deferredReadBytes;
-            if (deferred > 0)
-            {
-                // Clear local accumulator before advancing shared ReadIdx:
-                // another thread seeing the new ReadIdx must not also see
-                // stale _deferredReadBytes (though currently only the reader
-                // thread accesses this field, the ordering is defensive).
-                _deferredReadBytes = 0;
-                Volatile.Write(ref header.ReadIdx, Volatile.Read(ref header.ReadIdx) + (ulong)deferred);
-                SignalSpaceAvailability(ref header);
-            }
-
-            _borrowReleasePending = false;
-            _hasOutstandingBorrow = false;
         }
     }
 
@@ -825,6 +689,25 @@ public sealed class ShmRing : IDisposable
         var writeIdx2 = Volatile.Read(ref header.WriteIdx);
         var readIdx2 = Volatile.Read(ref header.ReadIdx);
         var free = _capacity - (writeIdx2 - readIdx2);
+
+        // Before blocking, drain any pending control frames (WindowUpdate)
+        // so the remote side can free ring space. Without this, both sides'
+        // WriterLoops can block waiting for space while WindowUpdates sit
+        // unreachable in the queue.
+        // Guard against recursion: DrainControlFrames → WriteFrame → WaitForSpace → drain.
+        // Depth 1 is enough — control frames are tiny and always fit if any space exists.
+        if (_drainRecursionDepth == 0)
+        {
+            _drainRecursionDepth++;
+            try { WaitForSpaceDrainCallback?.Invoke(); }
+            finally { _drainRecursionDepth--; }
+        }
+
+        // Re-check after drain — the remote may have freed space
+        writeIdx2 = Volatile.Read(ref header.WriteIdx);
+        readIdx2 = Volatile.Read(ref header.ReadIdx);
+        free = _capacity - (writeIdx2 - readIdx2);
+        if (free >= needed) return;
 
         if (free == 0)
         {

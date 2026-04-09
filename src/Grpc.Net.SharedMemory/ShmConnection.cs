@@ -404,6 +404,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _frameWriter!.EnqueueZeroCopy(type, streamId, flags, payload, pooledBuffer);
     }
 
+    /// <summary>
+    /// Zero-copy enqueue + wait for ring write completion. Safe for callers
+    /// that reuse the payload buffer after return (streaming RPCs).
+    /// </summary>
+    internal void SendFrameZeroCopyAndWait(FrameType type, uint streamId, byte flags,
+        ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        _frameWriter!.EnqueueZeroCopyAndWait(type, streamId, flags, payload, cancellationToken);
+    }
+
     internal void SendStreamWindowUpdate(uint streamId, uint increment)
     {
         if (increment > 0)
@@ -434,7 +445,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 while (!_disposeCts.Token.IsCancellationRequested)
                 {
                     var (header, payload) = FrameProtocol.ReadFramePayload(
-                        RxRing, allowBorrowed: true, _disposeCts.Token);
+                        RxRing, _disposeCts.Token);
                     ProcessFrame(header, payload);
                 }
 

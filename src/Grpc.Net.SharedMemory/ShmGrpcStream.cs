@@ -275,6 +275,31 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             Interlocked.Add(ref _sendWindow, -data.Length);
             var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
+
+            if (data.Length >= 65536 && Volatile.Read(ref _disposed) == 0)
+            {
+#pragma warning disable CA2016
+                if (_sendLock.Wait(0))
+#pragma warning restore CA2016
+                {
+                    try
+                    {
+                        _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, 0, data, ct);
+                    }
+                    catch
+                    {
+                        Interlocked.Add(ref _sendWindow, data.Length);
+                        throw;
+                    }
+                    finally
+                    {
+                        _sendLock.Release();
+                    }
+                    return Task.CompletedTask;
+                }
+                // Lock contended — fall through to normal SendFrameAsync
+                // (which will acquire the lock and do defensive copy)
+            }
             var task = SendFrameAsync(FrameType.Message, 0, data, ct);
             // Sync completion (the common case): no restore needed.
             if (task.IsCompletedSuccessfully)
@@ -316,7 +341,118 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         Interlocked.Add(ref _sendWindow, -data.Length);
         try
         {
-            await SendFrameAsync(FrameType.Message, 0, data, linkedCts.Token);
+            if (data.Length >= 65536 && Volatile.Read(ref _disposed) == 0)
+            {
+                await _sendLock.WaitAsync(linkedCts.Token);
+                try
+                {
+                    _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, 0, data, linkedCts.Token);
+                }
+                finally
+                {
+                    _sendLock.Release();
+                }
+            }
+            else
+            {
+                await SendFrameAsync(FrameType.Message, 0, data, linkedCts.Token);
+            }
+        }
+        catch
+        {
+            Interlocked.Add(ref _sendWindow, data.Length);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Sends a message with an implicit half-close in one frame (EndStream flag).
+    /// Eliminates the separate HalfClose frame, reducing a unary RPC from 3 to 2
+    /// client-side frames and saving one ring write + signal round-trip.
+    /// </summary>
+    public Task SendMessageAndHalfCloseAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (_halfCloseSent)
+            throw new InvalidOperationException("Cannot send after half-close");
+
+        if (Interlocked.Read(ref _sendWindow) >= data.Length)
+        {
+            Interlocked.Add(ref _sendWindow, -data.Length);
+            var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
+
+            // Large payloads: wait for the ring write to complete before
+            // returning, so the caller can safely reuse the buffer.
+            if (data.Length >= 65536 && Volatile.Read(ref _disposed) == 0)
+            {
+#pragma warning disable CA2016
+                if (_sendLock.Wait(0))
+#pragma warning restore CA2016
+                {
+                    try
+                    {
+                        _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, MessageFlags.EndStream, data, ct);
+                        _halfCloseSent = true;
+                        return Task.CompletedTask;
+                    }
+                    catch
+                    {
+                        Interlocked.Add(ref _sendWindow, data.Length);
+                        throw;
+                    }
+                    finally
+                    {
+                        _sendLock.Release();
+                    }
+                }
+            }
+
+            var task = SendFrameAsync(FrameType.Message, MessageFlags.EndStream, data, ct);
+            if (task.IsCompletedSuccessfully)
+            {
+                _halfCloseSent = true;
+                return Task.CompletedTask;
+            }
+            return SendMessageAndHalfCloseCompleteAsync(task);
+        }
+
+        return SendMessageAndHalfCloseSlowAsync(data, cancellationToken);
+    }
+
+    private async Task SendMessageAndHalfCloseCompleteAsync(Task sendTask)
+    {
+        await sendTask.ConfigureAwait(false);
+        _halfCloseSent = true;
+    }
+
+    private async Task SendMessageAndHalfCloseSlowAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
+    {
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+        while (Interlocked.Read(ref _sendWindow) < data.Length)
+        {
+            linkedCts.Token.ThrowIfCancellationRequested();
+            await _sendWindowSignal.WaitAsync(linkedCts.Token);
+        }
+        Interlocked.Add(ref _sendWindow, -data.Length);
+        try
+        {
+            if (data.Length >= 65536 && Volatile.Read(ref _disposed) == 0)
+            {
+                await _sendLock.WaitAsync(linkedCts.Token);
+                try
+                {
+                    _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, MessageFlags.EndStream, data, linkedCts.Token);
+                }
+                finally
+                {
+                    _sendLock.Release();
+                }
+            }
+            else
+            {
+                await SendFrameAsync(FrameType.Message, MessageFlags.EndStream, data, linkedCts.Token);
+            }
+            _halfCloseSent = true;
         }
         catch
         {
@@ -693,6 +829,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         f.ReturnToPool();
                         yield return messageAccumulator.ToArray();
                         messageAccumulator.SetLength(0);
+                        if ((f.Flags & MessageFlags.EndStream) != 0) { _halfCloseReceived = true; yield break; }
                         break;
                     }
 
@@ -700,6 +837,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     var owned = f.Memory.ToArray();
                     f.ReturnToPool();
                     yield return owned;
+                    if ((f.Flags & MessageFlags.EndStream) != 0) { _halfCloseReceived = true; yield break; }
                     break;
 
                 case FrameType.HalfClose:
@@ -797,12 +935,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         f.ReturnToPool();
                         var assembled = messageAccumulator.ToArray();
                         messageAccumulator.SetLength(0);
-                        return (assembled, default, false);
+                        var endStream1 = (f.Flags & MessageFlags.EndStream) != 0;
+                        if (endStream1) _halfCloseReceived = true;
+                        return (assembled, default, endStream1);
                     }
 
                     // Single-frame message: return zero-copy view.
                     // Caller must hold onto 'f' and pass it back as previousFrame
                     // on the next call so the pooled buffer can be released.
+                    if ((f.Flags & MessageFlags.EndStream) != 0)
+                    {
+                        _halfCloseReceived = true;
+                        return (f.Memory, f, true);
+                    }
                     return (f.Memory, f, false);
 
                 case FrameType.HalfClose:
@@ -830,7 +975,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Internal high-performance message receiver that yields <see cref="ReadOnlyMemory{T}"/>
-    /// views backed by pooled buffers or borrowed ring memory. The memory is only
+    /// views backed by pooled buffers. The memory is only
     /// valid until the next <c>MoveNextAsync</c> call — callers must copy any data
     /// they need to retain.
     /// Used by <see cref="ShmGrpcResponseStream"/> to avoid LOH allocations.
@@ -880,6 +1025,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                             previousFrame.ReturnToPool();
                             yield return messageAccumulator.ToArray();
                             messageAccumulator.SetLength(0);
+                            if ((f.Flags & MessageFlags.EndStream) != 0) { _halfCloseReceived = true; yield break; }
                             break;
                         }
 
@@ -889,6 +1035,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
                         previousFrame = f;
                         yield return f.Memory;
+                        if ((f.Flags & MessageFlags.EndStream) != 0) { _halfCloseReceived = true; yield break; }
                         break;
 
                     case FrameType.HalfClose:
@@ -969,18 +1116,16 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal void OnWindowUpdate(uint increment)
     {
         Interlocked.Add(ref _sendWindow, increment);
-        if (increment > 0)
+        if (increment > 0 && Volatile.Read(ref _disposed) == 0)
         {
-            _sendWindowSignal.Release();
+            try { _sendWindowSignal.Release(); } catch (ObjectDisposedException) { }
         }
     }
 
     private Task SendFrameAsync(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
     {
-        // Synchronous fast path: if the send lock is uncontended (the common case
-        // for unary calls and low-concurrency streaming), acquire it synchronously
-        // to avoid allocating an async state machine (~200 bytes per call).
         cancellationToken.ThrowIfCancellationRequested();
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         // Wait(0) is a non-blocking try-acquire; cancellation token is irrelevant.
 #pragma warning disable CA2016
@@ -1005,9 +1150,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     private async Task SendFrameAsyncContended(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         await _sendLock.WaitAsync(cancellationToken);
         try
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
             _connection.SendFrame(type, StreamId, flags, payload.Span);
         }
         finally
@@ -1021,14 +1168,16 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// to <see cref="ArrayPool{T}"/> by the writer thread after the ring write.
     /// </summary>
     private Task SendFrameZeroCopyAsync(FrameType type, byte flags,
-        ReadOnlyMemory<byte> payload, byte[] pooledBuffer, CancellationToken cancellationToken = default)
+        ReadOnlyMemory<byte> payload, byte[]? pooledBuffer, CancellationToken cancellationToken = default)
     {
-        // Synchronous fast path: same optimization as SendFrameAsync.
-        // Uses IsCancellationRequested + Task.FromCanceled instead of ThrowIfCancellationRequested
-        // because we must return pooledBuffer to ArrayPool before failing.
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            if (pooledBuffer != null) ArrayPool<byte>.Shared.Return(pooledBuffer);
+            throw new ObjectDisposedException(nameof(ShmGrpcStream));
+        }
         if (cancellationToken.IsCancellationRequested)
         {
-            ArrayPool<byte>.Shared.Return(pooledBuffer);
+            if (pooledBuffer != null) ArrayPool<byte>.Shared.Return(pooledBuffer);
             return Task.FromCanceled(cancellationToken);
         }
 
@@ -1043,7 +1192,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             }
             catch
             {
-                ArrayPool<byte>.Shared.Return(pooledBuffer);
+                if (pooledBuffer != null) ArrayPool<byte>.Shared.Return(pooledBuffer);
                 throw;
             }
             finally
@@ -1058,27 +1207,35 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     private async Task SendFrameZeroCopyAsyncContended(FrameType type, byte flags,
-        ReadOnlyMemory<byte> payload, byte[] pooledBuffer, CancellationToken cancellationToken)
+        ReadOnlyMemory<byte> payload, byte[]? pooledBuffer, CancellationToken cancellationToken)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            if (pooledBuffer != null) ArrayPool<byte>.Shared.Return(pooledBuffer);
+            throw new ObjectDisposedException(nameof(ShmGrpcStream));
+        }
         try
         {
             await _sendLock.WaitAsync(cancellationToken);
         }
         catch
         {
-            ArrayPool<byte>.Shared.Return(pooledBuffer);
+            if (pooledBuffer != null) ArrayPool<byte>.Shared.Return(pooledBuffer);
             throw;
         }
 
         try
         {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                if (pooledBuffer != null) ArrayPool<byte>.Shared.Return(pooledBuffer);
+                throw new ObjectDisposedException(nameof(ShmGrpcStream));
+            }
             _connection.SendFrameZeroCopy(type, StreamId, flags, payload, pooledBuffer);
         }
         catch
         {
-            // If enqueue fails, we must return the buffer ourselves since the
-            // writer thread will never see this entry.
-            ArrayPool<byte>.Shared.Return(pooledBuffer);
+            if (pooledBuffer != null) ArrayPool<byte>.Shared.Return(pooledBuffer);
             throw;
         }
         finally

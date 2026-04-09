@@ -35,43 +35,23 @@ public static class FrameProtocol
     internal const int MaxFramePayloadSize = 128 * 1024 * 1024;
 
     /// <summary>
-    /// Minimum payload size for zero-copy (borrowed) reads. Below this threshold,
-    /// ArrayPool.Rent + memcpy is cheaper than the deferred-commit overhead of the
-    /// borrow path.
-    /// </summary>
-    internal const int ZeroCopyMinPayloadSize = 256 * 1024;
-
-    /// <summary>
-    /// Minimum fraction of ring capacity that must be free (from the writer’s
-    /// perspective) before a zero-copy borrow is allowed.  During a borrow,
-    /// ReadIdx is frozen and deferred commits accumulate, so the writer sees
-    /// space shrinking without any reclamation.  If too little headroom exists
-    /// when the borrow starts, a high-throughput writer can fill the remaining
-    /// space before the app thread releases the borrow, deadlocking the ring.
-    ///
-    /// 50% guarantees at least capacity/2 bytes of headroom.  At 3 GB/s write
-    /// throughput and a typical borrow hold of &lt;10 ms, the writer can produce
-    /// at most ~30 MB — well within 32 MB headroom on a 64 MB ring.
-    /// </summary>
-    private const int BorrowFreeSpacePercent = 50;
-
-    /// <summary>
-    /// Reads a frame and returns a payload wrapper that can either borrow ring memory
-    /// (when contiguous and allowed) or use a pooled buffer fallback.
+    /// Reads a frame from the ring and returns a pooled-buffer payload.
     /// </summary>
     public static (FrameHeader Header, FramePayload Payload) ReadFramePayload(
         ShmRing ring,
-        bool allowBorrowed,
         CancellationToken cancellationToken = default)
     {
         while (true)
         {
-            // Read frame header
+            // Read frame header — reserve but defer CommitRead until payload
+            // is also read, so we issue a single Volatile.Write to shared
+            // ReadIdx per frame instead of two.
             var headerReservation = ring.ReserveRead(ShmConstants.FrameHeaderSize, cancellationToken);
+            var baseCommitReadIdx = headerReservation.CommitReadIdx;
 
             Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
             CopyFromReservation(headerReservation, headerBytes);
-            ring.CommitRead(headerReservation, ShmConstants.FrameHeaderSize);
+            // Note: CommitRead deferred — will be batched with payload below.
 
             var header = FrameHeader.DecodeFrom(headerBytes);
 
@@ -79,6 +59,7 @@ public static class FrameProtocol
             // allocations or block forever trying to read from the ring.
             if (header.Length > MaxFramePayloadSize)
             {
+                ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
                 throw new InvalidDataException(
                     $"Frame payload length {header.Length} exceeds maximum {MaxFramePayloadSize}. " +
                     "This may indicate data corruption in the shared memory ring buffer.");
@@ -86,6 +67,7 @@ public static class FrameProtocol
 
             if (!Enum.IsDefined(header.Type) && header.Type != FrameType.Pad)
             {
+                ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
                 throw new InvalidDataException(
                     $"Unknown frame type 0x{(byte)header.Type:X2} with length {header.Length}. " +
                     "This may indicate data corruption in the shared memory ring buffer.");
@@ -97,44 +79,43 @@ public static class FrameProtocol
                 if (header.Length > 0)
                 {
                     var padReservation = ring.ReserveRead((int)header.Length, cancellationToken);
-                    ring.CommitRead(padReservation, (int)header.Length);
+                    ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize + (int)header.Length);
+                }
+                else
+                {
+                    ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
                 }
                 continue;
             }
 
             if (header.Length == 0)
             {
+                ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
                 return (header, FramePayload.Empty);
             }
 
             var payloadLength = (int)header.Length;
             var payloadReservation = ring.ReserveRead(payloadLength, cancellationToken);
 
-            // Zero-copy (borrowed) path: return a direct view of ring memory.
-            // Only used when:
-            // - Caller allows borrowing (allowBorrowed)
-            // - Payload is contiguous (no ring wrap-around)
-            // - No other borrow is outstanding (single-borrow safety)
-            // - Payload is large enough to justify the overhead
-            // - Writer has >= 50% ring capacity free (deadlock prevention:
-            //   borrow freezes ReadIdx, so the writer cannot reclaim space
-            //   until the app thread releases the borrow)
-            if (allowBorrowed
-                && payloadLength >= ZeroCopyMinPayloadSize
-                && payloadReservation.Second.IsEmpty
-                && !ring.HasOutstandingBorrow
-                && ring.WriterFreeSpace >= ring.Capacity * (ulong)BorrowFreeSpacePercent / 100)
+            // Copy payload from ring to a pooled buffer.
+            // For contiguous payloads, copy directly from the first span.
+            var payload = ArrayPool<byte>.Shared.Rent(payloadLength);
+            if (payloadReservation.Second.IsEmpty)
             {
-                ring.SetBorrowActive();
-                return (header, FramePayload.FromReservation(payloadReservation, payloadLength));
+                payloadReservation.First.Span.Slice(0, payloadLength).CopyTo(payload);
+            }
+            else
+            {
+                CopyFromReservation(payloadReservation, payload.AsSpan(0, payloadLength));
             }
 
-            var payload = ArrayPool<byte>.Shared.Rent(payloadLength);
-            CopyFromReservation(payloadReservation, payload.AsSpan(0, payloadLength));
-            ring.CommitRead(payloadReservation, payloadLength);
+            // Single batched CommitRead for header + payload.
+            // Halves the number of Volatile.Write to shared ReadIdx per frame.
+            ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize + payloadLength);
             return (header, FramePayload.FromPooled(payload, payloadLength));
         }
     }
+
     /// <summary>
     /// Writes a frame (header + payload) to the ring buffer atomically.
     /// Blocks until space is available.
@@ -473,9 +454,9 @@ public static class FrameProtocol
     /// Writes a MESSAGE frame, automatically chunking if the payload exceeds
     /// the ring capacity. Matches grpc-go-shmem's writeFrameBuffersChunked.
     /// </summary>
-    public static void WriteMessage(ShmRing ring, uint streamId, ReadOnlySpan<byte> data, bool isLast, CancellationToken cancellationToken = default)
+    public static void WriteMessage(ShmRing ring, uint streamId, ReadOnlySpan<byte> data, bool isLast, CancellationToken cancellationToken = default, byte extraFlags = 0)
     {
-        var flags = isLast ? (byte)0 : MessageFlags.More;
+        var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
 
         var cap = (int)ring.Capacity;
         var maxFramePayload = Math.Max(1, cap / 2 - ShmConstants.FrameHeaderSize);

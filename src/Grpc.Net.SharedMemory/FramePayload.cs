@@ -21,53 +21,32 @@ using System.Buffers;
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
-/// Frame payload wrapper that either owns a pooled buffer or a ring reservation.
-/// Call <see cref="Release"/> to return buffers or commit the ring read.
+/// Frame payload wrapper that owns a pooled buffer.
+/// Call <see cref="Release"/> to return the buffer to the pool.
 /// </summary>
 public readonly struct FramePayload
 {
-    public static readonly FramePayload Empty = new(ReadOnlyMemory<byte>.Empty, null, default, false);
+    public static readonly FramePayload Empty = new(ReadOnlyMemory<byte>.Empty, null);
 
     private readonly byte[]? _pooledBuffer;
-    private readonly ReadReservation _reservation;
-    private readonly bool _hasReservation;
 
     public ReadOnlyMemory<byte> Memory { get; }
 
     public int Length => Memory.Length;
 
-    private FramePayload(ReadOnlyMemory<byte> memory, byte[]? pooledBuffer, ReadReservation reservation, bool hasReservation)
+    private FramePayload(ReadOnlyMemory<byte> memory, byte[]? pooledBuffer)
     {
         Memory = memory;
         _pooledBuffer = pooledBuffer;
-        _reservation = reservation;
-        _hasReservation = hasReservation;
     }
 
     public static FramePayload FromPooled(byte[] buffer, int length)
     {
-        return new FramePayload(buffer.AsMemory(0, length), buffer, default, false);
-    }
-
-    public static FramePayload FromReservation(ReadReservation reservation, int length)
-    {
-        var memory = reservation.First;
-        if (memory.Length != length)
-        {
-            memory = memory.Slice(0, length);
-        }
-
-        return new FramePayload(memory, null, reservation, true);
+        return new FramePayload(buffer.AsMemory(0, length), buffer);
     }
 
     public void Release()
     {
-        if (_hasReservation)
-        {
-            _reservation.Ring?.ReleaseBorrow(Length);
-            return;
-        }
-
         if (_pooledBuffer != null)
         {
             ArrayPool<byte>.Shared.Return(_pooledBuffer);

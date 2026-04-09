@@ -421,15 +421,34 @@ internal sealed class ShmResponseContent : HttpContent
         var header = new byte[5];
         header[0] = 0;
 
-        // Write gRPC-format messages to the output stream
+        // Write gRPC-format messages to the output stream.
+        // Combine header + payload into a single WriteAsync call when possible
+        // to halve the number of async I/O operations (syscalls).
         await foreach (var message in _stream.ReceiveMessageBuffersAsync(cancellationToken))
         {
-            // gRPC message format: [compressed:1][length:4][data]
-            // Not compressed (SHM-level compression is transparent)
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(1), (uint)message.Length);
 
-            await stream.WriteAsync(header, cancellationToken);
-            await stream.WriteAsync(message, cancellationToken);
+            // Try to coalesce the 5-byte header and payload into one write.
+            if (message.Length <= 65536)
+            {
+                var combined = System.Buffers.ArrayPool<byte>.Shared.Rent(5 + message.Length);
+                try
+                {
+                    header.CopyTo(combined, 0);
+                    message.Span.CopyTo(combined.AsSpan(5));
+                    await stream.WriteAsync(combined.AsMemory(0, 5 + message.Length), cancellationToken);
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<byte>.Shared.Return(combined);
+                }
+            }
+            else
+            {
+                // Large payloads: two writes (avoids extra copy of megabyte-scale data).
+                await stream.WriteAsync(header, cancellationToken);
+                await stream.WriteAsync(message, cancellationToken);
+            }
         }
 
         // Surface gRPC trailers as HTTP trailing headers.

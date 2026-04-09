@@ -202,30 +202,13 @@ public sealed class ShmControlHandler : HttpMessageHandler
     private static async Task<HttpResponseMessage> SendOnStreamAsync(
         ShmGrpcStream stream, HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        // Extract gRPC metadata
         var method = request.RequestUri?.AbsolutePath ?? "/";
         var authority = request.RequestUri?.Authority ?? "localhost";
         var metadata = ExtractMetadata(request.Headers);
         var deadline = ExtractDeadline(request.Headers);
 
-        // Send request headers
         await stream.SendRequestHeadersAsync(method, authority, metadata, deadline).ConfigureAwait(false);
 
-        // Send request body via a write-through stream that forwards each
-        // gRPC frame directly to SHM.
-        //
-        // For unary calls: PushStreamContent writes one message and returns
-        // immediately, so CopyToAsync completes inline (no ThreadPool needed).
-        //
-        // For streaming calls: PushStreamContent awaits CompleteTcs (blocks
-        // until the client closes the request stream). CopyToAsync yields at
-        // the first real await point, returning control to this method so we
-        // can proceed to ReceiveResponseHeadersAsync. The send continues on
-        // a ThreadPool thread via the natural async continuation.
-        //
-        // Calling SendBodyAsync directly (instead of Task.Run) eliminates
-        // ~1-2ms ThreadPool scheduling delay that was the primary bottleneck
-        // at low concurrency.
         if (request.Content != null)
         {
             var writeStream = new ShmGrpcRequestStream(stream);
@@ -236,17 +219,15 @@ public sealed class ShmControlHandler : HttpMessageHandler
             await stream.SendHalfCloseAsync().ConfigureAwait(false);
         }
 
-        // Wait for response headers (server sends these before processing messages).
-        // May throw ShmStreamRefusedException if the server rejected the stream.
         var responseHeaders = await stream.ReceiveResponseHeadersAsync(cancellationToken).ConfigureAwait(false);
 
-        // Create response with streaming content
+        var responseContent = new ShmControlResponseContent(stream);
         var response = new HttpResponseMessage(HttpStatusCode.OK)
         {
-            Content = new ShmControlResponseContent(stream),
+            Content = responseContent,
             Version = new Version(2, 0)
         };
-        ((ShmControlResponseContent)response.Content).SetTrailingHeaders(response.TrailingHeaders);
+        responseContent.SetTrailingHeaders(response.TrailingHeaders);
 
         // Add response headers
         if (responseHeaders.Metadata != null)
@@ -279,22 +260,14 @@ public sealed class ShmControlHandler : HttpMessageHandler
             await content.CopyToAsync(writeStream, cancellationToken).ConfigureAwait(false);
             await stream.SendHalfCloseAsync().ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is OperationCanceledException
-            or ObjectDisposedException
-            or RingClosedException
-            or InvalidOperationException)
-        {
-            // Expected during normal cancellation, disposal, connection close,
-            // or server-side stream reset. No action needed.
-        }
         catch (Exception ex)
         {
-            // Unexpected exception from HttpContent.CopyToAsync (user-supplied
-            // content) or SendHalfCloseAsync. Cancel the stream so that
-            // ReceiveResponseHeadersAsync (which may be waiting concurrently)
-            // fails fast instead of hanging until timeout.
+            // Any failure to send the request body (cancellation, disposal,
+            // connection close, or unexpected errors) must cancel the stream
+            // so that ReceiveResponseHeadersAsync fails fast instead of
+            // hanging until timeout.
             System.Diagnostics.Debug.WriteLine(
-                $"ShmControlHandler: unexpected error sending request body: {ex.GetType().Name}: {ex.Message}");
+                $"ShmControlHandler.SendBodyAsync: {ex.GetType().Name}: {ex.Message}");
             try { await stream.CancelAsync().ConfigureAwait(false); }
             catch { /* best effort */ }
         }
@@ -654,10 +627,6 @@ internal sealed class ShmGrpcRequestStream : Stream
 
     public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        // grpc-dotnet typically writes one complete gRPC frame per WriteAsync call:
-        // [compressed:1][length:4][payload].  However, Stream.WriteAsync does not
-        // guarantee frame-aligned writes, so we buffer partial headers and bodies
-        // defensively to handle arbitrary split points.
         var remaining = buffer;
 
         // Resume partial body from previous write
@@ -802,8 +771,26 @@ internal sealed class ShmControlResponseContent : HttpContent
         await foreach (var message in _stream.ReceiveMessageBuffersAsync(cancellationToken))
         {
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(1), (uint)message.Length);
-            await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
-            await stream.WriteAsync(message, cancellationToken).ConfigureAwait(false);
+
+            if (message.Length <= 65536)
+            {
+                var combined = System.Buffers.ArrayPool<byte>.Shared.Rent(5 + message.Length);
+                try
+                {
+                    header.CopyTo(combined, 0);
+                    message.Span.CopyTo(combined.AsSpan(5));
+                    await stream.WriteAsync(combined.AsMemory(0, 5 + message.Length), cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<byte>.Shared.Return(combined);
+                }
+            }
+            else
+            {
+                await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
+                await stream.WriteAsync(message, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         ApplyTrailers();
@@ -868,6 +855,7 @@ internal sealed class ShmGrpcResponseStream : Stream
     private int _frameOffset;
     private bool _hasMessage;
     private bool _completed;
+    private bool _completedAfterCurrentMessage;
 
     // State for deferred buffer release across calls to ReceiveNextMessageBufferAsync.
     private InboundFrame _previousFrame;
@@ -895,6 +883,16 @@ internal sealed class ShmGrpcResponseStream : Stream
             return ServeCurrentMessage(buffer.Span);
         }
 
+        // The previous message carried EndStream — stream is done after it.
+        if (_completedAfterCurrentMessage)
+        {
+            _previousFrame.ReturnToPool();
+            _previousFrame = default;
+            _completed = true;
+            _content.ApplyTrailers();
+            return 0;
+        }
+
         // Receive the next complete message. Each call accepts the caller's
         // cancellation token directly — no latched enumerator token.
         var (mem, frame, eos) = await _shmStream.ReceiveNextMessageBufferAsync(
@@ -902,10 +900,23 @@ internal sealed class ShmGrpcResponseStream : Stream
 
         if (eos)
         {
-            _previousFrame = default;
-            _completed = true;
-            _content.ApplyTrailers();
-            return 0;
+            if (mem.Length == 0)
+            {
+                _previousFrame = default;
+                _completed = true;
+                _content.ApplyTrailers();
+                return 0;
+            }
+
+            // EndStream with a final message (e.g. SendMessageAndHalfCloseAsync):
+            // consume the message first, mark completed after it's fully served.
+            _previousFrame = frame;
+            _message = mem;
+            _messageLength = mem.Length;
+            _frameOffset = 0;
+            _hasMessage = true;
+            _completedAfterCurrentMessage = true;
+            return ServeCurrentMessage(buffer.Span);
         }
 
         _previousFrame = frame;
