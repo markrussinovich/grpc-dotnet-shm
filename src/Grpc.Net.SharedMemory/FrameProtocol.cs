@@ -34,12 +34,38 @@ public static class FrameProtocol
     /// </summary>
     internal const int MaxFramePayloadSize = 128 * 1024 * 1024;
 
+#if SHM_TRACE
+    // Profiling counters — compile with /d:SHM_TRACE to enable.
+    public static long _rpCount, _rpReserve, _rpCopy, _rpTotal;
+
+    public static void DumpDirectReaderBreakdown()
+    {
+        var freq = (double)System.Diagnostics.Stopwatch.Frequency;
+        long syncHit = ShmControlResponseContent._drSyncHit;
+        long slowPath = ShmControlResponseContent._drSlowPath;
+        long slowTicks = ShmControlResponseContent._drSlowTicks;
+        long total = syncHit + slowPath;
+        if (total <= 0) return;
+        Console.WriteLine();
+        Console.WriteLine($"DirectReader path breakdown ({total} total calls):");
+        Console.WriteLine($"  SyncHit (TryReceive): {syncHit} ({100.0 * syncHit / total:F1}%)");
+        Console.WriteLine($"  SlowPath (await):     {slowPath} ({100.0 * slowPath / total:F1}%)");
+        if (slowPath > 0)
+        {
+            Console.WriteLine($"  SlowPath avg:         {slowTicks / freq * 1e6 / slowPath:F1} us/call");
+            Console.WriteLine($"    WaitForFrame:       {ShmControlResponseContent._drWaitTicks / freq * 1e6 / slowPath:F1} us/call");
+            Console.WriteLine($"    ProcessFrame:       {ShmControlResponseContent._drProcessTicks / freq * 1e6 / slowPath:F1} us/call");
+        }
+    }
+#endif
+
     /// <summary>
     /// Reads a frame from the ring and returns a pooled-buffer payload.
     /// </summary>
     public static (FrameHeader Header, FramePayload Payload) ReadFramePayload(
         ShmRing ring,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool zeroCopy = false)
     {
         while (true)
         {
@@ -95,10 +121,53 @@ public static class FrameProtocol
             }
 
             var payloadLength = (int)header.Length;
+#if SHM_TRACE
+            var _pt0 = System.Diagnostics.Stopwatch.GetTimestamp();
+#endif
             var payloadReservation = ring.ReserveRead(payloadLength, cancellationToken);
+#if SHM_TRACE
+            var _pt1 = System.Diagnostics.Stopwatch.GetTimestamp();
+#endif
 
-            // Copy payload from ring to a pooled buffer.
-            // For contiguous payloads, copy directly from the first span.
+            // Speculative early CommitRead with in-flight limit:
+            // CommitRead immediately AND return ring memory reference.
+            // Limited to MaxSpeculativeInFlight frames in the channel queue
+            // to prevent writer from wrapping to overwrite unconsumed frames.
+            //
+            // Additional safety: only speculative if there are no deferred
+            // (uncommitted) frames between baseCommitReadIdx and this frame.
+            // Detected by: baseCommitReadIdx + totalBytes == _pendingReadIdx.
+            // If not equal, deferred frames exist in the gap — committing
+            // this frame's bytes would skip them, exposing still-live ring
+            // memory to writer overwrite.
+            var totalBytes = ShmConstants.FrameHeaderSize + payloadLength;
+            if (zeroCopy
+                && header.Type == FrameType.Message
+                && payloadReservation.Second.IsEmpty
+                && Volatile.Read(ref ring.SpeculativeInFlight) < ring.MaxSpeculativeInFlight
+                && baseCommitReadIdx + (ulong)totalBytes == ring.PeekPendingReadIdx())
+            {
+                Interlocked.Increment(ref ring.SpeculativeInFlight);
+                ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+                return (header, FramePayload.FromRingMemoryPreCommitted(
+                    payloadReservation.First.Slice(0, payloadLength), ring));
+            }
+
+            // Deferred CommitRead: when in-flight limit reached or non-Message.
+            // Returns ring memory (zero-copy) but does NOT advance ReadIdx.
+            // This prevents writer from wrapping to overwrite speculative frames
+            // that the handler hasn't consumed yet. ReadIdx advances only when
+            // handler calls Release() after consuming the frame.
+            if (zeroCopy && payloadReservation.Second.IsEmpty)
+            {
+                return (header, FramePayload.FromRingMemory(
+                    payloadReservation.First.Slice(0, payloadLength),
+                    ring, baseCommitReadIdx, totalBytes));
+            }
+
+            // Copy to pooled buffer + immediate CommitRead.
+            // Used for: wrap-around reads or when zeroCopy is disabled.
+
             var payload = ArrayPool<byte>.Shared.Rent(payloadLength);
             if (payloadReservation.Second.IsEmpty)
             {
@@ -109,9 +178,19 @@ public static class FrameProtocol
                 CopyFromReservation(payloadReservation, payload.AsSpan(0, payloadLength));
             }
 
-            // Single batched CommitRead for header + payload.
-            // Halves the number of Volatile.Write to shared ReadIdx per frame.
             ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize + payloadLength);
+
+#if SHM_TRACE
+            var _pt2 = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (payloadLength >= 65536)
+            {
+                Interlocked.Increment(ref _rpCount);
+                Interlocked.Add(ref _rpReserve, _pt1 - _pt0);
+                Interlocked.Add(ref _rpCopy, _pt2 - _pt1);
+                Interlocked.Add(ref _rpTotal, _pt2 - _pt0);
+            }
+#endif
+
             return (header, FramePayload.FromPooled(payload, payloadLength));
         }
     }
@@ -459,7 +538,13 @@ public static class FrameProtocol
         var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
 
         var cap = (int)ring.Capacity;
-        var maxFramePayload = Math.Max(1, cap / 2 - ShmConstants.FrameHeaderSize);
+        // Use ringCapacity/4 as max frame payload. This ensures:
+        // 1. Ring can hold 4 frames simultaneously → writer rarely stalls
+        // 2. Single-frame messages (≤16MB) get speculative early CommitRead
+        //    → zero-copy + pipeline (More=0 safety condition)
+        // 3. Multi-frame messages: more frames but better pipeline overlap
+        //    (each frame is copy+CommitRead, final frame is zero-copy)
+        var maxFramePayload = Math.Max(1, cap / 4 - ShmConstants.FrameHeaderSize);
         // Ensure frame + header fits in the ring
         if (maxFramePayload + ShmConstants.FrameHeaderSize > cap)
         {

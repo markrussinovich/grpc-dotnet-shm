@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.Versioning;
 using System.Threading.Channels;
@@ -48,17 +49,39 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     // in creating streams, exceeding the server's maxConcurrentStreams limit.
     private int _clientStreamCount;
 
-    // Accumulated connection-level window update bytes. Sent when threshold
-    // is reached to reduce frame overhead. Uses Min(1MB, InitialWindowSize/4)
-    // to maintain the 25% window replenishment ratio from the original design.
-    private long _connWindowDebt;
-    private static readonly long ConnWindowUpdateThreshold =
-        Math.Min(1_048_576, ShmConstants.InitialWindowSize / 4);
+    // Connection-level flow control is disabled (_sendWindow = unlimited).
+    // Ring WaitForSpace is the only back-pressure needed.
+    // Fields retained (commented out) for potential future restoration.
+    // private long _connWindowDebt;
+    // private static readonly long ConnWindowUpdateThreshold =
+    //     Math.Min(1_048_576, ShmConstants.InitialWindowSize / 4);
 
     // Write lock: the SPSC ring buffer requires single-producer semantics.
     // All writes to TxRing are serialised through the ShmFrameWriter's
     // dedicated consumer thread (Channel SingleReader=true).
     private ShmFrameWriter? _frameWriter;
+
+    /// <summary>Gets the frame writer (for singleStreamMode direct write).</summary>
+    internal ShmFrameWriter? FrameWriter => _frameWriter;
+
+    /// <summary>
+    /// When true, ReadFramePayload returns ring memory directly (zero-copy)
+    /// instead of copying to a pooled buffer. CommitRead is deferred until
+    /// the consumer calls FramePayload.Release().
+    /// </summary>
+    internal bool ZeroCopyRead { get; set; }
+
+    /// <summary>
+    /// When true, this connection was negotiated for single-stream mode.
+    /// Server handlers use ExecuteInline for atomic ring writes.
+    /// </summary>
+    internal bool SingleStreamMode { get; set; }
+
+    /// <summary>
+    /// Per-connection reusable write buffer for singleStreamMode unary responses.
+    /// Eliminates per-call ArrayPool.Rent for same-sized messages.
+    /// </summary>
+    internal byte[]? CachedWriteBuffer;
 
     // Keepalive (A73 RFC)
     private readonly ShmKeepaliveOptions _keepaliveOptions;
@@ -415,14 +438,12 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _frameWriter!.EnqueueZeroCopyAndWait(type, streamId, flags, payload, cancellationToken);
     }
 
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822")]
     internal void SendStreamWindowUpdate(uint streamId, uint increment)
     {
-        if (increment > 0)
-        {
-            Span<byte> payload = stackalloc byte[4];
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, increment);
-            SendFrame(FrameType.WindowUpdate, streamId, 0, payload);
-        }
+        // No-op: _sendWindow is unlimited (long.MaxValue/2). The ring's
+        // WaitForSpace provides back-pressure. Sending WindowUpdate frames
+        // would only waste ~500ns per frame in control queue overhead.
     }
 
     private Task FrameReaderLoopAsync()
@@ -445,7 +466,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 while (!_disposeCts.Token.IsCancellationRequested)
                 {
                     var (header, payload) = FrameProtocol.ReadFramePayload(
-                        RxRing, _disposeCts.Token);
+                        RxRing, _disposeCts.Token, zeroCopy: ZeroCopyRead);
                     ProcessFrame(header, payload);
                 }
 
@@ -503,22 +524,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                     payload.Release();
                 }
 
-                // Batch connection-level window update: accumulate bytes and
-                // send when threshold is reached. Uses the smaller of 1 MB and
-                // InitialWindowSize/4 as threshold, matching the original 25%
-                // window replenishment ratio while bounding the absolute delay.
-                if (header.Type == FrameType.Message && payloadLength > 0)
-                {
-                    var debt = Interlocked.Add(ref _connWindowDebt, payloadLength);
-                    if (debt >= ConnWindowUpdateThreshold)
-                    {
-                        var toSend = Interlocked.Exchange(ref _connWindowDebt, 0);
-                        if (toSend > 0)
-                        {
-                            SendConnectionWindowUpdate((uint)Math.Min(toSend, uint.MaxValue));
-                        }
-                    }
-                }
+                // Connection-level window update: no-op since _sendWindow is
+                // unlimited. Ring WaitForSpace is the only back-pressure needed.
+                // Keeping the debt accumulation commented out to avoid the
+                // Interlocked.Add overhead on the hot path.
+                // if (header.Type == FrameType.Message && payloadLength > 0) { ... }
                 break;
 
             case FrameType.Ping:
@@ -744,17 +754,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Sends a connection-level window update to the remote side.
-    /// This keeps the remote's connection send quota replenished for interop
-    /// with implementations that enforce connection-level flow control.
-    /// </summary>
-    private void SendConnectionWindowUpdate(uint increment)
-    {
-        Span<byte> payload = stackalloc byte[4];
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, increment);
-        SendFrame(FrameType.WindowUpdate, 0, 0, payload);
-    }
-
     #endregion
 
     #region Keepalive
@@ -888,6 +887,13 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         _frameWriter?.Dispose();
 
+        // Return cached write buffer to pool.
+        if (CachedWriteBuffer != null)
+        {
+            ArrayPool<byte>.Shared.Return(CachedWriteBuffer);
+            CachedWriteBuffer = null;
+        }
+
         if (_goAwaySent == 0)
         {
             Interlocked.Exchange(ref _goAwaySent, 1);
@@ -930,6 +936,12 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
 
         _frameWriter?.Dispose();
+
+        if (CachedWriteBuffer != null)
+        {
+            ArrayPool<byte>.Shared.Return(CachedWriteBuffer);
+            CachedWriteBuffer = null;
+        }
 
         if (_goAwaySent == 0)
         {

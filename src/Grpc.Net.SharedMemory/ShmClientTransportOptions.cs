@@ -129,4 +129,18 @@ public sealed class ShmClientTransportOptions
         }
     }
     private TimeSpan _connectTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Gets or sets whether to enable single-stream optimizations on the client.
+    /// When <c>true</c>, enables zero-copy reads from the ring buffer, eliminating
+    /// one memcpy per received message. Only safe when each connection handles at
+    /// most one concurrent stream (e.g., serial unary calls or a single streaming call).
+    /// <para>
+    /// In multi-stream scenarios (concurrent RPCs on the same connection), deferred
+    /// ring CommitRead can accumulate in the Channel queue faster than handlers
+    /// consume them, causing the remote writer to block on WaitForSpace.
+    /// </para>
+    /// Default is <c>false</c>.
+    /// </summary>
+    public bool SingleStreamMode { get; set; }
 }

@@ -57,7 +57,7 @@ public class BenchmarkServiceImpl : BenchmarkService.BenchmarkServiceBase
             Payload = new Payload
             {
                 Type = request.ResponseType,
-                Body = ByteString.CopyFrom(payload)
+                Body = UnsafeByteOperations.UnsafeWrap(payload)
             }
         });
     }
@@ -77,7 +77,7 @@ public class BenchmarkServiceImpl : BenchmarkService.BenchmarkServiceBase
                 Payload = new Payload
                 {
                     Type = request.ResponseType,
-                    Body = ByteString.CopyFrom(payload)
+                    Body = UnsafeByteOperations.UnsafeWrap(payload)
                 }
             }).ConfigureAwait(false);
         }
@@ -247,7 +247,7 @@ public class Program
             Payload = new Payload
             {
                 Type = request.ResponseType,
-                Body = ByteString.CopyFrom(payload)
+                Body = UnsafeByteOperations.UnsafeWrap(payload)
             }
         };
 
@@ -278,7 +278,7 @@ public class Program
                 Payload = new Payload
                 {
                     Type = request.ResponseType,
-                    Body = ByteString.CopyFrom(payload)
+                    Body = UnsafeByteOperations.UnsafeWrap(payload)
                 }
             };
 

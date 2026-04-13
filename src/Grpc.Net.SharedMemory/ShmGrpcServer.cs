@@ -1,4 +1,4 @@
-#region Copyright notice and license
+﻿#region Copyright notice and license
 
 // Copyright 2025 The gRPC Authors
 //
@@ -43,6 +43,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     private readonly string _segmentName;
     private readonly ulong _ringCapacity;
     private readonly uint _maxStreams;
+    private readonly bool _singleStreamMode;
     private readonly Dictionary<string, IMethodHandler> _methods = new(StringComparer.Ordinal);
     private ShmControlListener? _listener;
     private readonly CancellationTokenSource _shutdownCts = new();
@@ -54,11 +55,15 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     /// <param name="segmentName">The shared memory segment name clients will connect to.</param>
     /// <param name="ringCapacity">Ring buffer capacity per connection (default: 64MB).</param>
     /// <param name="maxStreams">Maximum concurrent streams per connection (default: 100).</param>
-    public ShmGrpcServer(string segmentName, ulong ringCapacity = 64 * 1024 * 1024, uint maxStreams = 100)
+    /// <param name="singleStreamMode">When true, enables single-stream optimizations:
+    /// the server writes large response frames directly to the ring when the
+    /// WriterLoop is idle, saving ~80µs wakeup latency per message.</param>
+    public ShmGrpcServer(string segmentName, ulong ringCapacity = 64 * 1024 * 1024, uint maxStreams = 100, bool singleStreamMode = false)
     {
         _segmentName = segmentName ?? throw new ArgumentNullException(nameof(segmentName));
         _ringCapacity = ringCapacity;
         _maxStreams = maxStreams;
+        _singleStreamMode = singleStreamMode;
     }
 
     /// <summary>
@@ -152,6 +157,17 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
     private async Task HandleConnectionAsync(ShmConnection connection, CancellationToken ct)
     {
+        // Per-connection singleStreamMode negotiation:
+        // Enable if BOTH server allows it AND client requested it.
+        // Store the negotiated result back on the connection so handlers
+        // can read it via stream.Connection.SingleStreamMode.
+        var negotiated = _singleStreamMode && connection.SingleStreamMode;
+        connection.SingleStreamMode = negotiated;
+        if (negotiated)
+        {
+            connection.ZeroCopyRead = true;
+        }
+
         try
         {
             await foreach (var stream in connection.AcceptStreamsAsync(ct))
@@ -306,27 +322,129 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         private readonly Func<TReq, ServerCallContext, Task<TResp>> _handler;
         private readonly MessageParser<TReq> _parser = new(() => new TReq());
 
-        public UnaryHandler(Func<TReq, ServerCallContext, Task<TResp>> handler) => _handler = handler;
+        public UnaryHandler(Func<TReq, ServerCallContext, Task<TResp>> handler)
+        {
+            _handler = handler;
+        }
 
         public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct)
         {
-            // Read single request message
             var request = await ReadSingleMessageAsync(stream, _parser, ct);
-
-            // Send response headers
-            await context.EnsureResponseHeadersSentAsync();
-
-            // Call handler
             var response = await _handler(request, context);
 
-            // Send response using zero-copy pooled buffer
-            await SendProtobufMessageAsync(stream, response, ct);
+            // In singleStreamMode with one active stream, write response
+            // inline to avoid queue overhead. Three tiers:
+            // 1. TryPause + TryWriteInlineDirect: serialize directly into
+            //    ring (zero intermediate buffer, single-frame only)
+            // 2. TryPause + WriteInline: serialize to CachedWriteBuffer,
+            //    then memcpy to ring (multi-frame or wrap-around fallback)
+            // 3. ExecuteInline: submit write to WriterLoop thread when
+            //    TryPause fails (WriterLoop in Phase 2 spin)
+            if (stream.Connection.SingleStreamMode && stream.Connection.ActiveStreamCount <= 1)
+            {
+                var size = ((IMessage)response).CalculateSize();
+                var writer = stream.Connection.FrameWriter!;
+                var ringCap = (long)stream.Connection.TxRing.Capacity;
+                var msg = (IMessage)response;
 
-            // Send trailers
-            await stream.SendTrailersAsync(
-                context.Status.StatusCode,
-                context.Status.Detail,
-                context.ResponseTrailers);
+                // Fast path: TryPause + TryWriteInlineDirect — serialize
+                // protobuf directly into ring, zero intermediate buffer.
+                var maxFramePayload = Math.Max(1, (int)stream.Connection.TxRing.Capacity / 4 - ShmConstants.FrameHeaderSize);
+                if (size > 0 && size <= maxFramePayload && writer.TryPauseWriterLoop())
+                {
+                    try
+                    {
+                        if (!context.HeadersSent)
+                        {
+                            stream.SendResponseHeadersInline(writer);
+                            context.MarkHeadersSent();
+                        }
+                        if (writer.TryWriteInlineDirect(stream.StreamId, size, msg, 0, default))
+                        {
+                            stream.SendTrailersInline(writer, context.Status.StatusCode,
+                                context.Status.Detail, context.ResponseTrailers);
+                            return;
+                        }
+                        // TryWriteInlineDirect failed (wrap-around) — fall through.
+                    }
+                    finally
+                    {
+                        writer.ResumeWriterLoop();
+                    }
+                }
+
+                // Serialize to buffer (shared between TryPause and ExecuteInline).
+                byte[]? serializedBuffer = null;
+                int serializedSize = size;
+                if (size > 0)
+                {
+                    var cached = stream.Connection.CachedWriteBuffer;
+                    if (cached != null && cached.Length >= size)
+                    {
+                        serializedBuffer = cached;
+                    }
+                    else
+                    {
+                        if (cached != null) ArrayPool<byte>.Shared.Return(cached);
+                        serializedBuffer = ArrayPool<byte>.Shared.Rent(size);
+                        stream.Connection.CachedWriteBuffer = serializedBuffer;
+                    }
+                    using (var cos = new CodedOutputStream(serializedBuffer))
+                        msg.WriteTo(cos);
+                }
+
+                if (size <= ringCap && writer.TryPauseWriterLoop())
+                {
+                    // Small-medium: direct ring write on handler thread.
+                    try
+                    {
+                        if (!context.HeadersSent)
+                        {
+                            stream.SendResponseHeadersInline(writer);
+                            context.MarkHeadersSent();
+                        }
+
+                        if (serializedBuffer != null)
+                            writer.WriteInline(stream.StreamId,
+                                serializedBuffer.AsSpan(0, serializedSize), 0, default);
+                        else
+                            writer.WriteInline(stream.StreamId,
+                                ReadOnlySpan<byte>.Empty, 0, default);
+
+                        stream.SendTrailersInline(writer, context.Status.StatusCode,
+                            context.Status.Detail, context.ResponseTrailers);
+                    }
+                    finally
+                    {
+                        writer.ResumeWriterLoop();
+                    }
+                    return;
+                }
+
+                // TryPause failed or TryWriteInlineDirect unavailable: ExecuteInline.
+                writer.ExecuteInline(() =>
+                {
+                    if (!context.HeadersSent)
+                    {
+                        stream.SendResponseHeadersInline(writer);
+                        context.MarkHeadersSent();
+                    }
+                    if (serializedBuffer != null)
+                        writer.WriteInline(stream.StreamId,
+                            serializedBuffer.AsSpan(0, serializedSize), 0, default);
+                    else
+                        writer.WriteInline(stream.StreamId,
+                            ReadOnlySpan<byte>.Empty, 0, default);
+                    stream.SendTrailersInline(writer, context.Status.StatusCode,
+                        context.Status.Detail, context.ResponseTrailers);
+                });
+                return;
+            }
+
+            // Fallback path: ensure headers sent, then use WriterLoop queue.
+            await context.EnsureResponseHeadersSentAsync();
+            await SendProtobufMessageAsync(stream, response, ct);
+            await stream.SendTrailersAsync(context.Status.StatusCode, context.Status.Detail, context.ResponseTrailers);
         }
     }
 
@@ -337,19 +455,45 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         private readonly Func<TReq, IServerStreamWriter<TResp>, ServerCallContext, Task> _handler;
         private readonly MessageParser<TReq> _parser = new(() => new TReq());
 
-        public ServerStreamingHandler(Func<TReq, IServerStreamWriter<TResp>, ServerCallContext, Task> handler) => _handler = handler;
+        public ServerStreamingHandler(Func<TReq, IServerStreamWriter<TResp>, ServerCallContext, Task> handler)
+            => _handler = handler;
 
         public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct)
         {
-            // Read single request message
             var request = await ReadSingleMessageAsync(stream, _parser, ct);
+            var singleStream = stream.Connection.SingleStreamMode;
 
-            // Send response headers
-            await context.EnsureResponseHeadersSentAsync();
+            if (!singleStream || stream.Connection.ActiveStreamCount > 1)
+                await context.EnsureResponseHeadersSentAsync();
 
-            // Create writer and call handler
-            var writer = new ShmServerStreamWriter<TResp>(stream, context);
-            await _handler(request, writer, context);
+            var writer = new ShmServerStreamWriter<TResp>(stream, context, singleStream);
+            try
+            {
+                await _handler(request, writer, context);
+            }
+            finally
+            {
+                writer.ReturnWriteBuffer();
+            }
+
+            // In singleStreamMode, inline trailers to avoid queue overhead.
+            if (singleStream && stream.Connection.ActiveStreamCount <= 1)
+            {
+                var fw = stream.Connection.FrameWriter!;
+                if (fw.TryPauseWriterLoop())
+                {
+                    try
+                    {
+                        stream.SendTrailersInline(fw, context.Status.StatusCode,
+                            context.Status.Detail, context.ResponseTrailers);
+                    }
+                    finally
+                    {
+                        fw.ResumeWriterLoop();
+                    }
+                    return;
+                }
+            }
 
             // Send trailers
             await stream.SendTrailersAsync(
@@ -365,21 +509,109 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     {
         private readonly Func<IAsyncStreamReader<TReq>, ServerCallContext, Task<TResp>> _handler;
 
-        public ClientStreamingHandler(Func<IAsyncStreamReader<TReq>, ServerCallContext, Task<TResp>> handler) => _handler = handler;
+        public ClientStreamingHandler(Func<IAsyncStreamReader<TReq>, ServerCallContext, Task<TResp>> handler)
+            => _handler = handler;
 
         public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct)
         {
-            // Send response headers
-            await context.EnsureResponseHeadersSentAsync();
+            var singleStream = stream.Connection.SingleStreamMode;
+            if (!singleStream || stream.Connection.ActiveStreamCount > 1)
+                await context.EnsureResponseHeadersSentAsync();
 
-            // Create reader and call handler
             using var reader = new ShmAsyncStreamReader<TReq>(stream);
             var response = await _handler(reader, context);
 
-            // Send response using pooled buffer (avoids LOH allocation)
-            await SendProtobufMessageAsync(stream, response, ct);
+            if (singleStream && stream.Connection.ActiveStreamCount <= 1)
+            {
+                var size = ((IMessage)response).CalculateSize();
+                var writer = stream.Connection.FrameWriter!;
+                var msg = (IMessage)response;
 
-            // Send trailers
+                // Fast path: TryPause + TryWriteInlineDirect.
+                var maxFramePayload = Math.Max(1, (int)stream.Connection.TxRing.Capacity / 4 - ShmConstants.FrameHeaderSize);
+                if (size > 0 && size <= maxFramePayload && writer.TryPauseWriterLoop())
+                {
+                    try
+                    {
+                        if (!context.HeadersSent)
+                        {
+                            stream.SendResponseHeadersInline(writer);
+                            context.MarkHeadersSent();
+                        }
+                        if (writer.TryWriteInlineDirect(stream.StreamId, size, msg, 0, default))
+                        {
+                            stream.SendTrailersInline(writer, context.Status.StatusCode,
+                                context.Status.Detail, context.ResponseTrailers);
+                            return;
+                        }
+                    }
+                    finally
+                    {
+                        writer.ResumeWriterLoop();
+                    }
+                }
+
+                // Serialize to buffer.
+                byte[]? serializedBuffer = null;
+                if (size > 0)
+                {
+                    var cached = stream.Connection.CachedWriteBuffer;
+                    if (cached != null && cached.Length >= size)
+                        serializedBuffer = cached;
+                    else
+                    {
+                        if (cached != null) ArrayPool<byte>.Shared.Return(cached);
+                        serializedBuffer = ArrayPool<byte>.Shared.Rent(size);
+                        stream.Connection.CachedWriteBuffer = serializedBuffer;
+                    }
+                    using (var cos = new CodedOutputStream(serializedBuffer))
+                        msg.WriteTo(cos);
+                }
+
+                var ringCap = (long)stream.Connection.TxRing.Capacity;
+                if (size <= ringCap && writer.TryPauseWriterLoop())
+                {
+                    try
+                    {
+                        if (!context.HeadersSent)
+                        {
+                            stream.SendResponseHeadersInline(writer);
+                            context.MarkHeadersSent();
+                        }
+                        if (serializedBuffer != null)
+                            writer.WriteInline(stream.StreamId, serializedBuffer.AsSpan(0, size), 0, default);
+                        else
+                            writer.WriteInline(stream.StreamId, ReadOnlySpan<byte>.Empty, 0, default);
+                        stream.SendTrailersInline(writer, context.Status.StatusCode,
+                            context.Status.Detail, context.ResponseTrailers);
+                    }
+                    finally
+                    {
+                        writer.ResumeWriterLoop();
+                    }
+                    return;
+                }
+
+                // Large or TryPause failed: ExecuteInline.
+                var serializedSize = size;
+                writer.ExecuteInline(() =>
+                {
+                    if (!context.HeadersSent)
+                    {
+                        stream.SendResponseHeadersInline(writer);
+                        context.MarkHeadersSent();
+                    }
+                    if (serializedBuffer != null)
+                        writer.WriteInline(stream.StreamId, serializedBuffer.AsSpan(0, serializedSize), 0, default);
+                    else
+                        writer.WriteInline(stream.StreamId, ReadOnlySpan<byte>.Empty, 0, default);
+                    stream.SendTrailersInline(writer, context.Status.StatusCode,
+                        context.Status.Detail, context.ResponseTrailers);
+                });
+                return;
+            }
+
+            await SendProtobufMessageAsync(stream, response, ct);
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,
@@ -393,19 +625,47 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     {
         private readonly Func<IAsyncStreamReader<TReq>, IServerStreamWriter<TResp>, ServerCallContext, Task> _handler;
 
-        public DuplexStreamingHandler(Func<IAsyncStreamReader<TReq>, IServerStreamWriter<TResp>, ServerCallContext, Task> handler) => _handler = handler;
+        public DuplexStreamingHandler(Func<IAsyncStreamReader<TReq>, IServerStreamWriter<TResp>, ServerCallContext, Task> handler)
+            => _handler = handler;
 
         public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct)
         {
-            // Send response headers
-            await context.EnsureResponseHeadersSentAsync();
+            var singleStream = stream.Connection.SingleStreamMode;
+            // Headers: if truly single stream (1 active), WriteAsync sends
+            // headers inline. Otherwise send eagerly via queue.
+            if (!singleStream || stream.Connection.ActiveStreamCount > 1)
+                await context.EnsureResponseHeadersSentAsync();
 
-            // Create reader, writer, and call handler
             using var reader = new ShmAsyncStreamReader<TReq>(stream);
-            var writer = new ShmServerStreamWriter<TResp>(stream, context);
-            await _handler(reader, writer, context);
+            var writer = new ShmServerStreamWriter<TResp>(stream, context, singleStream);
+            try
+            {
+                await _handler(reader, writer, context);
+            }
+            finally
+            {
+                writer.ReturnWriteBuffer();
+            }
 
-            // Send trailers
+            // In singleStreamMode, inline trailers to avoid queue overhead.
+            if (singleStream && stream.Connection.ActiveStreamCount <= 1)
+            {
+                var fw = stream.Connection.FrameWriter!;
+                if (fw.TryPauseWriterLoop())
+                {
+                    try
+                    {
+                        stream.SendTrailersInline(fw, context.Status.StatusCode,
+                            context.Status.Detail, context.ResponseTrailers);
+                    }
+                    finally
+                    {
+                        fw.ResumeWriterLoop();
+                    }
+                    return;
+                }
+            }
+
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,
@@ -421,15 +681,99 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         ShmGrpcStream stream, MessageParser<TReq> parser, CancellationToken ct)
         where TReq : class, IMessage<TReq>, new()
     {
-        // Use ReceiveMessageBuffersAsync to avoid the extra byte[] allocation
-        // that ReceiveMessagesAsync performs via ToArray().  The buffer is
-        // valid until the next MoveNextAsync — parsing completes before that.
-        await foreach (var msg in stream.ReceiveMessageBuffersAsync(ct))
-        {
-            return parser.ParseFrom(new ReadOnlySequence<byte>(msg));
-        }
+        // Accumulator for multi-frame messages: single pre-allocated buffer
+        // that each frame copies into at the correct offset. Eliminates
+        // per-chunk ArrayPool.Rent and ReadOnlySequence chain overhead.
+        byte[]? assembled = null;
+        int assembledPos = 0;
 
-        throw new RpcException(new Status(StatusCode.Internal, "No request message received"));
+        try
+        {
+            while (true)
+            {
+                var frame = await stream.ReceiveFrameAsync(ct).ConfigureAwait(false);
+                if (frame == null)
+                    throw new RpcException(new Status(StatusCode.Internal, "No request message received"));
+
+                var f = frame.Value;
+                if (f.Type == FrameType.Message)
+                {
+                    if ((f.Flags & MessageFlags.More) != 0)
+                    {
+                        // Multi-frame: copy directly into assembled buffer.
+                        if (assembled == null)
+                        {
+                            // First frame — estimate total size.
+                            // Start with 4× first frame as initial guess.
+                            // Will grow if needed (rare for well-sized rings).
+                            var initialSize = f.Length * 4;
+                            assembled = ArrayPool<byte>.Shared.Rent(initialSize);
+                        }
+                        else if (assembledPos + f.Length > assembled.Length)
+                        {
+                            // Grow buffer (double).
+                            var newBuf = ArrayPool<byte>.Shared.Rent(assembled.Length * 2);
+                            assembled.AsSpan(0, assembledPos).CopyTo(newBuf);
+                            ArrayPool<byte>.Shared.Return(assembled);
+                            assembled = newBuf;
+                        }
+
+                        f.Memory.Span.CopyTo(assembled.AsSpan(assembledPos));
+                        assembledPos += f.Length;
+                        f.ReturnToPool();
+                        continue;
+                    }
+
+                    // Final frame or single-frame message.
+                    ReadOnlySequence<byte> sequence;
+
+                    if (assembled != null)
+                    {
+                        // Multi-frame final: copy last frame into assembled.
+                        if (assembledPos + f.Length > assembled.Length)
+                        {
+                            var newBuf = ArrayPool<byte>.Shared.Rent(assembledPos + f.Length);
+                            assembled.AsSpan(0, assembledPos).CopyTo(newBuf);
+                            ArrayPool<byte>.Shared.Return(assembled);
+                            assembled = newBuf;
+                        }
+                        f.Memory.Span.CopyTo(assembled.AsSpan(assembledPos));
+                        assembledPos += f.Length;
+                        f.ReturnToPool();
+
+                        sequence = new ReadOnlySequence<byte>(assembled.AsMemory(0, assembledPos));
+                    }
+                    else
+                    {
+                        // Single frame — ParseFrom directly from frame memory.
+                        // For pre-committed ZeroCopy frames this is truly zero-copy.
+                        sequence = new ReadOnlySequence<byte>(f.Memory);
+                    }
+
+                    var result = parser.ParseFrom(sequence);
+
+                    // Release single-frame ref (no-op for pre-committed).
+                    if (assembled == null)
+                        f.ReturnToPool();
+
+                    return result;
+                }
+                else if (f.Type == FrameType.HalfClose || f.Type == FrameType.Cancel || f.Type == FrameType.Trailers)
+                {
+                    f.ReturnToPool();
+                    throw new RpcException(new Status(StatusCode.Internal, "No request message received"));
+                }
+                else
+                {
+                    f.ReturnToPool();
+                }
+            }
+        }
+        finally
+        {
+            if (assembled != null)
+                ArrayPool<byte>.Shared.Return(assembled);
+        }
     }
 
     /// <summary>
@@ -446,8 +790,14 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         private InboundFrame _previousFrame;
         private T? _current;
         private bool _endOfStream;
+        // Multi-frame accumulation: single pre-allocated buffer.
+        private byte[]? _assembled;
+        private int _assembledPos;
 
-        public ShmAsyncStreamReader(ShmGrpcStream stream) => _stream = stream;
+        public ShmAsyncStreamReader(ShmGrpcStream stream)
+        {
+            _stream = stream;
+        }
 
         public T Current => _current ?? throw new InvalidOperationException("No current message");
 
@@ -461,42 +811,146 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 return false;
             }
 
-            // Use ReceiveNextMessageBufferAsync with the caller's per-call
-            // cancellation token. Unlike the enumerator-based approach, this
-            // ensures every MoveNext call respects the current token — not
-            // the one from the first call.
-            var (mem, frame, eos) = await _stream.ReceiveNextMessageBufferAsync(
-                _previousFrame, cancellationToken).ConfigureAwait(false);
+            // Release previous frame
+            _previousFrame.ReturnToPool();
+            _previousFrame = default;
 
-            if (eos)
+            // Fast path: try sync read from channel
+            InboundFrame frame;
+            while (_stream.TryReceiveFrame(out frame))
             {
-                if (mem.Length == 0)
-                {
-                    _previousFrame = default;
-                    _current = default;
-                    return false;
-                }
-
-                // EndStream with a final message: parse it, then signal
-                // end-of-stream on the *next* MoveNext call.
-                _previousFrame = frame;
-                _current = _parser.ParseFrom(new ReadOnlySequence<byte>(mem));
-                _endOfStream = true;
-                return true;
+                if (ProcessFrame(frame))
+                    return true;
+                if (_assembled == null)
+                    return false; // real end-of-stream
             }
 
-            _previousFrame = frame;
-            _current = _parser.ParseFrom(new ReadOnlySequence<byte>(mem));
-            return true;
+            // Slow path: wait for frame with minimal async layers
+            var ct = cancellationToken.CanBeCanceled ? cancellationToken : _stream.DisposeCancellationToken;
+            try
+            {
+                while (true)
+                {
+                    if (!await _stream.WaitForFrameAsync(ct).ConfigureAwait(false))
+                        return false;
+
+                    while (_stream.TryReceiveFrame(out frame))
+                    {
+                        if (ProcessFrame(frame))
+                            return true;
+                        if (_assembled == null)
+                            return false;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            catch (System.Threading.Channels.ChannelClosedException)
+            {
+                return false;
+            }
+        }
+
+        private bool ProcessFrame(InboundFrame frame)
+        {
+            switch (frame.Type)
+            {
+                case FrameType.Message:
+                    // Multi-frame: copy into single assembled buffer.
+                    if ((frame.Flags & MessageFlags.More) != 0)
+                    {
+                        if (_assembled == null)
+                        {
+                            _assembled = ArrayPool<byte>.Shared.Rent(frame.Length * 4);
+                            _assembledPos = 0;
+                        }
+                        else if (_assembledPos + frame.Length > _assembled.Length)
+                        {
+                            var newBuf = ArrayPool<byte>.Shared.Rent(_assembled.Length * 2);
+                            _assembled.AsSpan(0, _assembledPos).CopyTo(newBuf);
+                            ArrayPool<byte>.Shared.Return(_assembled);
+                            _assembled = newBuf;
+                        }
+                        frame.Memory.Span.CopyTo(_assembled.AsSpan(_assembledPos));
+                        _assembledPos += frame.Length;
+                        frame.ReturnToPool();
+                        return false; // keep reading
+                    }
+
+                    // Final frame or single-frame message.
+                    ReadOnlySequence<byte> sequence;
+                    if (_assembled != null)
+                    {
+                        // Multi-frame final: copy last frame into assembled.
+                        if (_assembledPos + frame.Length > _assembled.Length)
+                        {
+                            var newBuf = ArrayPool<byte>.Shared.Rent(_assembledPos + frame.Length);
+                            _assembled.AsSpan(0, _assembledPos).CopyTo(newBuf);
+                            ArrayPool<byte>.Shared.Return(_assembled);
+                            _assembled = newBuf;
+                        }
+                        frame.Memory.Span.CopyTo(_assembled.AsSpan(_assembledPos));
+                        _assembledPos += frame.Length;
+                        frame.ReturnToPool();
+                        sequence = new ReadOnlySequence<byte>(_assembled.AsMemory(0, _assembledPos));
+                    }
+                    else
+                    {
+                        // Single frame — ParseFrom directly (zero-copy for pre-committed).
+                        sequence = new ReadOnlySequence<byte>(frame.Memory);
+                    }
+
+                    _current = _parser.ParseFrom(sequence);
+
+                    if (_assembled != null)
+                    {
+                        // Keep assembled buffer for reuse across messages
+                        // (streaming with same-sized messages avoids re-allocation).
+                        _assembledPos = 0;
+                    }
+                    else
+                    {
+                        frame.ReturnToPool();
+                    }
+                    _previousFrame = default;
+
+                    var eos = (frame.Flags & MessageFlags.EndStream) != 0;
+                    if (eos)
+                    {
+                        _stream.MarkHalfCloseReceived();
+                        _endOfStream = true;
+                    }
+                    return true;
+
+                case FrameType.HalfClose:
+                    frame.ReturnToPool();
+                    _stream.MarkHalfCloseReceived();
+                    return false;
+
+                case FrameType.Trailers:
+                    _stream.SetTrailers(frame);
+                    frame.ReturnToPool();
+                    _stream.MarkHalfCloseReceived();
+                    return false;
+
+                default:
+                    frame.ReturnToPool();
+                    return false;
+            }
         }
 
         public void Dispose()
         {
-            // Release any held pooled buffer from the last received message.
-            // Without this, a handler that short-circuits (reads one message
-            // then returns) would leak the rented ArrayPool buffer.
             _previousFrame.ReturnToPool();
             _previousFrame = default;
+            if (_assembled != null)
+            {
+                ArrayPool<byte>.Shared.Return(_assembled);
+                _assembled = null;
+                _assembledPos = 0;
+            }
         }
     }
 
@@ -508,19 +962,118 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     {
         private readonly ShmGrpcStream _stream;
         private readonly ShmServerCallContext _context;
+        private readonly bool _directRingWrite;
+        // Reusable write buffer for the fallback path when TryWriteInlineDirect
+        // fails (ring wrap-around). Avoids per-message ArrayPool.Rent for
+        // repeated large messages in streaming scenarios.
+        private byte[]? _writeBuf;
 
-        public ShmServerStreamWriter(ShmGrpcStream stream, ShmServerCallContext context)
+        public ShmServerStreamWriter(ShmGrpcStream stream, ShmServerCallContext context, bool directRingWrite = false)
         {
             _stream = stream;
             _context = context;
+            _directRingWrite = directRingWrite;
         }
 
         public WriteOptions? WriteOptions { get; set; }
 
-        public async Task WriteAsync(T message)
+        /// <summary>Returns the reusable fallback buffer to ArrayPool.</summary>
+        internal void ReturnWriteBuffer()
         {
-            await _context.EnsureResponseHeadersSentAsync();
-            await SendProtobufMessageAsync(_stream, message, default);
+            if (_writeBuf != null)
+            {
+                ArrayPool<byte>.Shared.Return(_writeBuf);
+                _writeBuf = null;
+            }
+        }
+
+        public Task WriteAsync(T message)
+        {
+            // In singleStreamMode with one active stream, use ExecuteInline
+            // to bypass the queue. ExecuteInline internally handles the
+            // WriterLoop idle case via TryPause (see ShmFrameWriter).
+            if (_directRingWrite && _stream.Connection.ActiveStreamCount <= 1)
+            {
+                var size = message.CalculateSize();
+                var writer = _stream.Connection.FrameWriter!;
+                IMessage msg = message;
+
+                // Fast path: for single-frame messages (≤ ~16MB), try to
+                // serialize directly into the ring buffer (zero intermediate
+                // buffer). This requires exclusive ring access via TryPause.
+                // Falls through to the standard serialize+ExecuteInline path
+                // on failure (wrap-around, WriterLoop busy, multi-frame).
+                var maxFramePayload = Math.Max(1, (int)_stream.Connection.TxRing.Capacity / 4 - ShmConstants.FrameHeaderSize);
+                if (size > 0 && size <= maxFramePayload && writer.TryPauseWriterLoop())
+                {
+                    try
+                    {
+                        if (!_context.HeadersSent)
+                        {
+                            _stream.SendResponseHeadersInline(writer);
+                            _context.MarkHeadersSent();
+                        }
+                        if (writer.TryWriteInlineDirect(_stream.StreamId, size, msg, 0, default))
+                            return Task.CompletedTask;
+                        // TryWriteInlineDirect failed (wrap-around) — fall through
+                        // to serialize+WriteInline below while still holding pause.
+                    }
+                    finally
+                    {
+                        writer.ResumeWriterLoop();
+                    }
+                }
+
+                byte[]? buf = null;
+                if (size > 0)
+                {
+                    // Reuse write buffer if large enough.
+                    if (_writeBuf != null && _writeBuf.Length >= size)
+                    {
+                        buf = _writeBuf;
+                    }
+                    else
+                    {
+                        if (_writeBuf != null) ArrayPool<byte>.Shared.Return(_writeBuf);
+                        buf = ArrayPool<byte>.Shared.Rent(size);
+                        _writeBuf = buf;
+                    }
+                    using (var cos = new CodedOutputStream(buf))
+                        msg.WriteTo(cos);
+                }
+
+                var streamId = _stream.StreamId;
+                var bufSize = size;
+                var ctx = _context;
+                var stream = _stream;
+                writer.ExecuteInline(() =>
+                {
+                    if (!ctx.HeadersSent)
+                    {
+                        stream.SendResponseHeadersInline(writer);
+                        ctx.MarkHeadersSent();
+                    }
+                    if (buf != null)
+                        writer.WriteInline(streamId, buf.AsSpan(0, bufSize), 0, default);
+                    else
+                        writer.WriteInline(streamId, ReadOnlySpan<byte>.Empty, 0, default);
+                });
+
+                // Don't return buf — reused via _writeBuf across messages.
+                return Task.CompletedTask;
+            }
+
+            var headersTask = _context.EnsureResponseHeadersSentAsync();
+            if (!headersTask.IsCompletedSuccessfully)
+                return WriteAsyncSlow(headersTask, message);
+
+            return SendProtobufMessageAsync(_stream, message, default);
+        }
+
+        private async Task WriteAsyncSlow(Task headersTask, T message)
+        {
+            await headersTask.ConfigureAwait(false);
+            await SendProtobufMessageAsync(_stream, message, default).ConfigureAwait(false);
         }
     }
 

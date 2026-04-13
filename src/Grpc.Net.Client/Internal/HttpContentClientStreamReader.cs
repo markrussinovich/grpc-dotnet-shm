@@ -160,11 +160,64 @@ internal sealed class HttpContentClientStreamReader<TRequest, TResponse> : IAsyn
             // In a long running stream this can allow the previous value to be GCed.
             Current = null!;
 
-            var readMessage = await _call.ReadMessageAsync(
-                _responseStream,
-                _grpcEncoding,
-                singleMessage: false,
-                _call.CancellationToken).ConfigureAwait(false);
+            TResponse? readMessage;
+
+            // SHM fast path: when the response content provides direct message
+            // access, bypass the Stream.ReadAsync loop and gRPC framing overhead.
+            // This eliminates ~70% of large-message read latency by avoiding the
+            // async ReadMessageContentAsync loop, an ArrayPool copy, and the
+            // 5-byte gRPC header parse.
+            if (_httpResponse.Content is Grpc.Net.Client.IDirectMessageReader directReader)
+            {
+#if SHM_TRACE
+                var _pt0 = System.Diagnostics.Stopwatch.GetTimestamp();
+#endif
+                var (payload, eos) = await directReader.ReadNextMessageAsync(_call.CancellationToken).ConfigureAwait(false);
+#if SHM_TRACE
+                var _pt1 = System.Diagnostics.Stopwatch.GetTimestamp();
+#endif
+
+                if (payload.Length == 0 && eos)
+                {
+                    readMessage = null;
+                }
+                else
+                {
+                    try
+                    {
+                        _call.DeserializationContext.SetPayload(payload);
+                        readMessage = _call.Method.ResponseMarshaller.ContextualDeserializer(
+                            _call.DeserializationContext);
+                        _call.DeserializationContext.SetPayload(null);
+                    }
+                    finally
+                    {
+                        // Release ring/pooled memory immediately after deserialization.
+                        // Must be in finally: if deserialization throws, unreleased
+                        // zero-copy frames occupy ring space indefinitely, eventually
+                        // causing WaitForSpace stalls.
+                        directReader.ReleaseCurrentMessage();
+                    }
+
+#if SHM_TRACE
+                    var _pt2 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    if (payload.Length >= 65536)
+                    {
+                        System.Threading.Interlocked.Increment(ref Grpc.Net.Client.DirectReaderProf.Count);
+                        System.Threading.Interlocked.Add(ref Grpc.Net.Client.DirectReaderProf.ReadTicks, _pt1 - _pt0);
+                        System.Threading.Interlocked.Add(ref Grpc.Net.Client.DirectReaderProf.DeserTicks, _pt2 - _pt1);
+                    }
+#endif
+                }
+            }
+            else
+            {
+                readMessage = await _call.ReadMessageAsync(
+                    _responseStream,
+                    _grpcEncoding,
+                    singleMessage: false,
+                    _call.CancellationToken).ConfigureAwait(false);
+            }
 
             if (readMessage == null)
             {

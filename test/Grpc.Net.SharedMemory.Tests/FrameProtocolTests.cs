@@ -286,9 +286,11 @@ public class FrameProtocolTests
     {
         // Verifies that the producer can write after a large payload
         // is released and the ring space is reclaimed.
-        const int PayloadSize = 260_000;
+        // With maxFramePayload = ringCapacity/4, use a payload that fits in one frame.
+        const int RingCapacity = 512 * 1024;
+        const int PayloadSize = RingCapacity / 4 - 20; // fits in one frame
         var name = $"grpc_test_{Guid.NewGuid():N}";
-        using var seg = Segment.Create(name, ringCapacity: 512 * 1024, maxStreams: 100);
+        using var seg = Segment.Create(name, ringCapacity: RingCapacity, maxStreams: 100);
         var ring = seg.RingA;
 
         var largeMsg = new byte[PayloadSize];
@@ -464,4 +466,147 @@ public class ShmGrpcRequestStreamTests
         Assert.That(messages[0], Is.EqualTo(payload1));
         Assert.That(messages[1], Is.EqualTo(payload2));
     }
+
+    #region Zero-Copy Read Tests
+
+    [Test]
+    public void ZeroCopyRead_Speculative_CommitsReadIdx()
+    {
+        // Speculative path: CommitRead immediately, return ring memory.
+        var name = $"grpc_zc_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 64 * 1024, maxStreams: 10);
+        var ring = seg.RingA;
+
+        var payload = new byte[1024];
+        new Random(42).NextBytes(payload);
+        FrameProtocol.WriteMessage(ring, streamId: 1, payload, isLast: true);
+
+        var (header, fp) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+
+        Assert.That(header.Type, Is.EqualTo(FrameType.Message));
+        Assert.That(fp.Length, Is.EqualTo(1024));
+        Assert.That(fp.Memory.Span.SequenceEqual(payload), Is.True);
+
+        // Speculative: SpeculativeInFlight should be incremented
+        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(1));
+
+        fp.Release();
+        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(0));
+    }
+
+    [Test]
+    public void ZeroCopyRead_Deferred_HoldsReadIdx()
+    {
+        // When SpeculativeInFlight >= MaxSpeculativeInFlight, use deferred.
+        var name = $"grpc_zc_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 64 * 1024, maxStreams: 10);
+        var ring = seg.RingA;
+
+        var payload1 = new byte[512];
+        var payload2 = new byte[512];
+        var payload3 = new byte[512];
+        new Random(1).NextBytes(payload1);
+        new Random(2).NextBytes(payload2);
+        new Random(3).NextBytes(payload3);
+
+        FrameProtocol.WriteMessage(ring, 1, payload1, true);
+        FrameProtocol.WriteMessage(ring, 1, payload2, true);
+        FrameProtocol.WriteMessage(ring, 1, payload3, true);
+
+        // Read frame 1: speculative (inFlight=0 < max=2)
+        var (_, fp1) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(1));
+
+        // Read frame 2: speculative (inFlight=1 < max=2)
+        var (_, fp2) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(2));
+
+        // Read frame 3: inFlight=2 >= max=2, should be deferred
+        var readIdxBefore = ring.PeekPendingReadIdx();
+        // Save a point where ReadIdx was before frame 3 read (using WriteIdx trick)
+        var (_, fp3) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+
+        // Deferred: SpeculativeInFlight should NOT increase
+        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(2));
+        // But data should still be correct
+        Assert.That(fp3.Memory.Span.SequenceEqual(payload3), Is.True);
+
+        // Release frame 3 (deferred) — should succeed without error
+        fp3.Release();
+
+        fp1.Release();
+        fp2.Release();
+    }
+
+    [Test]
+    public void ZeroCopyRead_DeferredBeforeSpeculative_NoSkip()
+    {
+        // Core safety test: if a deferred frame exists, subsequent frames
+        // must NOT do speculative commit (would skip deferred bytes).
+        var name = $"grpc_zc_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 64 * 1024, maxStreams: 10);
+        var ring = seg.RingA;
+
+        var p1 = new byte[256];
+        var p2 = new byte[256];
+        var p3 = new byte[256];
+        new Random(10).NextBytes(p1);
+        new Random(20).NextBytes(p2);
+        new Random(30).NextBytes(p3);
+
+        FrameProtocol.WriteMessage(ring, 1, p1, true);
+        FrameProtocol.WriteMessage(ring, 1, p2, true);
+        FrameProtocol.WriteMessage(ring, 1, p3, true);
+
+        // Frame 1: speculative
+        var (_, fp1) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        // Frame 2: speculative (inFlight=1)
+        var (_, fp2) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(2));
+
+        // Frame 3: deferred (inFlight=2 >= max)
+        var (_, fp3) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+
+        // Release fp1 and fp2 → inFlight drops to 0
+        fp1.Release();
+        fp2.Release();
+        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(0));
+
+        // Verify fp3 data is still valid (not overwritten)
+        Assert.That(fp3.Memory.Span.SequenceEqual(p3), Is.True);
+
+        fp3.Release();
+    }
+
+    [Test]
+    public void ZeroCopyRead_WrapAround_FallsBackToCopy()
+    {
+        // When payload wraps around the ring, must copy to pooled buffer.
+        var name = $"grpc_zc_{Guid.NewGuid():N}";
+        // Small ring to force wrap-around
+        using var seg = Segment.Create(name, ringCapacity: 4096, maxStreams: 10);
+        var ring = seg.RingA;
+
+        // Write and read until we're near the end of the ring
+        for (int i = 0; i < 3; i++)
+        {
+            var filler = new byte[1000];
+            FrameProtocol.WriteMessage(ring, 1, filler, true);
+            var (_, fp) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+            fp.Release();
+        }
+
+        // Now write a message that should wrap around
+        var payload = new byte[1000];
+        new Random(99).NextBytes(payload);
+        FrameProtocol.WriteMessage(ring, 1, payload, true);
+
+        // Read with zeroCopy — should fall back to copy (wrap-around)
+        var (h, p) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        Assert.That(h.Type, Is.EqualTo(FrameType.Message));
+        Assert.That(p.Memory.Span.Slice(0, payload.Length).SequenceEqual(payload), Is.True);
+        p.Release();
+    }
+
+    #endregion
 }

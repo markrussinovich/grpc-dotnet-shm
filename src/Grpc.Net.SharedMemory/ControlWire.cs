@@ -29,21 +29,23 @@ public static class ControlWire
 {
     /// <summary>
     /// Encodes a CONNECT request.
-    /// Format: version(1) + ringA(8) + ringB(8) = 17 bytes
+    /// Format: version(1) + ringA(8) + ringB(8) [+ flags(1)] = 17 or 18 bytes
+    /// flags bit 0: singleStreamMode requested
     /// </summary>
-    public static byte[] EncodeConnectRequest(ulong ringA = 0, ulong ringB = 0)
+    public static byte[] EncodeConnectRequest(ulong ringA = 0, ulong ringB = 0, bool singleStreamMode = false)
     {
-        var buffer = new byte[1 + 8 + 8];
+        var buffer = new byte[1 + 8 + 8 + 1];
         buffer[0] = ShmConstants.ControlWireVersion;
         BinaryPrimitives.WriteUInt64LittleEndian(buffer.AsSpan(1, 8), ringA);
         BinaryPrimitives.WriteUInt64LittleEndian(buffer.AsSpan(9, 8), ringB);
+        buffer[17] = (byte)(singleStreamMode ? 1 : 0);
         return buffer;
     }
 
     /// <summary>
     /// Decodes a CONNECT request.
     /// </summary>
-    public static (ulong ringA, ulong ringB) DecodeConnectRequest(ReadOnlySpan<byte> data)
+    public static (ulong ringA, ulong ringB, bool singleStreamMode) DecodeConnectRequest(ReadOnlySpan<byte> data)
     {
         if (data.Length < 1)
         {
@@ -58,17 +60,19 @@ public static class ControlWire
         // Allow minimal v1 payloads (just version byte)
         if (data.Length == 1)
         {
-            return (0, 0);
+            return (0, 0, false);
         }
 
-        if (data.Length != 1 + 8 + 8)
+        if (data.Length < 1 + 8 + 8)
         {
             throw new InvalidDataException("Connect request invalid length");
         }
 
         var ringA = BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(1, 8));
         var ringB = BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(9, 8));
-        return (ringA, ringB);
+        // flags byte is optional for backward compatibility (old clients send 17 bytes)
+        var singleStream = data.Length > 17 && (data[17] & 1) != 0;
+        return (ringA, ringB, singleStream);
     }
 
     /// <summary>

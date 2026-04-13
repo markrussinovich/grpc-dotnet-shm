@@ -19,6 +19,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using Google.Protobuf;
 
 namespace Grpc.Net.SharedMemory;
 
@@ -47,13 +48,26 @@ internal sealed class ShmFrameWriter : IDisposable
 
     private readonly ShmRing _ring;
     private readonly ConcurrentQueue<FrameEntry> _queue;
+    private readonly ConcurrentQueue<FrameEntry> _controlQueue; // WindowUpdate/Ping/Pong bypass Messages
     private readonly ManualResetEventSlim _readySignal;
-    private int _waiting; // 1 if writer thread is blocked in Wait; accessed via Volatile.Read/Write
+    internal int _waiting; // 1 if writer thread is blocked in Wait; accessed via Volatile.Read/Write
     private volatile bool _completed;
     private readonly Task _writerTask;
     private readonly CancellationTokenSource _cts;
     private readonly CancellationToken _ct;
     private bool _disposed;
+
+    // Inline write: handler submits a write callback to be executed on the
+    // WriterLoop thread, avoiding concurrent ring access entirely.
+    // _inlineAction is the callback, _inlineSignal signals completion.
+    private volatile Action? _inlineAction;
+    private readonly ManualResetEventSlim _inlineSignal = new(false);
+
+    // Cooperative pause fields for TryPauseWriterLoop / ResumeWriterLoop.
+    // Used by singleStreamMode handlers to get exclusive ring access.
+    private volatile bool _paused;
+    private int _inlineWriterActive;
+    private volatile bool _idleInWait;
 
     public ShmFrameWriter(ShmRing ring, CancellationTokenSource cts)
     {
@@ -61,6 +75,7 @@ internal sealed class ShmFrameWriter : IDisposable
         _cts = cts;
         _ct = cts.Token;
         _queue = new ConcurrentQueue<FrameEntry>();
+        _controlQueue = new ConcurrentQueue<FrameEntry>();
         _readySignal = new ManualResetEventSlim(false);
 
         // Register drain callback so WaitForSpace can flush control frames
@@ -98,11 +113,21 @@ internal sealed class ShmFrameWriter : IDisposable
             throw new InvalidOperationException("Frame writer has been disposed.");
         }
 
-        _queue.Enqueue(new FrameEntry
+        var entry = new FrameEntry
         {
             Type = type, StreamId = streamId, Flags = flags,
             Length = len, Payload = mem, ReturnToPool = buf
-        });
+        };
+
+        // Control frames (WindowUpdate, Ping, Pong) go to a priority queue
+        // so DrainControlFrames can always reach them without scanning past
+        // queued Messages. This prevents deadlock when 32+ concurrent streams
+        // fill the WriterLoop's batch with large Messages that block on
+        // WaitForSpace — WindowUpdate must still be deliverable.
+        if (type == FrameType.WindowUpdate || type == FrameType.Ping || type == FrameType.Pong)
+            _controlQueue.Enqueue(entry);
+        else
+            _queue.Enqueue(entry);
 
         // Wake the writer thread if it is blocked waiting for data.
         // Late enqueues (after _completed is set) are handled by the three
@@ -207,9 +232,36 @@ internal sealed class ShmFrameWriter : IDisposable
         {
             while (!_ct.IsCancellationRequested && !_completed)
             {
+                // Inline write request: handler submitted a callback to execute
+                // on this thread. Execute it immediately (with ring exclusivity)
+                // and signal completion. This is the primary singleStreamMode
+                // optimization path — no pause/resume needed.
+                var inlineAction = _inlineAction;
+                if (inlineAction != null)
+                {
+                    _inlineAction = null;
+                    // Drain any pending control frames before the inline write
+                    // (e.g., WindowUpdate that arrived during handler setup).
+                    if (!_controlQueue.IsEmpty)
+                        DrainControlFrames();
+                    inlineAction();
+                    _inlineSignal.Set();
+                    continue;
+                }
+
+                // Cooperative pause: skip to Phase 3 when TryPauseWriterLoop
+                // needs exclusive ring access for inline writes.
+                if (_paused)
+                    goto phase3;
+
                 // Phase 1: immediate dequeue
+                if (!_controlQueue.IsEmpty)
+                    DrainControlFrames();
+
                 if (_queue.TryDequeue(out batch[0]))
                 {
+                    // Drain control frames within FlushBatch (before large
+                    // messages) rather than here — saves ~15ns per iteration.
                     var count = 1;
                     while (count < maxBatch && _queue.TryDequeue(out batch[count]))
                         count++;
@@ -222,9 +274,18 @@ internal sealed class ShmFrameWriter : IDisposable
                 // next frame within ~30-50µs (one full cross-ring round-trip).
                 // A brief spin here avoids falling through to the heavier
                 // ManualResetEventSlim.Wait (~80µs OS penalty).
+                //
                 var found = false;
                 for (int spin = 0; spin < ShmConstants.SpinIterationsMin; spin++)
                 {
+                    // Check for inline write request (singleStreamMode).
+                    if (_inlineAction != null || _paused)
+                    {
+                        found = false;
+                        // Loop back to top where _inlineAction/_paused is handled.
+                        break;
+                    }
+
                     Thread.SpinWait(1);
                     if (_queue.TryDequeue(out batch[0]))
                     {
@@ -238,36 +299,64 @@ internal sealed class ShmFrameWriter : IDisposable
                 }
 
                 if (found) continue;
+                // If broke due to _inlineAction/_paused, loop back to top.
+                if (_inlineAction != null || _paused) continue;
 
                 // Phase 3: blocking wait (lost-wake-safe pattern)
                 // Set _waiting BEFORE Reset to ensure writers see it and call Set().
+                phase3:
                 Volatile.Write(ref _waiting, 1);
                 _readySignal.Reset();
+
+                // Re-check inline action: handler may have set _inlineAction
+                // between Phase 2 exit and here. If so, execute it now.
+                if (_inlineAction != null)
+                {
+                    Volatile.Write(ref _waiting, 0);
+                    continue; // back to top → execute inline
+                }
+
+                // Re-check _paused: the direct writer may have set _paused
+                // between Phase 2 and here. If so, stay in _waiting state
+                // so TryPauseWriterLoop sees _idleInWait and succeeds.
+                if (_paused)
+                {
+                    _idleInWait = true;
+                    try { _readySignal.Wait(_ct); }
+                    finally { _idleInWait = false; Volatile.Write(ref _waiting, 0); }
+                    continue;
+                }
+
+                // Drain control frames before checking _queue — WindowUpdate
+                // frames in _controlQueue won't wake WriterLoop via Set()
+                // if they arrive during Phase 2 spin (_waiting=0).
+                DrainControlFrames();
+
                 if (_queue.TryDequeue(out batch[0]))
                 {
                     // Data arrived between Phase 2 and Reset — no need to wait.
                     Volatile.Write(ref _waiting, 0);
-                    var count = 1;
-                    while (count < maxBatch && _queue.TryDequeue(out batch[count]))
-                        count++;
-                    FlushBatch(batch, count);
+                    var count2 = 1;
+                    while (count2 < maxBatch && _queue.TryDequeue(out batch[count2]))
+                        count2++;
+                    FlushBatch(batch, count2);
                     continue;
                 }
 
+                _idleInWait = true;
                 try
                 {
                     _readySignal.Wait(_ct);
                 }
                 finally
                 {
+                    _idleInWait = false;
                     Volatile.Write(ref _waiting, 0);
                 }
             }
 
             // Drain remaining entries after _completed is set.
-            // This preserves the Channel semantics where items enqueued before
-            // completion are still consumed. Without this, the last frames
-            // (trailers, half-close, window updates) would be silently dropped.
+            DrainControlFrames();
             while (_queue.TryDequeue(out batch[0]))
             {
                 var count = 1;
@@ -275,6 +364,7 @@ internal sealed class ShmFrameWriter : IDisposable
                     count++;
                 FlushBatch(batch, count);
             }
+            DrainControlFrames();
         }
         catch (OperationCanceledException) { }
         catch (RingClosedException) { }
@@ -284,14 +374,7 @@ internal sealed class ShmFrameWriter : IDisposable
     {
         try
         {
-            // No lock needed: the writer thread is the sole consumer of the
-            // queue and all ring writes go through it, so there is no
-            // concurrent access to the ring.
-            // Importantly, NOT holding a lock here means that if
-            // FrameProtocol.WriteMessage blocks waiting for ring space
-            // (ReserveWrite), we do not prevent other enqueue operations
-            // from completing — avoiding a deadlock where WindowUpdate
-            // frames cannot be enqueued while the ring is full.
+            // WriterLoop is the sole ring writer (SPSC).
             _ring.BeginBatchWrite();
             try
             {
@@ -320,14 +403,20 @@ internal sealed class ShmFrameWriter : IDisposable
                     {
                         _ring.EndBatchWrite();
                         DrainControlFrames();
-                        _ring.BeginBatchWrite();
                     }
 
                     if (entry.Type == FrameType.Message)
                     {
                         var isLast = (entry.Flags & MessageFlags.More) == 0;
-                        var extraFlags = (byte)(entry.Flags & ~MessageFlags.More); // preserve EndStream etc.
+                        var extraFlags = (byte)(entry.Flags & ~MessageFlags.More);
                         FrameProtocol.WriteMessage(_ring, entry.StreamId, payload, isLast, _ct, extraFlags);
+                        // Re-enter batch mode after large messages to coalesce
+                        // OS signals for the rest of the batch (previously
+                        // removed due to suspected deadlock, but trace confirmed
+                        // no deadlock — the "TIMEOUT" was performance regression
+                        // from 32× extra signals per batch).
+                        if (payload.Length >= 65536)
+                            _ring.BeginBatchWrite();
                     }
                     else
                     {
@@ -354,31 +443,227 @@ internal sealed class ShmFrameWriter : IDisposable
     }
 
     /// <summary>
-    /// Drain non-Message frames from the queue and write them to the ring.
-    /// Called before a large ring write to ensure WindowUpdate/Ping/Pong
-    /// frames are delivered promptly, preventing bidirectional ring deadlock.
-    /// Stops at the first Message frame (leaves it queued for the caller).
+    /// Submits a write action to be executed with exclusive ring access.
+    ///
+    /// When WriterLoop is active (Phase 2 spin): submits the action as a
+    /// callback — WriterLoop detects _inlineAction within ~1 spin iteration
+    /// (~30ns) and executes it. The caller blocks on _inlineSignal until done.
+    ///
+    /// When WriterLoop is idle (Phase 3 kernel Wait): executes the action
+    /// directly on the caller's thread via TryPause, avoiding two kernel
+    /// wakeups (_readySignal.Set + _inlineSignal.Wait) that on Linux VMs
+    /// can each take 0.5–15ms, causing 40–80× throughput regression for
+    /// callers with async dispatch layers (Task.Yield → Channel).
+    /// </summary>
+    internal void ExecuteInline(Action action)
+    {
+        // Fast path: if WriterLoop is idle in Phase 3, execute directly
+        // on the caller's thread. TryPause succeeds instantly when
+        // _idleInWait=true (no spin needed).
+        if (_idleInWait && TryPauseWriterLoop())
+        {
+            try
+            {
+                action();
+            }
+            finally
+            {
+                ResumeWriterLoop();
+            }
+            return;
+        }
+
+        // WriterLoop is active (Phase 2 spin) — standard inline execution.
+        // Phase 2 checks _inlineAction every iteration, so detection is
+        // near-instant.
+        _inlineSignal.Reset();
+        _inlineAction = action;
+
+        // Always signal _readySignal regardless of _waiting state.
+        // On Linux, checking _waiting before Set() creates a lost-wake window:
+        //   WriterLoop exits Phase 2 spin (_waiting=0) → context switch →
+        //   handler sets _inlineAction, sees _waiting==0, skips Set() →
+        //   WriterLoop enters Phase 3, _readySignal.Reset(), re-checks
+        //   _inlineAction (should see it), but on Linux/ARM64 the volatile
+        //   read may not yet observe the store due to cross-core propagation
+        //   delay → Wait() blocks indefinitely.
+        // Unconditional Set() adds a spurious wakeup (~50ns) but eliminates
+        // the lost-wake entirely. Phase 2 spin + FlushBatch ignore Set()
+        // (ManualResetEventSlim stays set until Reset in Phase 3, which
+        // re-checks _inlineAction before Wait).
+        if (!_disposed)
+        {
+            try { _readySignal.Set(); } catch (ObjectDisposedException) { }
+        }
+
+        // Wait for WriterLoop to pick up and execute the action.
+        _inlineSignal.Wait(_ct);
+    }
+
+    /// <summary>
+    /// Tries to pause the WriterLoop within a bounded spin.
+    /// Returns true if paused successfully (exclusive ring access).
+    /// Returns false if WriterLoop is busy — caller should use fallback.
+    /// </summary>
+    internal bool TryPauseWriterLoop()
+    {
+        // CAS guard: only one inline writer at a time.
+        if (Interlocked.CompareExchange(ref _inlineWriterActive, 1, 0) != 0)
+            return false;
+
+        _paused = true;
+        // Spin until WriterLoop is truly idle (_idleInWait = true).
+        // Phase 2's _paused check (every iteration) ensures WriterLoop
+        // exits spin quickly and enters Phase 3 → _idleInWait = true.
+        for (int i = 0; i < 2000; i++)
+        {
+            if (_idleInWait)
+                return true;
+            Thread.SpinWait(1);
+        }
+        _paused = false;
+        Volatile.Write(ref _inlineWriterActive, 0);
+        return false;
+    }
+
+    /// <summary>Resumes the WriterLoop after a pause.</summary>
+    internal void ResumeWriterLoop()
+    {
+        _paused = false;
+        Volatile.Write(ref _inlineWriterActive, 0);
+        try { _readySignal.Set(); } catch (ObjectDisposedException) { }
+    }
+
+    /// <summary>
+    /// Writes a message frame inline on the caller's thread.
+    /// Caller MUST have called PauseWriterLoop first.
+    /// Drains ALL queued frames first (including Headers) to preserve ordering.
+    /// </summary>
+    internal void WriteInline(uint streamId, ReadOnlySpan<byte> payload, byte extraFlags, CancellationToken ct)
+    {
+        DrainAllQueued();
+        var isLast = (extraFlags & MessageFlags.More) == 0;
+        FrameProtocol.WriteMessage(_ring, streamId, payload, isLast, ct, extraFlags);
+    }
+
+    /// <summary>
+    /// Writes an arbitrary frame inline on the caller's thread.
+    /// Caller MUST have called PauseWriterLoop first.
+    /// Does NOT drain the queue — caller is responsible for ordering.
+    /// </summary>
+    internal void WriteInlineFrame(FrameType type, uint streamId, byte flags, ReadOnlySpan<byte> payload, CancellationToken ct)
+    {
+        var header = new FrameHeader(type, streamId, (uint)payload.Length, flags);
+        FrameProtocol.WriteFrame(_ring, header, payload, ct);
+    }
+
+    /// <summary>
+    /// Tries to serialize a protobuf message directly into the ring buffer,
+    /// avoiding the intermediate ArrayPool buffer and memcpy. Pre-checks that
+    /// enough contiguous ring space exists so ReserveWrite won't wrap around.
+    /// If the ring would wrap, returns false immediately (no PAD frame, no
+    /// side effects) — the caller falls back to WriteInline.
+    /// Caller MUST have called PauseWriterLoop first (sole writer guarantee).
+    /// </summary>
+    internal bool TryWriteInlineDirect(uint streamId, int payloadSize, IMessage message, byte extraFlags, CancellationToken ct)
+    {
+        var cap = (int)_ring.Capacity;
+        var maxFramePayload = Math.Max(1, cap / 4 - ShmConstants.FrameHeaderSize);
+
+        if (payloadSize > maxFramePayload)
+            return false;
+
+        var totalSize = ShmConstants.FrameHeaderSize + payloadSize;
+
+        // Drain queued frames first (response Headers etc.) so that
+        // space consumed by pending queue entries is freed before the
+        // contiguity check. Without this, the precheck may reject a
+        // direct-to-ring write that would succeed after draining.
+        DrainAllQueued();
+
+        // Check contiguity after drain.
+        if (!_ring.HasContiguousWriteSpace(totalSize))
+            return false;
+
+        var reservation = _ring.ReserveWrite(totalSize, ct);
+        if (!reservation.Second.IsEmpty)
+            return false; // lost contiguity — very rare
+
+        // Write frame header.
+        var isLast = (extraFlags & MessageFlags.More) == 0;
+        var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
+        var header = new FrameHeader(FrameType.Message, streamId, (uint)payloadSize, flags);
+        Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+        header.EncodeTo(headerBytes);
+        headerBytes.CopyTo(reservation.First.Span);
+
+        // Zero-copy: serialize directly into ring memory via CodedOutputStream
+        // backed by an UnmanagedMemoryStream over the ring's mapped pointer.
+        var payloadSlice = reservation.First.Slice(ShmConstants.FrameHeaderSize, payloadSize);
+        using (var pin = payloadSlice.Pin())
+        {
+            unsafe
+            {
+                using var ums = new System.IO.UnmanagedMemoryStream(
+                    (byte*)pin.Pointer, 0, payloadSize, System.IO.FileAccess.Write);
+                using var cos = new CodedOutputStream(ums);
+                message.WriteTo(cos);
+                cos.Flush();
+            }
+        }
+
+        _ring.CommitWrite(reservation, totalSize);
+        return true;
+    }
+
+    /// <summary>
+    /// Drain control frames (WindowUpdate, Ping, Pong) from the priority queue.
+    /// These are routed to _controlQueue at enqueue time so they are always
+    /// reachable regardless of how many Message frames are queued in _queue.
+    /// Critical for preventing deadlock when WriterLoop's WaitForSpace needs
+    /// the remote side to advance ReadIdx via WindowUpdate.
     /// </summary>
     private void DrainControlFrames()
     {
-        while (_queue.TryPeek(out var peeked))
+        while (_controlQueue.TryDequeue(out var entry))
         {
-            // Only drain pure control frames (WindowUpdate, Ping, Pong).
-            // Message and Trailers are stream-semantic and must preserve
-            // their queue ordering relative to each other.
-            if (peeked.Type == FrameType.Message
-                || peeked.Type == FrameType.Trailers
-                || peeked.Type == FrameType.Headers
-                || peeked.Type == FrameType.HalfClose
-                || peeked.Type == FrameType.Cancel
-                || peeked.Type == FrameType.GoAway)
-                break;
-
-            if (!_queue.TryDequeue(out var entry))
-                break;
-
             var header = new FrameHeader(entry.Type, entry.StreamId, (uint)entry.Length, entry.Flags);
             FrameProtocol.WriteFrame(_ring, header, entry.Payload.Span, _ct);
+            if (entry.ReturnToPool != null)
+                ArrayPool<byte>.Shared.Return(entry.ReturnToPool);
+            entry.CompletionSignal?.Set();
+        }
+    }
+
+    /// <summary>
+    /// Drain ALL queued frames and write them to the ring.
+    /// Called by WriteInline to ensure frames enqueued before the pause
+    /// (e.g., response Headers from EnsureResponseHeadersSentAsync) are
+    /// written before the inline message, preserving frame ordering.
+    /// </summary>
+    private void DrainAllQueued()
+    {
+        // Drain control frames first (WindowUpdate, Ping, Pong)
+        DrainControlFrames();
+
+        // Then drain all message/stream frames
+        while (_queue.TryDequeue(out var entry))
+        {
+            if (entry.CancelFlag != null && Volatile.Read(ref entry.CancelFlag.Value))
+                continue;
+
+            if (entry.Type == FrameType.Message)
+            {
+                var isLast = (entry.Flags & MessageFlags.More) == 0;
+                var extraFlags = (byte)(entry.Flags & ~MessageFlags.More);
+                FrameProtocol.WriteMessage(_ring, entry.StreamId, entry.Payload.Span, isLast, _ct, extraFlags);
+            }
+            else
+            {
+                var header = new FrameHeader(entry.Type, entry.StreamId, (uint)entry.Length, entry.Flags);
+                FrameProtocol.WriteFrame(_ring, header, entry.Payload.Span, _ct);
+            }
+
             if (entry.ReturnToPool != null)
                 ArrayPool<byte>.Shared.Return(entry.ReturnToPool);
             entry.CompletionSignal?.Set();
@@ -431,6 +716,12 @@ internal sealed class ShmFrameWriter : IDisposable
                         ArrayPool<byte>.Shared.Return(entry.ReturnToPool);
                     entry.CompletionSignal?.Set();
                 }
+                while (_controlQueue.TryDequeue(out var ctlEntry))
+                {
+                    if (ctlEntry.ReturnToPool != null)
+                        ArrayPool<byte>.Shared.Return(ctlEntry.ReturnToPool);
+                    ctlEntry.CompletionSignal?.Set();
+                }
             }
 
             _readySignal.Dispose();
@@ -443,6 +734,12 @@ internal sealed class ShmFrameWriter : IDisposable
                 if (lateEntry.ReturnToPool != null)
                     ArrayPool<byte>.Shared.Return(lateEntry.ReturnToPool);
                 lateEntry.CompletionSignal?.Set();
+            }
+            while (_controlQueue.TryDequeue(out var lateCtl))
+            {
+                if (lateCtl.ReturnToPool != null)
+                    ArrayPool<byte>.Shared.Return(lateCtl.ReturnToPool);
+                lateCtl.CompletionSignal?.Set();
             }
         }
     }

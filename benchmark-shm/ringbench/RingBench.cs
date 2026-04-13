@@ -31,20 +31,6 @@ using Microsoft.Extensions.Logging;
 // Main
 // ============================================================================
 
-// Catch unhandled exceptions from background threads
-AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
-{
-    Console.Error.WriteLine($"[DIAG] UNHANDLED EXCEPTION (IsTerminating={e.IsTerminating}): {e.ExceptionObject}");
-    Console.Error.Flush();
-};
-
-TaskScheduler.UnobservedTaskException += (sender, e) =>
-{
-    Console.Error.WriteLine($"[DIAG] UNOBSERVED TASK EXCEPTION: {e.Exception}");
-    Console.Error.Flush();
-    e.SetObserved();
-};
-
 // Ensure enough thread pool threads for benchmark operations
 ThreadPool.SetMinThreads(200, 200);
 
@@ -58,6 +44,10 @@ int serverPort = 0;
 string? serverSegment = null;
 int parentPid = 0;
 string? onlyTransport = null;
+string? onlySizes = null;
+// Static field so static local functions can access it.
+// Controlled by --no-single-stream CLI flag.
+ShmBenchConfig.SingleStream = true;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -77,6 +67,10 @@ for (int i = 0; i < args.Length; i++)
         parentPid = int.Parse(args[++i], CultureInfo.InvariantCulture);
     if (args[i] == "--only")
         onlyTransport = args[++i].ToLowerInvariant();
+    if (args[i] == "--sizes")
+        onlySizes = args[++i];
+    if (args[i] == "--no-single-stream")
+        ShmBenchConfig.SingleStream = false;
 }
 
 if (serverMode)
@@ -100,13 +94,23 @@ var cleaned = Segment.TryRemoveSegmentsByPrefix("bench_shm_");
 if (cleaned > 0)
     Console.WriteLine($"Cleaned {cleaned} stale SHM segment(s) from previous runs.");
 
-// Go benchmark sizes: 0, 1, 1K, 4K, 16K, 64K, 256K, 512K, 1M, 2M, 4M
-int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304 };
+// Benchmark sizes
+int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304,
+    16 * 1024 * 1024, 64 * 1024 * 1024, 256 * 1024 * 1024 };
+
+// --sizes filter: e.g. --sizes 67108864,268435456
+if (onlySizes != null)
+{
+    var filterSet = new HashSet<int>(onlySizes.Split(',').Select(s => int.Parse(s.Trim(), CultureInfo.InvariantCulture)));
+    sizes = sizes.Where(s => filterSet.Contains(s)).ToArray();
+    Console.WriteLine($"Filtering to sizes: {string.Join(", ", sizes.Select(FormatSize))}");
+}
 
 string cpu = GetCpuInfo();
 string runtime = RuntimeInformation.FrameworkDescription;
 Console.WriteLine($"CPU: {cpu}");
 Console.WriteLine($"Runtime: {runtime}");
+Console.WriteLine($"SHM SingleStreamMode: {ShmBenchConfig.SingleStream}");
 Console.WriteLine();
 
 var unaryResults = new List<BenchResult>();
@@ -116,18 +120,14 @@ var streamingResults = new List<BenchResult>();
 #pragma warning disable CS8321
 foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv })
 {
-    BenchEnv env;
-    try
-    {
-        env = await startEnv();
-    }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"[DIAG] Transport setup FAILED: {ex.GetType().Name}: {ex.Message}");
-        Console.Error.WriteLine(ex.ToString());
-        Console.Error.Flush();
-        continue;
-    }
+    // Force GC between transport tests to avoid cross-test interference
+    // (TCP 256MB tests leave hundreds of MB on LOH that can cause GC pauses
+    // during SHM tests, leading to spurious timeouts).
+    GC.Collect(2, GCCollectionMode.Aggressive, true, true);
+    GC.WaitForPendingFinalizers();
+    GC.Collect(2, GCCollectionMode.Aggressive, true, true);
+
+    var env = await startEnv();
 
     // --only tcp|shm: skip transports that don't match
     if (onlyTransport != null && env.Transport != onlyTransport)
@@ -204,6 +204,38 @@ var jsonPath = Path.Combine(outDir, "results.json");
 File.WriteAllText(jsonPath, JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
 Console.WriteLine($"Results written to: {jsonPath}");
 
+#if false // SHM_TRACE — legacy profiling hooks (fields removed)
+// Dump IDirectMessageReader profiling
+{
+    // Ring read profiling
+    if (FrameProtocol._rpCount > 0)
+    {
+        var freq = (double)Stopwatch.Frequency;
+        var n = FrameProtocol._rpCount;
+        Console.WriteLine();
+        Console.WriteLine($"Ring read profiling ({n} large frames):");
+        Console.WriteLine($"  ReserveRead:  {FrameProtocol._rpReserve / freq * 1e6 / n:F1} us/frame  (wait + reserve)");
+        Console.WriteLine($"  Rent+memcpy:  {FrameProtocol._rpCopy / freq * 1e6 / n:F1} us/frame  (ArrayPool + copy)");
+        Console.WriteLine($"  TOTAL ring:   {FrameProtocol._rpTotal / freq * 1e6 / n:F1} us/frame");
+    }
+
+    // IDirectMessageReader profiling
+    if (Grpc.Net.Client.DirectReaderProf.Count > 0)
+    {
+        var freq3 = (double)Stopwatch.Frequency;
+        var n3 = Grpc.Net.Client.DirectReaderProf.Count;
+        Console.WriteLine();
+        Console.WriteLine($"IDirectMessageReader profiling ({n3} large msgs):");
+        Console.WriteLine($"  ReadNextMsg: {Grpc.Net.Client.DirectReaderProf.ReadTicks / freq3 * 1e6 / n3:F1} us/msg");
+        Console.WriteLine($"  Deserialize: {Grpc.Net.Client.DirectReaderProf.DeserTicks / freq3 * 1e6 / n3:F1} us/msg");
+        Console.WriteLine($"  TOTAL:       {(Grpc.Net.Client.DirectReaderProf.ReadTicks + Grpc.Net.Client.DirectReaderProf.DeserTicks) / freq3 * 1e6 / n3:F1} us/msg");
+    }
+
+    // Sync/Slow path breakdown
+    FrameProtocol.DumpDirectReaderBreakdown();
+}
+#endif
+
 var csvPath = Path.Combine(outDir, "results.csv");
 WriteCsv(csvPath, unaryResults, streamingResults);
 Console.WriteLine($"CSV written to: {csvPath}");
@@ -231,10 +263,11 @@ TryGenerateRunnerPlots();
 // Benchmark Service Implementation (server side)
 // ============================================================================
 
+// Cached payloads: eliminates per-call LOH allocation for large sizes.
 static Payload MakePayload(int size)
 {
     if (size <= 0) return new Payload();
-    return new Payload { Body = ByteString.CopyFrom(new byte[size]) };
+    return new Payload { Body = UnsafeByteOperations.UnsafeWrap(PayloadCache.GetOrCreate(size)) };
 }
 
 // ============================================================================
@@ -250,8 +283,8 @@ async Task<BenchEnv> StartTcpEnv()
     {
         var channel = GrpcChannel.ForAddress($"http://127.0.0.1:{port}", new GrpcChannelOptions
         {
-            MaxReceiveMessageSize = 8 * 1024 * 1024,
-            MaxSendMessageSize = 8 * 1024 * 1024
+            MaxReceiveMessageSize = 512 * 1024 * 1024,
+            MaxSendMessageSize = 512 * 1024 * 1024
         });
         var client = new BenchmarkService.BenchmarkServiceClient(channel);
 
@@ -283,10 +316,11 @@ async Task<BenchEnv> StartShmEnv()
     {
         var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
         {
-            HttpHandler = new ShmControlHandler(segmentName),
+            HttpHandler = new ShmControlHandler(segmentName,
+                new ShmClientTransportOptions { SingleStreamMode = ShmBenchConfig.SingleStream }),
             DisposeHttpClient = true,
-            MaxReceiveMessageSize = 8 * 1024 * 1024,
-            MaxSendMessageSize = 8 * 1024 * 1024
+            MaxReceiveMessageSize = 512 * 1024 * 1024,
+            MaxSendMessageSize = 512 * 1024 * 1024
         });
 
         var client = new BenchmarkService.BenchmarkServiceClient(channel);
@@ -341,6 +375,11 @@ static Process StartServerProcess(string transport, int? port = null, string? se
     {
         argParts.Add("--segment");
         argParts.Add(segmentName!);
+    }
+
+    if (!ShmBenchConfig.SingleStream)
+    {
+        argParts.Add("--no-single-stream");
     }
 
     var psi = new ProcessStartInfo
@@ -482,12 +521,15 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
         builder.Logging.ClearProviders();
         builder.Services.AddGrpc(o =>
         {
-            o.MaxReceiveMessageSize = 8 * 1024 * 1024;
-            o.MaxSendMessageSize = 8 * 1024 * 1024;
+            o.MaxReceiveMessageSize = 512 * 1024 * 1024;
+            o.MaxSendMessageSize = 512 * 1024 * 1024;
         });
         builder.WebHost.ConfigureKestrel(k =>
         {
             k.Listen(IPAddress.Loopback, port, lo => lo.Protocols = HttpProtocols.Http2);
+            k.Limits.MaxRequestBodySize = 512L * 1024 * 1024;
+            k.Limits.Http2.InitialConnectionWindowSize = 128 * 1024 * 1024;
+            k.Limits.Http2.InitialStreamWindowSize = 128 * 1024 * 1024;
         });
 
         var app = builder.Build();
@@ -522,7 +564,7 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
     Segment.TryRemoveSegment(segmentName);
     Segment.TryRemoveSegment(segmentName + "_ctl");
 
-    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024);
+    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, singleStreamMode: ShmBenchConfig.SingleStream);
 
     server.MapUnary<SimpleRequest, SimpleResponse>(
         "/grpc.testing.BenchmarkService/UnaryCall",
@@ -565,12 +607,14 @@ static async Task<(double avgUs, double throughputMBps)> MeasureUnary(
 {
     var payload = MakePayload(payloadSize);
     var req = new SimpleRequest { ResponseSize = payloadSize, Payload = payload };
-    var stepTimeout = TimeSpan.FromSeconds(120);
+    var stepTimeout = TimeSpan.FromSeconds(600);
     var started = Stopwatch.StartNew();
 
     // Warmup
     for (int i = 0; i < Math.Min(10, iterations / 10 + 1); i++)
+    {
         await UnaryCallWithHardTimeoutAsync(client, req, stepTimeout).ConfigureAwait(false);
+    }
 
     var sw = Stopwatch.StartNew();
     for (int i = 0; i < iterations; i++)
@@ -670,7 +714,10 @@ static int IterationsForSize(int size)
         <= 262144 => 400,
         <= 524288 => 250,
         <= 1048576 => 150,
-        _ => 80
+        <= 4194304 => 80,
+        <= 16 * 1024 * 1024 => 20,
+        <= 64 * 1024 * 1024 => 10,
+        _ => 5
     };
 
     int multiplier = size >= 524288 ? LargePayloadIterationMultiplier : IterationMultiplier;
@@ -959,10 +1006,31 @@ sealed class BenchmarkServiceImpl : BenchmarkService.BenchmarkServiceBase
         }
     }
 
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte[]> _payloadCache2 = new();
     static Payload MakePayload(int size)
     {
         if (size <= 0) return new Payload();
-        return new Payload { Body = ByteString.CopyFrom(new byte[size]) };
+        var bytes = _payloadCache2.GetOrAdd(size, s => new byte[s]);
+        return new Payload { Body = UnsafeByteOperations.UnsafeWrap(bytes) };
+    }
+}
+
+static class ShmBenchConfig
+{
+    public static bool SingleStream = true;
+}
+
+static class PayloadCache
+{
+    private static readonly Dictionary<int, byte[]> Cache = new();
+    public static byte[] GetOrCreate(int size)
+    {
+        if (!Cache.TryGetValue(size, out var bytes))
+        {
+            bytes = new byte[size];
+            Cache[size] = bytes;
+        }
+        return bytes;
     }
 }
 
