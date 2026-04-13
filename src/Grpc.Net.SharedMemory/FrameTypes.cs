@@ -170,6 +170,13 @@ public static class ShmConstants
     /// automatically chunked by the flow-control layer in ShmGrpcStream,
     /// so the window does not limit the maximum message size.
     /// </summary>
+    /// <summary>
+    /// Initial send window per stream.
+    /// Set to half the default ring capacity so that at least one max-frame-payload
+    /// chunk can be sent immediately. Larger messages are chunked at the
+    /// SendMessageAsync layer, with each chunk independently consuming window
+    /// and triggering WindowUpdate from the receiver.
+    /// </summary>
     public const int InitialWindowSize = 32 * 1024 * 1024;
 
     /// <summary>Maximum window size.</summary>

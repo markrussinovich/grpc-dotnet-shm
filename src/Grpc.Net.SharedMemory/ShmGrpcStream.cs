@@ -76,7 +76,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private HeadersV1? _responseHeaders;
     private TrailersV1? _trailers;
     private long _sendWindow;
-    private bool _halfCloseSent;
+    private int _halfCloseSent; // 0=not sent, 1=sent; use Interlocked for thread safety
     private bool _halfCloseReceived;
     private bool _cancelled;
     private int _disposed;
@@ -85,6 +85,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// Gets the stream ID.
     /// </summary>
     public uint StreamId { get; }
+
+    /// <summary>Gets the owning connection (for direct ring write).</summary>
+    internal ShmConnection Connection => _connection;
 
     /// <summary>
     /// Gets whether this stream is from the client side.
@@ -114,7 +117,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>
     /// Gets whether this side has half-closed (no more messages will be sent).
     /// </summary>
-    public bool IsLocalHalfClosed => _halfCloseSent;
+    public bool IsLocalHalfClosed => Volatile.Read(ref _halfCloseSent) != 0;
+
+    /// <summary>Marks half-close as sent without actually sending it
+    /// (used when HalfClose was written inline by the caller).</summary>
+    internal void MarkHalfCloseSent() => Volatile.Write(ref _halfCloseSent, 1);
 
     /// <summary>
     /// Gets whether the stream was cancelled.
@@ -139,7 +146,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         _disposeCts = new CancellationTokenSource();
         _sendLock = new SemaphoreSlim(1, 1);
         _sendWindowSignal = new SemaphoreSlim(0, int.MaxValue);
-        _sendWindow = ShmConstants.InitialWindowSize;
+        // Effectively unlimited: the ring's WaitForSpace already provides
+        // back-pressure via the SPSC ring buffer. A separate per-stream
+        // flow-control window is an HTTP/2-over-TCP concept that only adds
+        // cross-process WindowUpdate round trips in SHM, causing 64 MB
+        // unary throughput to drop from 1.7 GB/s to 0.75 GB/s.
+        _sendWindow = long.MaxValue / 2;
     }
 
     /// <summary>
@@ -252,25 +264,38 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Writes response headers directly to the ring via the given writer.
+    /// Used by singleStreamMode inline write paths (TryPause/ExecuteInline).
+    /// </summary>
+    internal void SendResponseHeadersInline(ShmFrameWriter writer, Metadata? metadata = null)
+    {
+        if (_responseHeaders != null) return;
+        _responseHeaders = new HeadersV1 { Version = 1, HeaderType = 1, Metadata = ConvertMetadata(metadata) };
+        var (payload, payloadLength) = _responseHeaders.Encode();
+        try
+        {
+            writer.WriteInlineFrame(FrameType.Headers, StreamId, HeadersFlags.Initial,
+                payload.AsSpan(0, payloadLength), default);
+        }
+        finally { ArrayPool<byte>.Shared.Return(payload); }
+    }
+
+    /// <summary>
     /// Sends a message payload.
     /// </summary>
     public Task SendMessageAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        if (_halfCloseSent)
+        if (Volatile.Read(ref _halfCloseSent) != 0)
             throw new InvalidOperationException("Cannot send after half-close");
 
-        // Fast path: when the send window has enough space (the common case for
-        // small payloads — 120B vs 32 MiB window), skip the async machinery and
-        // the LinkedCTS allocation entirely. Each CreateLinkedTokenSource costs
-        // ~200 bytes; at 50K+ messages/sec this dominates GC gen0 pressure.
-        //
-        // Note: the Read-then-Add is not strictly atomic, so two concurrent
-        // callers could both pass the check and drive _sendWindow negative.
-        // This is safe because (1) gRPC serializes sends per stream — concurrent
-        // SendMessageAsync on the same stream does not happen in practice, and
-        // (2) even if it did, a negative window just causes the next send to
-        // enter the slow path and wait for WINDOW_UPDATE, which is self-correcting.
+        // No FC-level chunking needed: FrameProtocol.WriteMessage already
+        // splits data into ring-sized frames (maxFramePayload = ring/2),
+        // each using WaitForSpace for back-pressure. The per-stream flow
+        // control window is set to unlimited — the ring itself is the
+        // only back-pressure mechanism needed in SHM.
+
+        // Fast path for messages that fit in a single frame.
         if (Interlocked.Read(ref _sendWindow) >= data.Length)
         {
             Interlocked.Add(ref _sendWindow, -data.Length);
@@ -298,7 +323,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     return Task.CompletedTask;
                 }
                 // Lock contended — fall through to normal SendFrameAsync
-                // (which will acquire the lock and do defensive copy)
             }
             var task = SendFrameAsync(FrameType.Message, 0, data, ct);
             // Sync completion (the common case): no restore needed.
@@ -306,7 +330,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             {
                 return task;
             }
-            // Async or failed: restore window on failure.
+            // Async completion or sync fault: restore window on failure.
+            if (task.IsFaulted || task.IsCanceled)
+            {
+                Interlocked.Add(ref _sendWindow, data.Length);
+                return task; // propagate exception
+            }
             return SendMessageWithWindowRestoreAsync(task, data.Length);
         }
 
@@ -327,6 +356,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
     private async Task SendMessageSlowAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
@@ -373,7 +403,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     public Task SendMessageAndHalfCloseAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        if (_halfCloseSent)
+        if (Volatile.Read(ref _halfCloseSent) != 0)
             throw new InvalidOperationException("Cannot send after half-close");
 
         if (Interlocked.Read(ref _sendWindow) >= data.Length)
@@ -392,7 +422,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     try
                     {
                         _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, MessageFlags.EndStream, data, ct);
-                        _halfCloseSent = true;
+                        Volatile.Write(ref _halfCloseSent, 1);
                         return Task.CompletedTask;
                     }
                     catch
@@ -410,8 +440,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             var task = SendFrameAsync(FrameType.Message, MessageFlags.EndStream, data, ct);
             if (task.IsCompletedSuccessfully)
             {
-                _halfCloseSent = true;
+                Volatile.Write(ref _halfCloseSent, 1);
                 return Task.CompletedTask;
+            }
+            if (task.IsFaulted || task.IsCanceled)
+            {
+                Interlocked.Add(ref _sendWindow, data.Length);
+                return task;
             }
             return SendMessageAndHalfCloseCompleteAsync(task);
         }
@@ -422,7 +457,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private async Task SendMessageAndHalfCloseCompleteAsync(Task sendTask)
     {
         await sendTask.ConfigureAwait(false);
-        _halfCloseSent = true;
+        Volatile.Write(ref _halfCloseSent, 1);
     }
 
     private async Task SendMessageAndHalfCloseSlowAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
@@ -452,7 +487,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             {
                 await SendFrameAsync(FrameType.Message, MessageFlags.EndStream, data, linkedCts.Token);
             }
-            _halfCloseSent = true;
+            Volatile.Write(ref _halfCloseSent, 1);
         }
         catch
         {
@@ -471,7 +506,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         try
         {
             ThrowIfDisposed();
-            if (_halfCloseSent)
+            if (Volatile.Read(ref _halfCloseSent) != 0)
                 throw new InvalidOperationException("Cannot send after half-close");
         }
         catch
@@ -479,6 +514,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             ArrayPool<byte>.Shared.Return(pooledBuffer);
             throw;
         }
+
+        // No FC-level chunking — FrameProtocol.WriteMessage handles
+        // ring-level frame splitting. See SendMessageAsync comment.
 
         // Fast path: window available — skip LinkedCTS allocation.
         // See SendMessageAsync for the Read-then-Add safety rationale.
@@ -489,6 +527,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             var task = SendFrameZeroCopyAsync(FrameType.Message, 0, data, pooledBuffer, ct);
             if (task.IsCompletedSuccessfully)
             {
+                return task;
+            }
+            if (task.IsFaulted || task.IsCanceled)
+            {
+                Interlocked.Add(ref _sendWindow, data.Length);
                 return task;
             }
             return SendZeroCopyWithWindowRestoreAsync(task, data.Length);
@@ -549,6 +592,33 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Writes trailers directly to the ring via the given (paused) writer.
+    /// Caller MUST hold the WriterLoop pause. No queue, no async, no signal race.
+    /// </summary>
+    internal void SendTrailersInline(ShmFrameWriter writer, StatusCode statusCode, string? statusMessage = null, Metadata? metadata = null)
+    {
+        _trailers = new TrailersV1
+        {
+            Version = 1,
+            GrpcStatusCode = statusCode,
+            GrpcStatusMessage = statusMessage,
+            Metadata = ConvertMetadata(metadata)
+        };
+
+        var (payload, payloadLength) = _trailers.Encode();
+        try
+        {
+            writer.WriteInlineFrame(FrameType.Trailers, StreamId, TrailersFlags.EndStream,
+                payload.AsSpan(0, payloadLength), default);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(payload);
+        }
+        Volatile.Write(ref _halfCloseSent, 1);
+    }
+
+    /// <summary>
     /// Sends trailers and closes the stream (server-side).
     /// </summary>
     public async Task SendTrailersAsync(StatusCode statusCode, string? statusMessage = null, Metadata? metadata = null)
@@ -583,7 +653,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             await SendFrameZeroCopyAsync(FrameType.Trailers, TrailersFlags.EndStream,
                 payload.AsMemory(0, payloadLength), payload);
         }
-        _halfCloseSent = true;
+        Volatile.Write(ref _halfCloseSent, 1);
     }
 
     /// <summary>
@@ -592,12 +662,37 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     public Task SendHalfCloseAsync()
     {
         ThrowIfDisposed();
-        if (_halfCloseSent) return Task.CompletedTask;
+        // Atomic: ensure only one HalfClose is ever sent.
+        if (Interlocked.CompareExchange(ref _halfCloseSent, 1, 0) != 0)
+            return Task.CompletedTask;
+
+        // In singleStreamMode, write HalfClose inline to avoid queue overhead.
+        // Always use TryPause here (never ExecuteInline) because:
+        // 1. HalfClose is a zero-payload frame — ring write is ~100ns.
+        // 2. TryPause spin is bounded: WriterLoop checks _paused every Phase 2
+        //    iteration (~30ns), so pause completes within a few µs.
+        // 3. ExecuteInline would allocate a lambda closure + two kernel signals,
+        //    adding ~2-5µs overhead per unary call that dominates small payloads.
+        if (_connection.SingleStreamMode && _connection.ActiveStreamCount <= 1)
+        {
+            var writer = _connection.FrameWriter;
+            if (writer != null && writer.TryPauseWriterLoop())
+            {
+                try
+                {
+                    FrameProtocol.WriteHalfClose(_connection.TxRing, StreamId, default);
+                }
+                finally
+                {
+                    writer.ResumeWriterLoop();
+                }
+                return Task.CompletedTask;
+            }
+        }
 
         var task = SendFrameAsync(FrameType.HalfClose, 0, Array.Empty<byte>());
         if (task.IsCompletedSuccessfully)
         {
-            _halfCloseSent = true;
             return Task.CompletedTask;
         }
         return SendHalfCloseSlowAsync(task);
@@ -606,7 +701,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private async Task SendHalfCloseSlowAsync(Task sendTask)
     {
         await sendTask.ConfigureAwait(false);
-        _halfCloseSent = true;
+        Volatile.Write(ref _halfCloseSent, 1);
     }
 
     /// <summary>
@@ -1111,6 +1206,55 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 }
                 break;
         }
+    }
+
+    /// <summary>
+    /// Tries to dequeue a frame from the inbound channel without waiting.
+    /// Used by IDirectMessageReader sync fast path.
+    /// </summary>
+    internal bool TryReceiveFrame(out InboundFrame frame)
+    {
+        return _inboundFrames.Reader.TryRead(out frame);
+    }
+
+    /// <summary>Waits until a frame is available in the channel.</summary>
+    internal ValueTask<bool> WaitForFrameAsync(CancellationToken cancellationToken)
+    {
+        return _inboundFrames.Reader.WaitToReadAsync(cancellationToken);
+    }
+
+    /// <summary>Exposes the dispose cancellation token for direct readers.</summary>
+    internal CancellationToken DisposeCancellationToken => _disposeCts.Token;
+
+    /// <summary>Sends a stream-level window update.</summary>
+    internal void SendWindowUpdate(uint increment)
+    {
+        if (increment > 0)
+        {
+            _connection.SendStreamWindowUpdate(StreamId, increment);
+        }
+    }
+
+    /// <summary>
+    /// Completes the inbound frame channel so that any pending
+    /// ReceiveFrameAsync/WaitToReadAsync returns immediately.
+    /// Safe to call even if already completed or disposed.
+    /// </summary>
+    internal void CompleteInbound()
+    {
+        _inboundFrames.Writer.TryComplete();
+    }
+
+    /// <summary>Marks half-close as received from the remote side.</summary>
+    internal void MarkHalfCloseReceived()
+    {
+        _halfCloseReceived = true;
+    }
+
+    /// <summary>Sets trailers from a Trailers frame.</summary>
+    internal void SetTrailers(InboundFrame frame)
+    {
+        _trailers = TrailersV1.Decode(frame.Memory.Span);
     }
 
     internal void OnWindowUpdate(uint increment)

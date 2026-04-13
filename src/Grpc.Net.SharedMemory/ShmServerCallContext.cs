@@ -49,13 +49,21 @@ internal sealed class ShmServerCallContext : ServerCallContext
     /// <summary>
     /// Ensures response headers have been sent. Called before first response message.
     /// </summary>
-    internal async Task EnsureResponseHeadersSentAsync()
+    internal Task EnsureResponseHeadersSentAsync()
     {
-        if (!_headersSent)
-        {
-            _headersSent = true;
-            await _stream.SendResponseHeadersAsync();
-        }
+        if (_headersSent)
+            return Task.CompletedTask;
+
+        return EnsureResponseHeadersSentSlowAsync();
+    }
+
+    internal bool HeadersSent => _headersSent;
+    internal void MarkHeadersSent() => _headersSent = true;
+
+    private async Task EnsureResponseHeadersSentSlowAsync()
+    {
+        _headersSent = true;
+        await _stream.SendResponseHeadersAsync();
     }
 
     protected override string MethodCore => _requestHeaders.Method ?? "";

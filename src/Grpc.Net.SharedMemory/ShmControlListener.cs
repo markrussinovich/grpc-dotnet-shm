@@ -98,10 +98,10 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             }
 
             // Decode and validate CONNECT request
-            (ulong clientRingA, ulong clientRingB) clientPreferred;
+            (ulong clientRingA, ulong clientRingB, bool clientSingleStream) connectParams;
             try
             {
-                clientPreferred = ControlWire.DecodeConnectRequest(payload.Span);
+                connectParams = ControlWire.DecodeConnectRequest(payload.Span);
             }
             catch (Exception ex)
             {
@@ -113,7 +113,7 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             // Negotiate ring capacity: Min(clientPreferred, serverMax).
             // If client sends 0, use server default.
             var negotiatedRing = ControlWire.NegotiateRingCapacity(
-                clientPreferred.clientRingA, _ringCapacity);
+                connectParams.clientRingA, _ringCapacity);
 
             // Purge closed connections to free resources accumulated from
             // previous test runs. Without this, _activeConnections grows
@@ -162,6 +162,9 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             try
             {
                 connection = new ShmConnection(segmentName, dataSegment);
+                // Propagate client's singleStreamMode request.
+                // Server decides in HandleConnectionAsync whether to honor it.
+                connection.SingleStreamMode = connectParams.clientSingleStream;
             }
             catch
             {

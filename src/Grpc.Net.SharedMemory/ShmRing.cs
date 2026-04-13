@@ -143,6 +143,46 @@ public sealed class ShmRing : IDisposable
     /// </summary>
     public ulong Capacity => _capacity;
 
+    // Speculative zero-copy: limits how many pre-committed frames can be
+    // in-flight (enqueued but not yet consumed by handler). Prevents
+    // writer from wrapping to overwrite frames the handler hasn't read yet.
+    // maxSpeculative = capacity / (2 * maxFrameSize) ensures writer needs
+    // to write ≥ half the ring before reaching the oldest frame.
+    internal int SpeculativeInFlight;
+    internal int MaxSpeculativeInFlight => Math.Max(1, (int)(_capacity / (2 * (_capacity / 4))));
+    // = capacity / (capacity/2) = 2
+
+    /// <summary>Reads the current WriteIdx (for speculative safety checks).</summary>
+    internal ulong PeekWriteIdx()
+    {
+        ref var header = ref GetHeader();
+        return Volatile.Read(ref header.WriteIdx);
+    }
+
+    /// <summary>
+    /// Returns the current pending read index (bytes reserved but not yet committed).
+    /// Used by speculative CommitRead to commit all bytes up to the current position,
+    /// including any deferred frames that precede the speculative frame.
+    /// </summary>
+    internal ulong PeekPendingReadIdx() => Volatile.Read(ref _pendingReadIdx);
+
+    /// <summary>
+    /// Checks whether a contiguous write of <paramref name="size"/> bytes is
+    /// possible without wrap-around. Safe to call from the sole writer thread
+    /// while no other writer is active (e.g., WriterLoop is paused).
+    /// </summary>
+    internal bool HasContiguousWriteSpace(int size)
+    {
+        ref var header = ref GetHeader();
+        var writeIdx = Volatile.Read(ref header.WriteIdx);
+        var readIdx = Volatile.Read(ref header.ReadIdx);
+        var used = writeIdx - readIdx;
+        if ((ulong)size > _capacity - used)
+            return false;
+        var writePos = writeIdx & _capMask;
+        return writePos + (ulong)size <= _capacity;
+    }
+
     /// <summary>
     /// Gets whether the ring is closed.
     /// </summary>
@@ -576,7 +616,21 @@ public sealed class ShmRing : IDisposable
             return;
 
         ref var header = ref GetHeader();
-        Volatile.Write(ref header.ReadIdx, baseCommitReadIdx + (ulong)totalBytesConsumed);
+        var newReadIdx = baseCommitReadIdx + (ulong)totalBytesConsumed;
+
+        // When ZeroCopyRead is active, multiple frames may share the same
+        // baseCommitReadIdx (the shared ReadIdx at reservation time) but
+        // their deferred Release calls arrive in arbitrary order.
+        // Use a CAS loop to ensure ReadIdx only moves forward — a later
+        // Release with an earlier baseCommitReadIdx must not regress it.
+        while (true)
+        {
+            var current = Volatile.Read(ref header.ReadIdx);
+            if (newReadIdx <= current)
+                return; // Already past this point — nothing to do.
+            if (Interlocked.CompareExchange(ref header.ReadIdx, newReadIdx, current) == current)
+                break;
+        }
         SignalSpaceAvailability(ref header);
     }
 

@@ -294,6 +294,15 @@ internal static partial class StreamExtensions
         Action<TMessage, SerializationContext> serializer,
         CallOptions callOptions)
     {
+        // SHM fast path: when the stream provides direct message access,
+        // bypass the SerializationContext buffer and gRPC framing. The
+        // transport serializes into its own buffer and sends non-blocking.
+        if (stream is Grpc.Net.Client.IDirectMessageWriter directWriter)
+        {
+            await directWriter.WriteSerializedMessageAsync(message, serializer, call.CancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         // Sync relevant changes here with other WriteMessageAsync
         var serializationContext = call.SerializationContext;
         serializationContext.CallOptions = callOptions;

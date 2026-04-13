@@ -359,7 +359,7 @@ public class BenchmarkRunner
             Payload = new Payload
             {
                 Type = PayloadType.Compressable,
-                Body = Google.Protobuf.ByteString.CopyFrom(payload)
+                Body = Google.Protobuf.UnsafeByteOperations.UnsafeWrap(payload)
             }
         };
     }
