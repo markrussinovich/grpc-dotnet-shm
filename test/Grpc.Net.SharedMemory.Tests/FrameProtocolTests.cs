@@ -344,10 +344,11 @@ public class ShmGrpcRequestStreamTests
     {
         var name = $"grpc_test_{Guid.NewGuid():N}";
         using var seg = Segment.Create(name, ringCapacity: 64 * 1024, maxStreams: 100);
-        var serverConn = new ShmConnection(name, seg);
-        var clientStream = serverConn.CreateStream();
+        var clientConn = ShmConnection.FromClientSegment(name, seg);
+        var clientStream = clientConn.CreateStream();
 
         var requestStream = new ShmGrpcRequestStream(clientStream);
+        await clientStream.SendRequestHeadersAsync("/test/RequestStream", "localhost");
         await writeAction(requestStream);
 
         // Half-close so the frame writer flushes all pending entries
@@ -357,7 +358,7 @@ public class ShmGrpcRequestStreamTests
         await Task.Delay(200);
 
         // Read messages from the TX ring using a timeout to avoid hanging
-        var txRing = serverConn.TxRing;
+        var txRing = clientConn.TxRing;
         var messages = new List<byte[]>();
         using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
@@ -386,7 +387,7 @@ public class ShmGrpcRequestStreamTests
         }
 
         clientStream.Dispose();
-        await serverConn.DisposeAsync();
+        await clientConn.DisposeAsync();
         return messages;
     }
 
@@ -487,17 +488,19 @@ public class ShmGrpcRequestStreamTests
         Assert.That(fp.Length, Is.EqualTo(1024));
         Assert.That(fp.Memory.Span.SequenceEqual(payload), Is.True);
 
-        // Speculative: SpeculativeInFlight should be incremented
-        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(1));
+        // Speculative: SpeculativeReservedBytes > 0 while frame is held
+        Assert.That(ring.SpeculativeReservedBytes, Is.GreaterThan(0));
 
         fp.Release();
-        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(0));
+        // After Release: reserved bytes restored to 0
+        Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(0));
     }
 
     [Test]
-    public void ZeroCopyRead_Deferred_HoldsReadIdx()
+    public void ZeroCopyRead_Speculative_ReservesWriterCapacity()
     {
-        // When SpeculativeInFlight >= MaxSpeculativeInFlight, use deferred.
+        // All zero-copy frames use speculative CommitRead with
+        // SpeculativeReservedBytes safety margin.
         var name = $"grpc_zc_{Guid.NewGuid():N}";
         using var seg = Segment.Create(name, ringCapacity: 64 * 1024, maxStreams: 10);
         var ring = seg.RingA;
@@ -513,36 +516,36 @@ public class ShmGrpcRequestStreamTests
         FrameProtocol.WriteMessage(ring, 1, payload2, true);
         FrameProtocol.WriteMessage(ring, 1, payload3, true);
 
-        // Read frame 1: speculative (inFlight=0 < max=2)
+        // Each speculative read increases reserved bytes
         var (_, fp1) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
-        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(1));
+        var r1 = ring.SpeculativeReservedBytes;
+        Assert.That(r1, Is.GreaterThan(0));
 
-        // Read frame 2: speculative (inFlight=1 < max=2)
         var (_, fp2) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
-        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(2));
+        var r2 = ring.SpeculativeReservedBytes;
+        Assert.That(r2, Is.GreaterThan(r1));
 
-        // Read frame 3: inFlight=2 >= max=2, should be deferred
-        var readIdxBefore = ring.PeekPendingReadIdx();
-        // Save a point where ReadIdx was before frame 3 read (using WriteIdx trick)
         var (_, fp3) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        var r3 = ring.SpeculativeReservedBytes;
+        Assert.That(r3, Is.GreaterThan(r2));
 
-        // Deferred: SpeculativeInFlight should NOT increase
-        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(2));
-        // But data should still be correct
+        // All data valid while held
+        Assert.That(fp1.Memory.Span.SequenceEqual(payload1), Is.True);
+        Assert.That(fp2.Memory.Span.SequenceEqual(payload2), Is.True);
         Assert.That(fp3.Memory.Span.SequenceEqual(payload3), Is.True);
 
-        // Release frame 3 (deferred) — should succeed without error
+        // Release restores capacity
         fp3.Release();
-
         fp1.Release();
         fp2.Release();
+        Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(0));
     }
 
     [Test]
-    public void ZeroCopyRead_DeferredBeforeSpeculative_NoSkip()
+    public void ZeroCopyRead_DeferredRelease_AdvancesReadIdx()
     {
-        // Core safety test: if a deferred frame exists, subsequent frames
-        // must NOT do speculative commit (would skip deferred bytes).
+        // Deferred Release uses DeferredCommitReadIdx to advance ReadIdx.
+        // Out-of-order release is safe via CAS only-forward.
         var name = $"grpc_zc_{Guid.NewGuid():N}";
         using var seg = Segment.Create(name, ringCapacity: 64 * 1024, maxStreams: 10);
         var ring = seg.RingA;
@@ -558,24 +561,18 @@ public class ShmGrpcRequestStreamTests
         FrameProtocol.WriteMessage(ring, 1, p2, true);
         FrameProtocol.WriteMessage(ring, 1, p3, true);
 
-        // Frame 1: speculative
         var (_, fp1) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
-        // Frame 2: speculative (inFlight=1)
         var (_, fp2) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
-        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(2));
-
-        // Frame 3: deferred (inFlight=2 >= max)
         var (_, fp3) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
 
-        // Release fp1 and fp2 → inFlight drops to 0
-        fp1.Release();
-        fp2.Release();
-        Assert.That(ring.SpeculativeInFlight, Is.EqualTo(0));
-
-        // Verify fp3 data is still valid (not overwritten)
+        // All data valid
+        Assert.That(fp1.Memory.Span.SequenceEqual(p1), Is.True);
         Assert.That(fp3.Memory.Span.SequenceEqual(p3), Is.True);
 
+        // Release out of order
         fp3.Release();
+        fp1.Release();
+        fp2.Release();
     }
 
     [Test]

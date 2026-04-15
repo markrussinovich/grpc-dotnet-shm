@@ -45,6 +45,7 @@ public class FlowControlTests
 
     [Test]
     [Platform("Win")]
+    [Timeout(5000)]
     public async Task Stream_InitialSendWindow_IsCorrect()
     {
         var segmentName = $"flow_test_{Guid.NewGuid():N}";
@@ -52,16 +53,36 @@ public class FlowControlTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
 
+        var serverTask = Task.Run(async () =>
+        {
+            var serverStream = await server.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            using var s = serverStream!;
+
+            await s.SendResponseHeadersAsync();
+
+            byte[]? received = null;
+            await foreach (var msg in s.ReceiveMessagesAsync())
+                received = msg;
+
+            Assert.That(received, Is.Not.Null);
+            Assert.That(received!.Length, Is.EqualTo(1000));
+
+            await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
+        });
+
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/flow", "localhost");
 
         // Stream should have initial window size available
-        // We can verify by sending a message that's smaller than initial window
         var smallMessage = new byte[1000];
         await stream.SendMessageAsync(smallMessage);
+        await stream.SendHalfCloseAsync();
 
-        // Should complete without blocking
-        Assert.Pass();
+        await stream.ReceiveResponseHeadersAsync();
+        await foreach (var _ in stream.ReceiveMessagesAsync()) { }
+
+        await serverTask;
     }
 
     [Test]
@@ -74,23 +95,41 @@ public class FlowControlTests
         using var server = ShmConnection.CreateAsServer(segmentName, 65536, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
 
+        var serverTask = Task.Run(async () =>
+        {
+            var serverStream = await server.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            using var s = serverStream!;
+
+            await s.SendResponseHeadersAsync();
+
+            byte[]? received = null;
+            await foreach (var msg in s.ReceiveMessagesAsync())
+                received = msg;
+
+            Assert.That(received, Is.Not.Null);
+            Assert.That(received!.Length, Is.EqualTo(10000));
+
+            await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
+        });
+
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/flow", "localhost");
 
-        var startTime = DateTime.UtcNow;
-
-        // Send message smaller than initial window (16 MiB)
+        // Send message smaller than ring capacity — should not block on backpressure
         var message = new byte[10000];
         await stream.SendMessageAsync(message);
+        await stream.SendHalfCloseAsync();
 
-        var elapsed = DateTime.UtcNow - startTime;
+        await stream.ReceiveResponseHeadersAsync();
+        await foreach (var _ in stream.ReceiveMessagesAsync()) { }
 
-        // Should complete quickly (within 100ms), not block on flow control
-        Assert.That(elapsed.TotalMilliseconds, Is.LessThan(100));
+        await serverTask;
     }
 
     [Test]
     [Platform("Win")]
+    [Timeout(5000)]
     public async Task MultipleSmallMessages_ConsumeWindow()
     {
         var segmentName = $"flow_test_{Guid.NewGuid():N}";
@@ -98,18 +137,44 @@ public class FlowControlTests
         using var server = ShmConnection.CreateAsServer(segmentName, 2 * 1024 * 1024, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
 
+        var messageCount = 10;
+        var messageSize = 1000;
+        var serverReceivedCount = 0;
+
+        var serverTask = Task.Run(async () =>
+        {
+            var serverStream = await server.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            using var s = serverStream!;
+
+            await s.SendResponseHeadersAsync();
+
+            await foreach (var msg in s.ReceiveMessagesAsync())
+            {
+                Assert.That(msg.Length, Is.EqualTo(messageSize));
+                serverReceivedCount++;
+            }
+
+            await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
+        });
+
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/flow", "localhost");
 
         // Send multiple small messages
-        var message = new byte[1000];
-        for (int i = 0; i < 10; i++)
+        var message = new byte[messageSize];
+        for (int i = 0; i < messageCount; i++)
         {
             await stream.SendMessageAsync(message);
         }
+        await stream.SendHalfCloseAsync();
 
-        // All should complete (10KB < 65KB initial window)
-        Assert.Pass();
+        await stream.ReceiveResponseHeadersAsync();
+        await foreach (var _ in stream.ReceiveMessagesAsync()) { }
+
+        await serverTask;
+
+        Assert.That(serverReceivedCount, Is.EqualTo(messageCount));
     }
 
     [Test]
@@ -232,6 +297,28 @@ public class ConcurrentStreamTests
         using var server = ShmConnection.CreateAsServer(segmentName, 65536, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
 
+        var serverReceived = new string[2];
+
+        // Server accepts both streams
+        var serverTask1 = Task.Run(async () =>
+        {
+            var s = await server.AcceptStreamAsync();
+            using var ss = s!;
+            await ss.SendResponseHeadersAsync();
+            await foreach (var msg in ss.ReceiveMessagesAsync())
+                serverReceived[0] = Encoding.UTF8.GetString(msg);
+            await ss.SendTrailersAsync(Grpc.Core.StatusCode.OK);
+        });
+        var serverTask2 = Task.Run(async () =>
+        {
+            var s = await server.AcceptStreamAsync();
+            using var ss = s!;
+            await ss.SendResponseHeadersAsync();
+            await foreach (var msg in ss.ReceiveMessagesAsync())
+                serverReceived[1] = Encoding.UTF8.GetString(msg);
+            await ss.SendTrailersAsync(Grpc.Core.StatusCode.OK);
+        });
+
         var stream1 = client.CreateStream();
         var stream2 = client.CreateStream();
 
@@ -239,12 +326,27 @@ public class ConcurrentStreamTests
         await stream2.SendRequestHeadersAsync("/test/2", "localhost");
 
         // Send messages on both streams concurrently
-        var task1 = stream1.SendMessageAsync(Encoding.UTF8.GetBytes("message on stream 1"));
-        var task2 = stream2.SendMessageAsync(Encoding.UTF8.GetBytes("message on stream 2"));
+        var task1 = Task.Run(async () =>
+        {
+            await stream1.SendMessageAsync(Encoding.UTF8.GetBytes("message on stream 1"));
+            await stream1.SendHalfCloseAsync();
+            await stream1.ReceiveResponseHeadersAsync();
+            await foreach (var _ in stream1.ReceiveMessagesAsync()) { }
+        });
+        var task2 = Task.Run(async () =>
+        {
+            await stream2.SendMessageAsync(Encoding.UTF8.GetBytes("message on stream 2"));
+            await stream2.SendHalfCloseAsync();
+            await stream2.ReceiveResponseHeadersAsync();
+            await foreach (var _ in stream2.ReceiveMessagesAsync()) { }
+        });
 
-        await Task.WhenAll(task1, task2);
+        await Task.WhenAll(task1, task2, serverTask1, serverTask2);
 
-        Assert.Pass();
+        // Both messages were received (order may vary due to concurrency)
+        var allReceived = serverReceived.OrderBy(s => s).ToArray();
+        Assert.That(allReceived[0], Is.EqualTo("message on stream 1"));
+        Assert.That(allReceived[1], Is.EqualTo("message on stream 2"));
     }
 
     [Test]
@@ -258,25 +360,48 @@ public class ConcurrentStreamTests
         using var client = ShmConnection.ConnectAsClient(segmentName);
 
         const int streamCount = 50;
-        var streams = new List<ShmGrpcStream>();
-        var tasks = new List<Task>();
+        var serverReceivedCount = 0;
+        var serverTasks = new List<Task>();
+        var clientTasks = new List<Task>();
 
+        // Server accepts all streams
         for (int i = 0; i < streamCount; i++)
         {
-            var stream = client.CreateStream();
-            streams.Add(stream);
-            tasks.Add(stream.SendRequestHeadersAsync($"/test/{i}", "localhost"));
+            serverTasks.Add(Task.Run(async () =>
+            {
+                var s = await server.AcceptStreamAsync();
+                using var ss = s!;
+                await ss.SendResponseHeadersAsync();
+                await foreach (var _ in ss.ReceiveMessagesAsync()) { }
+                Interlocked.Increment(ref serverReceivedCount);
+                await ss.SendTrailersAsync(Grpc.Core.StatusCode.OK);
+            }));
         }
 
-        await Task.WhenAll(tasks);
+        // Client creates streams in parallel
+        for (int i = 0; i < streamCount; i++)
+        {
+            var idx = i;
+            clientTasks.Add(Task.Run(async () =>
+            {
+                var stream = client.CreateStream();
+                await stream.SendRequestHeadersAsync($"/test/{idx}", "localhost");
+                await stream.SendMessageAsync(Encoding.UTF8.GetBytes($"msg{idx}"));
+                await stream.SendHalfCloseAsync();
+                await stream.ReceiveResponseHeadersAsync();
+                await foreach (var _ in stream.ReceiveMessagesAsync()) { }
+            }));
+        }
 
-        Assert.That(streams.Count, Is.EqualTo(streamCount));
-        Assert.That(streams.Select(s => s.StreamId).Distinct().Count(), Is.EqualTo(streamCount));
+        await Task.WhenAll(clientTasks.Concat(serverTasks));
+
+        Assert.That(serverReceivedCount, Is.EqualTo(streamCount));
     }
 
     [Test]
     [Platform("Win")]
-    public void StreamIsClientStream_ReflectsConnection()
+    [Timeout(5000)]
+    public async Task StreamIsClientStream_ReflectsConnection()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";
 
@@ -284,9 +409,15 @@ public class ConcurrentStreamTests
         using var client = ShmConnection.ConnectAsClient(segmentName);
 
         var clientStream = client.CreateStream();
-        var serverStream = server.CreateStream();
+        await clientStream.SendRequestHeadersAsync("/test/reflect", "localhost");
+
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
 
         Assert.That(clientStream.IsClientStream, Is.True);
-        Assert.That(serverStream.IsClientStream, Is.False);
+        Assert.That(s.IsClientStream, Is.False);
+
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 }

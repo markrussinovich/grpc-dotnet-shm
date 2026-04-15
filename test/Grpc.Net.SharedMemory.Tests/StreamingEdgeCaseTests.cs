@@ -39,11 +39,17 @@ public class StreamingEdgeCaseTests
         
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/empty", "localhost");
-        
-        // Send empty message (valid in gRPC)
         await stream.SendMessageAsync(Array.Empty<byte>());
+        await stream.SendHalfCloseAsync();
+
+        // Server verifies receipt
+        var serverStream = await server.AcceptStreamAsync();
+        byte[]? received = null;
+        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+            received = m;
         
-        Assert.Pass();
+        Assert.That(received, Is.Not.Null);
+        Assert.That(received!.Length, Is.EqualTo(0));
     }
 
     [Test]
@@ -58,10 +64,17 @@ public class StreamingEdgeCaseTests
         
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/single", "localhost");
-        
         await stream.SendMessageAsync(new byte[] { 0x42 });
+        await stream.SendHalfCloseAsync();
+
+        var serverStream = await server.AcceptStreamAsync();
+        byte[]? received = null;
+        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+            received = m;
         
-        Assert.Pass();
+        Assert.That(received, Is.Not.Null);
+        Assert.That(received!.Length, Is.EqualTo(1));
+        Assert.That(received[0], Is.EqualTo(0x42));
     }
 
     [Test]
@@ -71,20 +84,25 @@ public class StreamingEdgeCaseTests
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
         
-        // Create large enough buffer
         using var server = ShmConnection.CreateAsServer(segmentName, 2 * 1024 * 1024, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/large", "localhost");
         
-        // Send 1MB message
         var largeMessage = new byte[1024 * 1024];
         new Random(42).NextBytes(largeMessage);
-        
         await stream.SendMessageAsync(largeMessage);
+        await stream.SendHalfCloseAsync();
+
+        var serverStream = await server.AcceptStreamAsync();
+        byte[]? received = null;
+        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+            received = m;
         
-        Assert.Pass();
+        Assert.That(received, Is.Not.Null);
+        Assert.That(received!.Length, Is.EqualTo(1024 * 1024));
+        Assert.That(received.AsSpan(0, 64).SequenceEqual(largeMessage.AsSpan(0, 64)), Is.True);
     }
 
     [Test]
@@ -101,11 +119,17 @@ public class StreamingEdgeCaseTests
         await stream.SendRequestHeadersAsync("/test/multi-empty", "localhost");
         
         for (int i = 0; i < 5; i++)
-        {
             await stream.SendMessageAsync(Array.Empty<byte>());
+        await stream.SendHalfCloseAsync();
+
+        var serverStream = await server.AcceptStreamAsync();
+        int count = 0;
+        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+        {
+            Assert.That(m.Length, Is.EqualTo(0));
+            count++;
         }
-        
-        Assert.Pass();
+        Assert.That(count, Is.EqualTo(5));
     }
 
     [Test]
@@ -121,13 +145,18 @@ public class StreamingEdgeCaseTests
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/rapid", "localhost");
         
-        // Send many small messages rapidly
         for (int i = 0; i < 100; i++)
-        {
             await stream.SendMessageAsync(Encoding.UTF8.GetBytes($"msg{i}"));
+        await stream.SendHalfCloseAsync();
+
+        var serverStream = await server.AcceptStreamAsync();
+        int count = 0;
+        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+        {
+            Assert.That(Encoding.UTF8.GetString(m), Is.EqualTo($"msg{count}"));
+            count++;
         }
-        
-        Assert.Pass();
+        Assert.That(count, Is.EqualTo(100));
     }
 
     [Test]
@@ -143,15 +172,23 @@ public class StreamingEdgeCaseTests
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/alternating", "localhost");
         
-        // Alternate between small and larger messages
+        var expected = new List<int>();
         for (int i = 0; i < 20; i++)
         {
             var size = (i % 2 == 0) ? 10 : 1000;
-            var message = new byte[size];
-            await stream.SendMessageAsync(message);
+            expected.Add(size);
+            await stream.SendMessageAsync(new byte[size]);
         }
-        
-        Assert.Pass();
+        await stream.SendHalfCloseAsync();
+
+        var serverStream = await server.AcceptStreamAsync();
+        int idx = 0;
+        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+        {
+            Assert.That(m.Length, Is.EqualTo(expected[idx]), $"Message {idx} size mismatch");
+            idx++;
+        }
+        Assert.That(idx, Is.EqualTo(20));
     }
 
     [Test]
@@ -197,7 +234,6 @@ public class StreamingEdgeCaseTests
     [Test]
     [Platform("Win")]
     [Timeout(5000)]
-    [Ignore("Code bug: SendMessageAsync does not guard against missing request/response headers")]
     public async Task SendMessage_BeforeHeaders_Throws()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -235,7 +271,6 @@ public class StreamingEdgeCaseTests
     [Test]
     [Platform("Win")]
     [Timeout(5000)]
-    [Ignore("Code bug: SendTrailersAsync does not check _halfCloseSent before sending duplicate trailers")]
     public async Task SendTrailers_AfterTrailers_Throws()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";

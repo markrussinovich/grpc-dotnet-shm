@@ -469,8 +469,21 @@ internal sealed class ShmConnectionPool : IAsyncDisposable
     /// Called by <see cref="ShmPooledConnection"/> when a stream completes.
     /// Wakes up any <see cref="GetConnectionAsync"/> callers waiting for capacity.
     /// </summary>
-    internal void OnStreamCompleted()
+    internal void OnStreamCompleted(ShmPooledConnection connection)
     {
+        // Update cached connection: if the current cached connection is full
+        // but this one just freed a slot, switch the fast-path pointer.
+        // This avoids all threads falling through to the locked scan path
+        // when conn[0] is busy but conn[1] has capacity.
+        var cached = _cachedFirstConnection;
+        if (cached == null || !cached.IsAvailable)
+        {
+            if (connection.IsAvailable)
+            {
+                _cachedFirstConnection = connection;
+            }
+        }
+
         SignalStreamAvailable();
     }
 

@@ -70,16 +70,24 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private readonly Channel<InboundFrame> _inboundFrames;
     private readonly CancellationTokenSource _disposeCts;
     private readonly SemaphoreSlim _sendLock;
-    private readonly SemaphoreSlim _sendWindowSignal;
 
     private HeadersV1? _requestHeaders;
     private HeadersV1? _responseHeaders;
     private TrailersV1? _trailers;
-    private long _sendWindow;
     private int _halfCloseSent; // 0=not sent, 1=sent; use Interlocked for thread safety
     private bool _halfCloseReceived;
     private bool _cancelled;
     private int _disposed;
+    private volatile Exception? _sendFailure; // set by SendBodyAsync on failure
+
+    /// <summary>
+    /// Records a send-side failure so that response readers can surface
+    /// the real root cause instead of treating truncated responses as EOF.
+    /// </summary>
+    internal void SetSendFailure(Exception ex) => _sendFailure = ex;
+
+    /// <summary>Gets the send-side failure, if any.</summary>
+    internal Exception? SendFailure => _sendFailure;
 
     /// <summary>
     /// Gets the stream ID.
@@ -145,13 +153,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         });
         _disposeCts = new CancellationTokenSource();
         _sendLock = new SemaphoreSlim(1, 1);
-        _sendWindowSignal = new SemaphoreSlim(0, int.MaxValue);
-        // Effectively unlimited: the ring's WaitForSpace already provides
-        // back-pressure via the SPSC ring buffer. A separate per-stream
-        // flow-control window is an HTTP/2-over-TCP concept that only adds
-        // cross-process WindowUpdate round trips in SHM, causing 64 MB
-        // unary throughput to drop from 1.7 GB/s to 0.75 GB/s.
-        _sendWindow = long.MaxValue / 2;
+        // Per-stream flow control is disabled: the ring's WaitForSpace
+        // provides back-pressure via the SPSC ring buffer. A separate
+        // per-stream window would add cross-process WindowUpdate round
+        // trips, causing throughput to drop from 1.7 GB/s to 0.75 GB/s.
     }
 
     /// <summary>
@@ -280,119 +285,60 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         finally { ArrayPool<byte>.Shared.Return(payload); }
     }
 
+    private bool HasSentInitialHeaders()
+    {
+        return IsClientStream ? _requestHeaders != null : _responseHeaders != null;
+    }
+
+    private void ThrowIfCannotSendMessage()
+    {
+        if (_cancelled)
+            throw new InvalidOperationException("Cannot send after cancel");
+        if (!HasSentInitialHeaders())
+            throw new InvalidOperationException("Cannot send message before headers");
+        if (Volatile.Read(ref _halfCloseSent) != 0)
+            throw new InvalidOperationException("Cannot send after half-close");
+    }
+
+    private void ThrowIfCannotSendTrailers()
+    {
+        if (_cancelled)
+            throw new InvalidOperationException("Cannot send after cancel");
+        if (_trailers != null)
+            throw new InvalidOperationException("Cannot send trailers after trailers");
+    }
+
     /// <summary>
     /// Sends a message payload.
     /// </summary>
     public Task SendMessageAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        if (Volatile.Read(ref _halfCloseSent) != 0)
-            throw new InvalidOperationException("Cannot send after half-close");
+        ThrowIfCannotSendMessage();
 
-        // No FC-level chunking needed: FrameProtocol.WriteMessage already
-        // splits data into ring-sized frames (maxFramePayload = ring/2),
-        // each using WaitForSpace for back-pressure. The per-stream flow
-        // control window is set to unlimited — the ring itself is the
-        // only back-pressure mechanism needed in SHM.
+        // No per-stream flow control: the ring's WaitForSpace provides
+        // back-pressure via the SPSC ring buffer.
+        var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
 
-        // Fast path for messages that fit in a single frame.
-        if (Interlocked.Read(ref _sendWindow) >= data.Length)
+        if (data.Length >= 65536 && Volatile.Read(ref _disposed) == 0)
         {
-            Interlocked.Add(ref _sendWindow, -data.Length);
-            var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
-
-            if (data.Length >= 65536 && Volatile.Read(ref _disposed) == 0)
-            {
 #pragma warning disable CA2016
-                if (_sendLock.Wait(0))
+            if (_sendLock.Wait(0))
 #pragma warning restore CA2016
-                {
-                    try
-                    {
-                        _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, 0, data, ct);
-                    }
-                    catch
-                    {
-                        Interlocked.Add(ref _sendWindow, data.Length);
-                        throw;
-                    }
-                    finally
-                    {
-                        _sendLock.Release();
-                    }
-                    return Task.CompletedTask;
-                }
-                // Lock contended — fall through to normal SendFrameAsync
-            }
-            var task = SendFrameAsync(FrameType.Message, 0, data, ct);
-            // Sync completion (the common case): no restore needed.
-            if (task.IsCompletedSuccessfully)
             {
-                return task;
-            }
-            // Async completion or sync fault: restore window on failure.
-            if (task.IsFaulted || task.IsCanceled)
-            {
-                Interlocked.Add(ref _sendWindow, data.Length);
-                return task; // propagate exception
-            }
-            return SendMessageWithWindowRestoreAsync(task, data.Length);
-        }
-
-        // Slow path: need to wait for send window — requires linked CTS.
-        return SendMessageSlowAsync(data, cancellationToken);
-    }
-
-    private async Task SendMessageWithWindowRestoreAsync(Task sendTask, int dataLength)
-    {
-        try
-        {
-            await sendTask.ConfigureAwait(false);
-        }
-        catch
-        {
-            Interlocked.Add(ref _sendWindow, dataLength);
-            throw;
-        }
-    }
-
-    /// <summary>
-    private async Task SendMessageSlowAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
-    {
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-
-        // Wait for send window
-        while (Interlocked.Read(ref _sendWindow) < data.Length)
-        {
-            linkedCts.Token.ThrowIfCancellationRequested();
-            await _sendWindowSignal.WaitAsync(linkedCts.Token);
-        }
-
-        Interlocked.Add(ref _sendWindow, -data.Length);
-        try
-        {
-            if (data.Length >= 65536 && Volatile.Read(ref _disposed) == 0)
-            {
-                await _sendLock.WaitAsync(linkedCts.Token);
                 try
                 {
-                    _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, 0, data, linkedCts.Token);
+                    _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, 0, data, ct);
                 }
                 finally
                 {
                     _sendLock.Release();
                 }
+                return Task.CompletedTask;
             }
-            else
-            {
-                await SendFrameAsync(FrameType.Message, 0, data, linkedCts.Token);
-            }
+            // Lock contended — fall through to normal SendFrameAsync
         }
-        catch
-        {
-            Interlocked.Add(ref _sendWindow, data.Length);
-            throw;
-        }
+        return SendFrameAsync(FrameType.Message, 0, data, ct);
     }
 
     /// <summary>
@@ -403,35 +349,26 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     public Task SendMessageAndHalfCloseAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        if (Volatile.Read(ref _halfCloseSent) != 0)
-            throw new InvalidOperationException("Cannot send after half-close");
+        ThrowIfCannotSendMessage();
 
-        if (Interlocked.Read(ref _sendWindow) >= data.Length)
+        var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
+
+        // Large payloads: wait for the ring write to complete before
+        // returning, so the caller can safely reuse the buffer.
+        if (data.Length >= 65536 && Volatile.Read(ref _disposed) == 0)
         {
-            Interlocked.Add(ref _sendWindow, -data.Length);
-            var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
-
-            // Large payloads: wait for the ring write to complete before
-            // returning, so the caller can safely reuse the buffer.
-            if (data.Length >= 65536 && Volatile.Read(ref _disposed) == 0)
-            {
 #pragma warning disable CA2016
-                if (_sendLock.Wait(0))
+            if (_sendLock.Wait(0))
 #pragma warning restore CA2016
+            {
+                try
                 {
-                    try
-                    {
-                        _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, MessageFlags.EndStream, data, ct);
-                        Volatile.Write(ref _halfCloseSent, 1);
-                        return Task.CompletedTask;
-                    }
-                    catch
-                    {
-                        Interlocked.Add(ref _sendWindow, data.Length);
-                        throw;
-                    }
-                    finally
-                    {
+                    _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, MessageFlags.EndStream, data, ct);
+                    Volatile.Write(ref _halfCloseSent, 1);
+                    return Task.CompletedTask;
+                }
+                finally
+                {
                         _sendLock.Release();
                     }
                 }
@@ -443,57 +380,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 Volatile.Write(ref _halfCloseSent, 1);
                 return Task.CompletedTask;
             }
-            if (task.IsFaulted || task.IsCanceled)
-            {
-                Interlocked.Add(ref _sendWindow, data.Length);
-                return task;
-            }
             return SendMessageAndHalfCloseCompleteAsync(task);
-        }
-
-        return SendMessageAndHalfCloseSlowAsync(data, cancellationToken);
     }
 
     private async Task SendMessageAndHalfCloseCompleteAsync(Task sendTask)
     {
         await sendTask.ConfigureAwait(false);
         Volatile.Write(ref _halfCloseSent, 1);
-    }
-
-    private async Task SendMessageAndHalfCloseSlowAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
-    {
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-        while (Interlocked.Read(ref _sendWindow) < data.Length)
-        {
-            linkedCts.Token.ThrowIfCancellationRequested();
-            await _sendWindowSignal.WaitAsync(linkedCts.Token);
-        }
-        Interlocked.Add(ref _sendWindow, -data.Length);
-        try
-        {
-            if (data.Length >= 65536 && Volatile.Read(ref _disposed) == 0)
-            {
-                await _sendLock.WaitAsync(linkedCts.Token);
-                try
-                {
-                    _connection.SendFrameZeroCopyAndWait(FrameType.Message, StreamId, MessageFlags.EndStream, data, linkedCts.Token);
-                }
-                finally
-                {
-                    _sendLock.Release();
-                }
-            }
-            else
-            {
-                await SendFrameAsync(FrameType.Message, MessageFlags.EndStream, data, linkedCts.Token);
-            }
-            Volatile.Write(ref _halfCloseSent, 1);
-        }
-        catch
-        {
-            Interlocked.Add(ref _sendWindow, data.Length);
-            throw;
-        }
     }
 
     /// <summary>
@@ -506,8 +399,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         try
         {
             ThrowIfDisposed();
-            if (Volatile.Read(ref _halfCloseSent) != 0)
-                throw new InvalidOperationException("Cannot send after half-close");
+            ThrowIfCannotSendMessage();
         }
         catch
         {
@@ -515,80 +407,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             throw;
         }
 
-        // No FC-level chunking — FrameProtocol.WriteMessage handles
-        // ring-level frame splitting. See SendMessageAsync comment.
-
-        // Fast path: window available — skip LinkedCTS allocation.
-        // See SendMessageAsync for the Read-then-Add safety rationale.
-        if (Interlocked.Read(ref _sendWindow) >= data.Length)
-        {
-            Interlocked.Add(ref _sendWindow, -data.Length);
-            var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
-            var task = SendFrameZeroCopyAsync(FrameType.Message, 0, data, pooledBuffer, ct);
-            if (task.IsCompletedSuccessfully)
-            {
-                return task;
-            }
-            if (task.IsFaulted || task.IsCanceled)
-            {
-                Interlocked.Add(ref _sendWindow, data.Length);
-                return task;
-            }
-            return SendZeroCopyWithWindowRestoreAsync(task, data.Length);
-        }
-
-        // Slow path: need to wait for window.
-        return SendMessageZeroCopySlowAsync(data, pooledBuffer, cancellationToken);
-    }
-
-    private async Task SendZeroCopyWithWindowRestoreAsync(Task sendTask, int dataLength)
-    {
-        try
-        {
-            await sendTask.ConfigureAwait(false);
-        }
-        catch
-        {
-            Interlocked.Add(ref _sendWindow, dataLength);
-            throw;
-        }
-    }
-
-    private async Task SendMessageZeroCopySlowAsync(ReadOnlyMemory<byte> data, byte[] pooledBuffer, CancellationToken cancellationToken)
-    {
-        CancellationTokenSource? linkedCts = null;
-        try
-        {
-            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-
-            // Wait for send window
-            while (Interlocked.Read(ref _sendWindow) < data.Length)
-            {
-                linkedCts.Token.ThrowIfCancellationRequested();
-                await _sendWindowSignal.WaitAsync(linkedCts.Token);
-            }
-        }
-        catch
-        {
-            linkedCts?.Dispose();
-            ArrayPool<byte>.Shared.Return(pooledBuffer);
-            throw;
-        }
-
-        Interlocked.Add(ref _sendWindow, -data.Length);
-        try
-        {
-            await SendFrameZeroCopyAsync(FrameType.Message, 0, data, pooledBuffer, linkedCts!.Token);
-        }
-        catch
-        {
-            Interlocked.Add(ref _sendWindow, data.Length);
-            throw;
-        }
-        finally
-        {
-            linkedCts!.Dispose();
-        }
+        // No per-stream flow control: ring WaitForSpace provides back-pressure.
+        var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
+        return SendFrameZeroCopyAsync(FrameType.Message, 0, data, pooledBuffer, ct);
     }
 
     /// <summary>
@@ -626,6 +447,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         ThrowIfDisposed();
         if (IsClientStream)
             throw new InvalidOperationException("Only server can send trailers");
+        ThrowIfCannotSendTrailers();
 
         _trailers = new TrailersV1
         {
@@ -709,7 +531,8 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public async Task CancelAsync()
     {
-        if (_cancelled || Volatile.Read(ref _disposed) != 0) return;
+        ThrowIfDisposed();
+        if (_cancelled) return;
         _cancelled = true;
 
         try
@@ -837,7 +660,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     {
         var firstFrame = await firstFrameTask.ConfigureAwait(false);
         if (firstFrame == null)
-            throw new InvalidOperationException("Stream closed before receiving headers");
+        {
+            var sendEx = _sendFailure;
+            throw sendEx != null
+                ? new InvalidOperationException("Request body send failed", sendEx)
+                : new InvalidOperationException("Stream closed before receiving headers");
+        }
 
         if (firstFrame.Value.Type == FrameType.Headers)
         {
@@ -861,7 +689,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             var frame = await ReceiveFrameAsync(cancellationToken).ConfigureAwait(false);
             if (frame == null)
-                throw new InvalidOperationException("Stream closed before receiving headers");
+            {
+                var sendEx2 = _sendFailure;
+                throw sendEx2 != null
+                    ? new InvalidOperationException("Request body send failed", sendEx2)
+                    : new InvalidOperationException("Stream closed before receiving headers");
+            }
 
             if (frame.Value.Type == FrameType.Headers)
             {
@@ -897,19 +730,20 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             if (_cancelled) yield break;
 
             var frame = await ReceiveFrameAsync(cancellationToken);
-            if (frame == null) yield break;
+            if (frame == null)
+            {
+                // If the send side failed, surface it instead of silently
+                // treating a truncated response as normal EOF.
+                var sendEx = _sendFailure;
+                if (sendEx != null)
+                    throw new InvalidOperationException("Request body send failed during streaming", sendEx);
+                yield break;
+            }
 
             var f = frame.Value;
             switch (f.Type)
             {
                 case FrameType.Message:
-                    // Send stream-level window update via the batched writer
-                    var increment = (uint)f.Length;
-                    if (increment > 0)
-                    {
-                        _connection.SendStreamWindowUpdate(StreamId, increment);
-                    }
-
                     if ((f.Flags & MessageFlags.More) != 0)
                     {
                         messageAccumulator ??= new MemoryStream();
@@ -1000,6 +834,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             var frame = await ReceiveFrameAsync(cancellationToken).ConfigureAwait(false);
             if (frame == null)
             {
+                var sendEx = _sendFailure;
+                if (sendEx != null)
+                    throw new InvalidOperationException("Request body send failed during streaming", sendEx);
                 return (default, default, true);
             }
 
@@ -1007,13 +844,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             switch (f.Type)
             {
                 case FrameType.Message:
-                    // Send stream-level window update via the batched writer
-                    var increment = (uint)f.Length;
-                    if (increment > 0)
-                    {
-                        _connection.SendStreamWindowUpdate(StreamId, increment);
-                    }
-
                     if ((f.Flags & MessageFlags.More) != 0)
                     {
                         // Multi-fragment: accumulate and continue reading
@@ -1088,6 +918,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 var frame = await ReceiveFrameAsync(cancellationToken);
                 if (frame == null)
                 {
+                    var sendEx = _sendFailure;
+                    if (sendEx != null)
+                        throw new InvalidOperationException("Request body send failed during streaming", sendEx);
                     yield break;
                 }
 
@@ -1095,13 +928,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 switch (f.Type)
                 {
                     case FrameType.Message:
-                        // Send stream-level window update via the batched writer
-                        var increment = (uint)f.Length;
-                        if (increment > 0)
-                        {
-                            _connection.SendStreamWindowUpdate(StreamId, increment);
-                        }
-
                         if ((f.Flags & MessageFlags.More) != 0)
                         {
                             messageAccumulator ??= new MemoryStream();
@@ -1226,15 +1052,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>Exposes the dispose cancellation token for direct readers.</summary>
     internal CancellationToken DisposeCancellationToken => _disposeCts.Token;
 
-    /// <summary>Sends a stream-level window update.</summary>
-    internal void SendWindowUpdate(uint increment)
-    {
-        if (increment > 0)
-        {
-            _connection.SendStreamWindowUpdate(StreamId, increment);
-        }
-    }
-
     /// <summary>
     /// Completes the inbound frame channel so that any pending
     /// ReceiveFrameAsync/WaitToReadAsync returns immediately.
@@ -1257,13 +1074,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         _trailers = TrailersV1.Decode(frame.Memory.Span);
     }
 
-    internal void OnWindowUpdate(uint increment)
+    internal static void OnWindowUpdate(uint increment)
     {
-        Interlocked.Add(ref _sendWindow, increment);
-        if (increment > 0 && Volatile.Read(ref _disposed) == 0)
-        {
-            try { _sendWindowSignal.Release(); } catch (ObjectDisposedException) { }
-        }
+        // No-op: per-stream flow control is disabled.
+        // Ring WaitForSpace provides back-pressure.
     }
 
     private Task SendFrameAsync(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
@@ -1429,7 +1243,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         _connection.RemoveStream(StreamId);
         _sendLock.Dispose();
-        _sendWindowSignal.Dispose();
         _disposeCts.Dispose();
     }
 

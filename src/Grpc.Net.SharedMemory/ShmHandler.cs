@@ -47,7 +47,7 @@ public sealed class ShmHandler : HttpMessageHandler
     private readonly SemaphoreSlim _connectionLock;
     private readonly ShmRetryPolicy? _retryPolicy;
     private readonly ShmRetryThrottling? _retryThrottling;
-    private bool _disposed;
+    private int _disposed;
 
     /// <summary>
     /// Creates a new ShmHandler that connects to the specified shared memory segment.
@@ -74,7 +74,7 @@ public sealed class ShmHandler : HttpMessageHandler
     /// <inheritdoc/>
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_disposed != 0, this);
 
         // Without retry policy, execute single attempt directly
         if (_retryPolicy == null)
@@ -314,8 +314,12 @@ public sealed class ShmHandler : HttpMessageHandler
             {
                 if (header.Key.EndsWith("-bin", StringComparison.OrdinalIgnoreCase))
                 {
-                    // Binary metadata
-                    metadata.Add(new Metadata.Entry(header.Key, Convert.FromBase64String(value)));
+                    // Binary metadata — skip malformed base64 instead of crashing.
+                    try
+                    {
+                        metadata.Add(new Metadata.Entry(header.Key, Convert.FromBase64String(value)));
+                    }
+                    catch (FormatException) { /* malformed base64 — skip */ }
                 }
                 else
                 {
@@ -378,14 +382,16 @@ public sealed class ShmHandler : HttpMessageHandler
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _disposed = true;
-            if (disposing)
-            {
-                _connection.Dispose();
-                _connectionLock.Dispose();
-            }
+            base.Dispose(disposing);
+            return;
+        }
+
+        if (disposing)
+        {
+            _connection.Dispose();
+            _connectionLock.Dispose();
         }
         base.Dispose(disposing);
     }

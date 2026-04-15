@@ -174,7 +174,7 @@ internal sealed class ShmPooledConnection
         // Notify the pool so it can wake any waiters blocked in GetConnectionSlowAsync.
         // SignalStreamAvailable internally checks _waiterCount == 0 and short-circuits,
         // so there is no need for a redundant check here.
-        _pool.OnStreamCompleted();
+        _pool.OnStreamCompleted(this);
 
         // Draining check: only when connection is draining (GoAway received),
         // which is extremely rare during normal operation.

@@ -128,7 +128,10 @@ public sealed partial class Segment : IDisposable
     private readonly MappedMemoryManager _memoryManager;
     private readonly Memory<byte> _memory;
     private readonly bool _isServer;
+    private readonly CancellationTokenSource _disposeCts = new();
+    private readonly object _headerWaitSync = new();
     private int _disposed;
+    private int _headerWaitCount;
     private FileStream? _lockFileStream;
 
     /// <summary>Gets the segment name.</summary>
@@ -629,24 +632,55 @@ public sealed partial class Segment : IDisposable
         await WaitForHeaderFlagAsync(ClientReadyOffset, cancellationToken).ConfigureAwait(false);
     }
 
-    private Task WaitForHeaderFlagAsync(int offset, CancellationToken cancellationToken)
+    private async Task WaitForHeaderFlagAsync(int offset, CancellationToken cancellationToken)
     {
+        ThrowIfDisposed();
+
         if (IsHeaderFlagSet(offset))
         {
-            return Task.CompletedTask;
+            return;
         }
 
-        if (OperatingSystem.IsWindows())
+        lock (_headerWaitSync)
         {
-            return Task.Run(() => WaitHeaderFlagWindows(offset, cancellationToken), cancellationToken);
+            ThrowIfDisposed();
+            _headerWaitCount++;
         }
 
-        if (OperatingSystem.IsLinux())
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+
+        try
         {
-            return Task.Run(() => WaitHeaderFlagLinux(offset, cancellationToken), cancellationToken);
-        }
+            if (OperatingSystem.IsWindows())
+            {
+                await Task.Run(() => WaitHeaderFlagWindows(offset, linkedCts.Token), linkedCts.Token).ConfigureAwait(false);
+                return;
+            }
 
-        return WaitHeaderFlagPollingAsync(offset, cancellationToken);
+            if (OperatingSystem.IsLinux())
+            {
+                await Task.Run(() => WaitHeaderFlagLinux(offset, linkedCts.Token), linkedCts.Token).ConfigureAwait(false);
+                return;
+            }
+
+            await WaitHeaderFlagPollingAsync(offset, linkedCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_disposeCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            ThrowIfDisposed();
+            throw;
+        }
+        finally
+        {
+            lock (_headerWaitSync)
+            {
+                _headerWaitCount--;
+                if (_headerWaitCount == 0)
+                {
+                    Monitor.PulseAll(_headerWaitSync);
+                }
+            }
+        }
     }
 
     private bool IsHeaderFlagSet(int offset)
@@ -714,6 +748,24 @@ public sealed partial class Segment : IDisposable
             FutexWake(flagPtr);
         }
 #endif
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+    }
+
+    private void CancelAndWaitForHeaderWaiters()
+    {
+        _disposeCts.Cancel();
+
+        lock (_headerWaitSync)
+        {
+            while (_headerWaitCount != 0)
+            {
+                Monitor.Wait(_headerWaitSync);
+            }
+        }
     }
 
 #if WINDOWS
@@ -885,8 +937,12 @@ public sealed partial class Segment : IDisposable
         }
         catch
         {
-            lockStream?.Dispose();
-            try { if (lockStream != null) File.Delete(lockStream.Name); } catch { }
+            // Delete before close to avoid lock file race (see Dispose).
+            if (lockStream != null)
+            {
+                try { File.Delete(lockStream.Name); } catch { }
+                lockStream.Dispose();
+            }
             throw;
         }
 
@@ -922,17 +978,22 @@ public sealed partial class Segment : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
+        CancelAndWaitForHeaderWaiters();
+
         RingA.Dispose();
         RingB.Dispose();
         _memoryManager.Dispose();
         _accessor.Dispose();
         _mappedFile.Dispose();
+        _disposeCts.Dispose();
         // Intentionally do NOT delete the backing file
     }
 
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+        CancelAndWaitForHeaderWaiters();
 
         RingA.Dispose();
         RingB.Dispose();
@@ -954,13 +1015,18 @@ public sealed partial class Segment : IDisposable
         }
 
         // Release the advisory lock file (Linux endpoint-steal protection).
-        // Closing the stream releases the file-share lock; then delete the file.
+        // Delete BEFORE closing: on Linux, unlinking an open file is safe
+        // (the fd keeps the lock alive). This prevents the race where
+        // process B opens the lock after A closes it, then A deletes B's
+        // lock, allowing C to create a fresh lock — split-brain.
         if (_lockFileStream != null)
         {
             var lockPath = _lockFileStream.Name;
-            try { _lockFileStream.Dispose(); } catch { }
             try { File.Delete(lockPath); } catch { }
+            try { _lockFileStream.Dispose(); } catch { }
             _lockFileStream = null;
         }
+
+        _disposeCts.Dispose();
     }
 }

@@ -65,6 +65,9 @@ public readonly struct ReadReservation
     public int Length => First.Length + Second.Length;
 
     internal ShmRing? Ring { get; init; }
+    /// <summary>
+    /// For speculative CommitRead: the shared ReadIdx at reservation time.
+    /// </summary>
     internal ulong CommitReadIdx { get; init; }
     internal int MaxBytes { get; init; }
 }
@@ -143,14 +146,18 @@ public sealed class ShmRing : IDisposable
     /// </summary>
     public ulong Capacity => _capacity;
 
-    // Speculative zero-copy: limits how many pre-committed frames can be
-    // in-flight (enqueued but not yet consumed by handler). Prevents
-    // writer from wrapping to overwrite frames the handler hasn't read yet.
-    // maxSpeculative = capacity / (2 * maxFrameSize) ensures writer needs
-    // to write ≥ half the ring before reaching the oldest frame.
-    internal int SpeculativeInFlight;
-    internal int MaxSpeculativeInFlight => Math.Max(1, (int)(_capacity / (2 * (_capacity / 4))));
-    // = capacity / (capacity/2) = 2
+    // Speculative zero-copy: track bytes committed but not yet consumed.
+    // Writer deducts this from available space in ReserveWrite, ensuring
+    // it can never reach ring memory still referenced by handler code.
+    //
+    // This is precise: 1MB speculative frame → writer loses 1MB capacity,
+    // not the full maxFramePayload. Handler Release restores the space.
+    //
+    // Thread safety: Interlocked.Add for increment (FrameReaderLoop thread)
+    // and decrement (handler thread via Release). ReserveWrite reads with
+    // Volatile.Read — stale reads only cause a conservative wait, never
+    // a safety violation.
+    internal long SpeculativeReservedBytes;
 
     /// <summary>Reads the current WriteIdx (for speculative safety checks).</summary>
     internal ulong PeekWriteIdx()
@@ -181,6 +188,23 @@ public sealed class ShmRing : IDisposable
             return false;
         var writePos = writeIdx & _capMask;
         return writePos + (ulong)size <= _capacity;
+    }
+
+    /// <summary>
+    /// Returns the number of contiguous bytes available at the current write
+    /// position before the ring wraps. Returns 0 if the ring is full.
+    /// </summary>
+    internal ulong ContiguousWriteSpace()
+    {
+        ref var header = ref GetHeader();
+        var writeIdx = Volatile.Read(ref header.WriteIdx);
+        var readIdx = Volatile.Read(ref header.ReadIdx);
+        var used = writeIdx - readIdx;
+        var free = _capacity - used;
+        if (free == 0) return 0;
+        var writePos = writeIdx & _capMask;
+        var tailSpace = _capacity - writePos;
+        return tailSpace < free ? tailSpace : free;
     }
 
     /// <summary>
@@ -246,7 +270,8 @@ public sealed class ShmRing : IDisposable
             var writeIdx = Volatile.Read(ref header.WriteIdx);
             var readIdx = Volatile.Read(ref header.ReadIdx);
             var used = writeIdx - readIdx;
-            var available = _capacity - used;
+            var specReserved = (ulong)System.Math.Max(0L, Volatile.Read(ref SpeculativeReservedBytes));
+            var available = _capacity - used - System.Math.Min(specReserved, _capacity - used);
 
             if ((ulong)data.Length <= available)
             {
@@ -403,7 +428,8 @@ public sealed class ShmRing : IDisposable
             var writeIdx = Volatile.Read(ref header.WriteIdx);
             var readIdx = Volatile.Read(ref header.ReadIdx);
             var used = writeIdx - readIdx;
-            var available = _capacity - used;
+            var specReserved = (ulong)System.Math.Max(0L, Volatile.Read(ref SpeculativeReservedBytes));
+            var available = _capacity - used - System.Math.Min(specReserved, _capacity - used);
 
             if ((ulong)size <= available)
             {
@@ -763,57 +789,34 @@ public sealed class ShmRing : IDisposable
         free = _capacity - (writeIdx2 - readIdx2);
         if (free >= needed) return;
 
-        if (free == 0)
+        // Wait for total space to become available. We always wait on
+        // SpaceSeq regardless of whether the ring is completely full
+        // (free==0) or partially free (free>0 but <needed). The old
+        // code used ContigSeq for the partial case, but ReserveWrite
+        // accepts wrap-around reservations so contiguity is not required.
+        // Using ContigSeq caused deadlocks when deferred CommitRead
+        // held ReadIdx back: the writer waited for ContigSeq signals
+        // that never came because no further reads occurred.
+        Interlocked.Increment(ref header.SpaceWaiters);
+        try
         {
-            // Ring is completely full - wait on spaceSeq
-            Interlocked.Increment(ref header.SpaceWaiters);
-            try
-            {
-                var seq = Volatile.Read(ref header.SpaceSeq);
+            var seq = Volatile.Read(ref header.SpaceSeq);
 
-                // Re-check before blocking
-                var wi = Volatile.Read(ref header.WriteIdx);
-                var ri = Volatile.Read(ref header.ReadIdx);
-                if (_capacity - (wi - ri) >= needed)
-                {
-                    return;
-                }
-
-                _sync?.WaitForSpace(seq, timeout: null, cancellationToken);
-            }
-            finally
+            // Re-check before blocking
+            var wi = Volatile.Read(ref header.WriteIdx);
+            var ri = Volatile.Read(ref header.ReadIdx);
+            if (_capacity - (wi - ri) >= needed)
             {
-                if (!_localClosed)
-                {
-                    Interlocked.Decrement(ref header.SpaceWaiters);
-                }
+                return;
             }
+
+            _sync?.WaitForSpace(seq, timeout: null, cancellationToken);
         }
-        else
+        finally
         {
-            // Ring has some space but not enough - wait on contigSeq
-            // (contiguity-improving reads may free enough space)
-            Interlocked.Increment(ref header.ContigWaiters);
-            try
+            if (!_localClosed)
             {
-                var seq = Volatile.Read(ref header.ContigSeq);
-
-                // Re-check before blocking
-                var wi = Volatile.Read(ref header.WriteIdx);
-                var ri = Volatile.Read(ref header.ReadIdx);
-                if (_capacity - (wi - ri) >= needed)
-                {
-                    return;
-                }
-
-                _sync?.WaitForContig(seq, timeout: null, cancellationToken);
-            }
-            finally
-            {
-                if (!_localClosed)
-                {
-                    Interlocked.Decrement(ref header.ContigWaiters);
-                }
+                Interlocked.Decrement(ref header.SpaceWaiters);
             }
         }
     }
@@ -952,7 +955,8 @@ public sealed class ShmRing : IDisposable
         var writeIdx = Volatile.Read(ref header.WriteIdx);
         var readIdx = Volatile.Read(ref header.ReadIdx);
         var used = writeIdx - readIdx;
-        var available = _capacity - used;
+        var specReserved = (ulong)System.Math.Max(0L, Volatile.Read(ref SpeculativeReservedBytes));
+            var available = _capacity - used - System.Math.Min(specReserved, _capacity - used);
         return (ulong)size <= available;
     }
 
@@ -1044,7 +1048,8 @@ public sealed class ShmRing : IDisposable
         var writeIdx = Volatile.Read(ref header.WriteIdx);
         var readIdx = Volatile.Read(ref header.ReadIdx);
         var used = writeIdx - readIdx;
-        var available = _capacity - used;
+        var specReserved = (ulong)System.Math.Max(0L, Volatile.Read(ref SpeculativeReservedBytes));
+            var available = _capacity - used - System.Math.Min(specReserved, _capacity - used);
 
         if ((ulong)data.Length > available)
         {
