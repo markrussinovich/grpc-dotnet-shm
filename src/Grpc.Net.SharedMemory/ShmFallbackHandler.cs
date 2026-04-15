@@ -49,7 +49,7 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
     private HttpMessageHandler? _tcpHandler;
 
     private volatile bool _shmFailed;
-    private volatile bool _disposed;
+    private volatile int _disposed;
 
     // Counters for observability
     private long _shmAttempts;
@@ -117,7 +117,7 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
         HttpRequestMessage request,
         CancellationToken cancellationToken)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_disposed != 0, this);
 
         // Policy: disabled → always TCP
         if (_policy.Policy == ShmServicePolicy.Disabled)
@@ -172,7 +172,7 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
             return existing;
         }
 
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_disposed != 0, this);
 
         var newHandler = new ShmHandler(_segmentName);
         var prev = Interlocked.CompareExchange(ref _shmHandler, newHandler, null);
@@ -184,7 +184,7 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
 
         // Re-check: if Dispose raced between our disposed check and the CAS,
         // the new handler was published into an already-disposed parent.
-        if (_disposed)
+        if (_disposed != 0)
         {
             Interlocked.CompareExchange(ref _shmHandler, null, newHandler);
             newHandler.Dispose();
@@ -214,7 +214,7 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
             return existing;
         }
 
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_disposed != 0, this);
 
         var newHandler = new SocketsHttpHandler
         {
@@ -227,7 +227,7 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
             return prev;
         }
 
-        if (_disposed)
+        if (_disposed != 0)
         {
             Interlocked.CompareExchange(ref _tcpHandler, null, newHandler);
             newHandler.Dispose();
@@ -291,12 +291,8 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
-        if (_disposed)
-        {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
-        }
-
-        _disposed = true;
 
         if (disposing)
         {

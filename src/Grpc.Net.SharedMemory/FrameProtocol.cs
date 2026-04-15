@@ -129,40 +129,31 @@ public static class FrameProtocol
             var _pt1 = System.Diagnostics.Stopwatch.GetTimestamp();
 #endif
 
-            // Speculative early CommitRead with in-flight limit:
-            // CommitRead immediately AND return ring memory reference.
-            // Limited to MaxSpeculativeInFlight frames in the channel queue
-            // to prevent writer from wrapping to overwrite unconsumed frames.
+            // Zero-copy read strategy:
             //
-            // Additional safety: only speculative if there are no deferred
-            // (uncommitted) frames between baseCommitReadIdx and this frame.
-            // Detected by: baseCommitReadIdx + totalBytes == _pendingReadIdx.
-            // If not equal, deferred frames exist in the gap — committing
-            // this frame's bytes would skip them, exposing still-live ring
-            // memory to writer overwrite.
+            // More frames (multi-frame continuation): always copy path.
+            // Handler copies More payloads into assembled buffer anyway,
+            // and deferred CommitRead causes 256MB deadlock.
+            //
+            // Single-frame final messages (More=0): speculative zero-copy.
+            // CommitRead advances ReadIdx immediately, but writer safety is
+            // guaranteed by SpeculativeReservedBytes: ReserveWrite deducts
+            // the speculative bytes from available space, so the writer
+            // can never reach ring memory still held by handler code.
+            // On handler Release, SpeculativeReservedBytes is decremented,
+            // restoring the writer's available capacity.
+            var isMore = (header.Flags & MessageFlags.More) != 0;
             var totalBytes = ShmConstants.FrameHeaderSize + payloadLength;
-            if (zeroCopy
-                && header.Type == FrameType.Message
-                && payloadReservation.Second.IsEmpty
-                && Volatile.Read(ref ring.SpeculativeInFlight) < ring.MaxSpeculativeInFlight
-                && baseCommitReadIdx + (ulong)totalBytes == ring.PeekPendingReadIdx())
-            {
-                Interlocked.Increment(ref ring.SpeculativeInFlight);
-                ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
-                return (header, FramePayload.FromRingMemoryPreCommitted(
-                    payloadReservation.First.Slice(0, payloadLength), ring));
-            }
 
-            // Deferred CommitRead: when in-flight limit reached or non-Message.
-            // Returns ring memory (zero-copy) but does NOT advance ReadIdx.
-            // This prevents writer from wrapping to overwrite speculative frames
-            // that the handler hasn't consumed yet. ReadIdx advances only when
-            // handler calls Release() after consuming the frame.
-            if (zeroCopy && payloadReservation.Second.IsEmpty)
+            // Speculative zero-copy: CommitRead + reserve bytes for safety.
+            if (zeroCopy && !isMore && payloadReservation.Second.IsEmpty)
             {
-                return (header, FramePayload.FromRingMemory(
-                    payloadReservation.First.Slice(0, payloadLength),
-                    ring, baseCommitReadIdx, totalBytes));
+                // Reserve ring space before CommitRead so writer can't
+                // reach this memory even after ReadIdx advances.
+                Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
+                ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+                return (header, FramePayload.FromRingMemorySpeculative(
+                    payloadReservation.First.Slice(0, payloadLength), ring, totalBytes));
             }
 
             // Copy to pooled buffer + immediate CommitRead.
@@ -538,18 +529,15 @@ public static class FrameProtocol
         var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
 
         var cap = (int)ring.Capacity;
-        // Use ringCapacity/4 as max frame payload. This ensures:
-        // 1. Ring can hold 4 frames simultaneously → writer rarely stalls
-        // 2. Single-frame messages (≤16MB) get speculative early CommitRead
-        //    → zero-copy + pipeline (More=0 safety condition)
-        // 3. Multi-frame messages: more frames but better pipeline overlap
-        //    (each frame is copy+CommitRead, final frame is zero-copy)
-        var maxFramePayload = Math.Max(1, cap / 4 - ShmConstants.FrameHeaderSize);
-        // Ensure frame + header fits in the ring
-        if (maxFramePayload + ShmConstants.FrameHeaderSize > cap)
-        {
-            maxFramePayload = Math.Max(1, cap - ShmConstants.FrameHeaderSize);
-        }
+        // Max frame payload = ringCap/3. Chosen so that:
+        // 1. Common payloads (4MB, 16MB) fit in a single frame →
+        //    speculative zero-copy read path (no More flag).
+        //    16MB protobuf CalculateSize ≈ 16.8MB < 64MB/3 = 22.4MB.
+        // 2. Speculative safety: N=2 in-flight × cap/3 = 2cap/3 < cap,
+        //    so writer needs cap/3 (~22MB) to reach oldest frame.
+        // 3. Pipeline: 3 frames fit simultaneously in the ring,
+        //    providing good overlap for streaming workloads.
+        var maxFramePayload = Math.Max(1, cap / 3);
 
         if (data.Length <= maxFramePayload)
         {

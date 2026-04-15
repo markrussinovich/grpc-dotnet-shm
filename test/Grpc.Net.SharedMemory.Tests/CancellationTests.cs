@@ -40,10 +40,14 @@ public class CancellationTests
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
         var stream = client.CreateStream();
+        await stream.SendRequestHeadersAsync("/test/Cancel", "localhost");
         
-        // Cancel before sending any data
+        // Server accepts the stream
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        
+        // Cancel from client side
         await stream.CancelAsync();
-        
         Assert.That(stream.IsCancelled, Is.True);
     }
 
@@ -60,9 +64,12 @@ public class CancellationTests
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/Cancel", "localhost");
         
+        // Server accepts
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        
         // Cancel after sending headers
         await stream.CancelAsync();
-        
         Assert.That(stream.IsCancelled, Is.True);
     }
 
@@ -110,7 +117,6 @@ public class CancellationTests
     [Test]
     [Platform("Win")]
     [Timeout(5000)]
-    [Ignore("Code bug: SendMessageAsync does not check _cancelled flag")]
     public async Task CancelledStream_SendMessage_Throws()
     {
         var segmentName = $"cancel_test_{Guid.NewGuid():N}";
@@ -155,7 +161,6 @@ public class CancellationTests
     [Test]
     [Platform("Win")]
     [Timeout(5000)]
-    [Ignore("Code bug: CancelAsync silently returns when disposed instead of throwing ObjectDisposedException")]
     public void CancelStream_AfterDispose_Throws()
     {
         var segmentName = $"cancel_test_{Guid.NewGuid():N}";
@@ -190,6 +195,11 @@ public class CancellationTests
         await stream2.SendRequestHeadersAsync("/test/2", "localhost");
         await stream3.SendRequestHeadersAsync("/test/3", "localhost");
         
+        // Server accepts all three
+        var ss1 = await server.AcceptStreamAsync();
+        var ss2 = await server.AcceptStreamAsync();
+        var ss3 = await server.AcceptStreamAsync();
+        
         // Cancel only stream2
         await stream2.CancelAsync();
         
@@ -197,8 +207,19 @@ public class CancellationTests
         Assert.That(stream2.IsCancelled, Is.True);
         Assert.That(stream3.IsCancelled, Is.False);
         
-        // Other streams should still work
+        // Other streams should still work — send and verify on server
         await stream1.SendMessageAsync(Encoding.UTF8.GetBytes("still works"));
+        await stream1.SendHalfCloseAsync();
+        byte[]? recv1 = null;
+        await foreach (var m in ss1!.ReceiveMessagesAsync())
+            recv1 = m;
+        Assert.That(Encoding.UTF8.GetString(recv1!), Is.EqualTo("still works"));
+
         await stream3.SendMessageAsync(Encoding.UTF8.GetBytes("also works"));
+        await stream3.SendHalfCloseAsync();
+        byte[]? recv3 = null;
+        await foreach (var m in ss3!.ReceiveMessagesAsync())
+            recv3 = m;
+        Assert.That(Encoding.UTF8.GetString(recv3!), Is.EqualTo("also works"));
     }
 }

@@ -37,15 +37,25 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var clientStream = client.CreateStream();
         var metadata = new Grpc.Core.Metadata
         {
             { "custom-header", "custom-value" }
         };
         
-        await stream.SendRequestHeadersAsync("/test/metadata", "localhost", metadata);
+        await clientStream.SendRequestHeadersAsync("/test/metadata", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        Assert.That(s.RequestHeaders, Is.Not.Null);
+        var entry = s.RequestHeaders!.Metadata.FirstOrDefault(e => e.Key == "custom-header");
+        Assert.That(entry.Key, Is.EqualTo("custom-header"));
+        Assert.That(Encoding.UTF8.GetString(entry.Values[0]), Is.EqualTo("custom-value"));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]
@@ -58,7 +68,7 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var clientStream = client.CreateStream();
         
         // Binary metadata uses -bin suffix
         var binaryData = new byte[] { 0x00, 0xFF, 0x42, 0x80 };
@@ -67,9 +77,18 @@ public class MetadataTests
             { "custom-data-bin", binaryData }
         };
         
-        await stream.SendRequestHeadersAsync("/test/binary-metadata", "localhost", metadata);
+        await clientStream.SendRequestHeadersAsync("/test/binary-metadata", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        var entry = s.RequestHeaders!.Metadata.FirstOrDefault(e => e.Key == "custom-data-bin");
+        Assert.That(entry.Key, Is.EqualTo("custom-data-bin"));
+        Assert.That(entry.Values[0], Is.EqualTo(binaryData));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]
@@ -82,7 +101,7 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 65536, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var clientStream = client.CreateStream();
         
         // Large binary data (8KB)
         var binaryData = new byte[8192];
@@ -93,9 +112,19 @@ public class MetadataTests
             { "large-data-bin", binaryData }
         };
         
-        await stream.SendRequestHeadersAsync("/test/large-binary", "localhost", metadata);
+        await clientStream.SendRequestHeadersAsync("/test/large-binary", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        var entry = s.RequestHeaders!.Metadata.FirstOrDefault(e => e.Key == "large-data-bin");
+        Assert.That(entry.Key, Is.EqualTo("large-data-bin"));
+        Assert.That(entry.Values[0].Length, Is.EqualTo(8192));
+        Assert.That(entry.Values[0], Is.EqualTo(binaryData));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]
@@ -108,7 +137,7 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var clientStream = client.CreateStream();
         var metadata = new Grpc.Core.Metadata
         {
             { "header-1", "value-1" },
@@ -116,9 +145,20 @@ public class MetadataTests
             { "header-3", "value-3" }
         };
         
-        await stream.SendRequestHeadersAsync("/test/multi-metadata", "localhost", metadata);
+        await clientStream.SendRequestHeadersAsync("/test/multi-metadata", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        var serverMeta = s.RequestHeaders!.Metadata;
+        Assert.That(serverMeta.Count(e => e.Key.StartsWith("header-")), Is.EqualTo(3));
+        Assert.That(Encoding.UTF8.GetString(serverMeta.First(e => e.Key == "header-1").Values[0]), Is.EqualTo("value-1"));
+        Assert.That(Encoding.UTF8.GetString(serverMeta.First(e => e.Key == "header-2").Values[0]), Is.EqualTo("value-2"));
+        Assert.That(Encoding.UTF8.GetString(serverMeta.First(e => e.Key == "header-3").Values[0]), Is.EqualTo("value-3"));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]
@@ -131,7 +171,7 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var clientStream = client.CreateStream();
         
         // gRPC allows duplicate keys
         var metadata = new Grpc.Core.Metadata
@@ -140,9 +180,20 @@ public class MetadataTests
             { "repeated-key", "value-2" }
         };
         
-        await stream.SendRequestHeadersAsync("/test/duplicate-keys", "localhost", metadata);
+        await clientStream.SendRequestHeadersAsync("/test/duplicate-keys", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        var entries = s.RequestHeaders!.Metadata.Where(e => e.Key == "repeated-key").ToList();
+        Assert.That(entries, Has.Count.EqualTo(2));
+        var values = entries.Select(e => Encoding.UTF8.GetString(e.Values[0])).ToList();
+        Assert.That(values, Does.Contain("value-1"));
+        Assert.That(values, Does.Contain("value-2"));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]
@@ -155,15 +206,24 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var clientStream = client.CreateStream();
         var metadata = new Grpc.Core.Metadata
         {
             { "empty-header", "" }
         };
         
-        await stream.SendRequestHeadersAsync("/test/empty-value", "localhost", metadata);
+        await clientStream.SendRequestHeadersAsync("/test/empty-value", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        var entry = s.RequestHeaders!.Metadata.FirstOrDefault(e => e.Key == "empty-header");
+        Assert.That(entry.Key, Is.EqualTo("empty-header"));
+        Assert.That(entry.Values[0].Length, Is.EqualTo(0));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]
@@ -176,17 +236,29 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var binaryPayload = new byte[] { 1, 2, 3, 4 };
+        var clientStream = client.CreateStream();
         var metadata = new Grpc.Core.Metadata
         {
             { "text-header", "text-value" },
-            { "binary-data-bin", new byte[] { 1, 2, 3, 4 } },
+            { "binary-data-bin", binaryPayload },
             { "another-text", "another-value" }
         };
         
-        await stream.SendRequestHeadersAsync("/test/mixed-metadata", "localhost", metadata);
+        await clientStream.SendRequestHeadersAsync("/test/mixed-metadata", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        var serverMeta = s.RequestHeaders!.Metadata;
+        Assert.That(serverMeta, Has.Count.GreaterThanOrEqualTo(3));
+        Assert.That(Encoding.UTF8.GetString(serverMeta.First(e => e.Key == "text-header").Values[0]), Is.EqualTo("text-value"));
+        Assert.That(serverMeta.First(e => e.Key == "binary-data-bin").Values[0], Is.EqualTo(binaryPayload));
+        Assert.That(Encoding.UTF8.GetString(serverMeta.First(e => e.Key == "another-text").Values[0]), Is.EqualTo("another-value"));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]
@@ -212,12 +284,20 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var clientStream = client.CreateStream();
         
         // Null metadata should be fine (no custom headers)
-        await stream.SendRequestHeadersAsync("/test/null-metadata", "localhost", null);
+        await clientStream.SendRequestHeadersAsync("/test/null-metadata", "localhost", null);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        Assert.That(s.RequestHeaders, Is.Not.Null);
+        Assert.That(s.RequestHeaders!.Metadata, Has.Count.EqualTo(0));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]
@@ -230,12 +310,20 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var clientStream = client.CreateStream();
         var metadata = new Grpc.Core.Metadata();
         
-        await stream.SendRequestHeadersAsync("/test/empty-metadata", "localhost", metadata);
+        await clientStream.SendRequestHeadersAsync("/test/empty-metadata", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        Assert.That(s.RequestHeaders, Is.Not.Null);
+        Assert.That(s.RequestHeaders!.Metadata, Has.Count.EqualTo(0));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]
@@ -248,15 +336,24 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var clientStream = client.CreateStream();
         var metadata = new Grpc.Core.Metadata
         {
             { "special-chars", "value with spaces and !@#$%^&*()" }
         };
         
-        await stream.SendRequestHeadersAsync("/test/special-chars", "localhost", metadata);
+        await clientStream.SendRequestHeadersAsync("/test/special-chars", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        var entry = s.RequestHeaders!.Metadata.FirstOrDefault(e => e.Key == "special-chars");
+        Assert.That(entry.Key, Is.EqualTo("special-chars"));
+        Assert.That(Encoding.UTF8.GetString(entry.Values[0]), Is.EqualTo("value with spaces and !@#$%^&*()"));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]
@@ -269,15 +366,24 @@ public class MetadataTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 10);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var stream = client.CreateStream();
+        var clientStream = client.CreateStream();
         var metadata = new Grpc.Core.Metadata
         {
             { "unicode-value", "Hello 世界 🌍" }
         };
         
-        await stream.SendRequestHeadersAsync("/test/unicode", "localhost", metadata);
+        await clientStream.SendRequestHeadersAsync("/test/unicode", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
         
-        Assert.Pass();
+        var serverStream = await server.AcceptStreamAsync();
+        Assert.That(serverStream, Is.Not.Null);
+        using var s = serverStream!;
+        
+        var entry = s.RequestHeaders!.Metadata.FirstOrDefault(e => e.Key == "unicode-value");
+        Assert.That(entry.Key, Is.EqualTo("unicode-value"));
+        Assert.That(Encoding.UTF8.GetString(entry.Values[0]), Is.EqualTo("Hello 世界 🌍"));
+        
+        await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
 
     [Test]

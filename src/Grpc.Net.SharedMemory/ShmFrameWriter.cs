@@ -46,6 +46,40 @@ internal sealed class ShmFrameWriter : IDisposable
         public StrongBox<bool>? CancelFlag; // shared with caller; true = skip this entry
     }
 
+    /// <summary>
+    /// Pooled signal+cancelFlag pair for EnqueueZeroCopyAndWait.
+    /// Avoids per-message MRES+StrongBox allocation on the large-
+    /// streaming hot path. Up to ~maxConcurrentStreams entries cached.
+    /// </summary>
+    private sealed class WaitToken
+    {
+        public readonly ManualResetEventSlim Signal = new(false);
+        public readonly StrongBox<bool> CancelFlag = new(false);
+
+        public void Reset()
+        {
+            Signal.Reset();
+            Volatile.Write(ref CancelFlag.Value, false);
+        }
+    }
+
+    private readonly ConcurrentBag<WaitToken> _waitTokenPool = new();
+
+    private WaitToken RentWaitToken()
+    {
+        if (_waitTokenPool.TryTake(out var token))
+        {
+            token.Reset();
+            return token;
+        }
+        return new WaitToken();
+    }
+
+    private void ReturnWaitToken(WaitToken token)
+    {
+        _waitTokenPool.Add(token);
+    }
+
     private readonly ShmRing _ring;
     private readonly ConcurrentQueue<FrameEntry> _queue;
     private readonly ConcurrentQueue<FrameEntry> _controlQueue; // WindowUpdate/Ping/Pong bypass Messages
@@ -55,7 +89,7 @@ internal sealed class ShmFrameWriter : IDisposable
     private readonly Task _writerTask;
     private readonly CancellationTokenSource _cts;
     private readonly CancellationToken _ct;
-    private bool _disposed;
+    private int _disposed;
 
     // Inline write: handler submits a write callback to be executed on the
     // WriterLoop thread, avoiding concurrent ring access entirely.
@@ -68,6 +102,7 @@ internal sealed class ShmFrameWriter : IDisposable
     private volatile bool _paused;
     private int _inlineWriterActive;
     private volatile bool _idleInWait;
+    private volatile bool _singleStreamMode;
 
     public ShmFrameWriter(ShmRing ring, CancellationTokenSource cts)
     {
@@ -89,6 +124,15 @@ internal sealed class ShmFrameWriter : IDisposable
     }
 
     /// <summary>
+    /// Enables singleStreamMode: ResumeWriterLoop won't wake WriterLoop,
+    /// letting it stay in Phase 3 idle. Next TryPause succeeds instantly
+    /// without the kernel wake + Phase 2 spin overhead (~120µs saved).
+    /// Control frames (Ping/Pong) still wake WriterLoop via Enqueue's
+    /// _readySignal.Set() check.
+    /// </summary>
+    internal void EnableSingleStreamMode() => _singleStreamMode = true;
+
+    /// <summary>
     /// Enqueues a frame by defensively copying the payload into a pooled buffer.
     /// The copy is written to the ring and the buffer returned to the pool by
     /// the dedicated writer thread.
@@ -101,9 +145,22 @@ internal sealed class ShmFrameWriter : IDisposable
         ReadOnlyMemory<byte> mem = default;
         if (len > 0)
         {
-            buf = ArrayPool<byte>.Shared.Rent(len);
-            payload.CopyTo(buf);
-            mem = buf.AsMemory(0, len);
+            // Small payloads (control frames like Ping/Pong ≤ 64B):
+            // allocate a small byte[] directly — cheaper than ArrayPool
+            // rent/return overhead. ReturnToPool stays null so FlushBatch
+            // won't call ArrayPool.Return for these tiny arrays.
+            if (len <= 64)
+            {
+                var small = new byte[len];
+                payload.CopyTo(small);
+                mem = small.AsMemory(0, len);
+            }
+            else
+            {
+                buf = ArrayPool<byte>.Shared.Rent(len);
+                payload.CopyTo(buf);
+                mem = buf.AsMemory(0, len);
+            }
         }
 
         if (_completed)
@@ -133,7 +190,7 @@ internal sealed class ShmFrameWriter : IDisposable
         // Late enqueues (after _completed is set) are handled by the three
         // drain layers in WriterLoop + Dispose — no dequeue here to avoid
         // accidentally consuming another thread's frame from the queue head.
-        if (Volatile.Read(ref _waiting) != 0 && !_disposed)
+        if (Volatile.Read(ref _waiting) != 0 && _disposed == 0)
         {
             try { _readySignal.Set(); } catch (ObjectDisposedException) { }
         }
@@ -165,7 +222,7 @@ internal sealed class ShmFrameWriter : IDisposable
             ReturnToPool = pooledBuffer
         });
 
-        if (Volatile.Read(ref _waiting) != 0 && !_disposed)
+        if (Volatile.Read(ref _waiting) != 0 && _disposed == 0)
         {
             try { _readySignal.Set(); } catch (ObjectDisposedException) { }
         }
@@ -185,18 +242,17 @@ internal sealed class ShmFrameWriter : IDisposable
             throw new InvalidOperationException("Frame writer has been disposed.");
         }
 
-        var signal = new ManualResetEventSlim(false);
-        var cancelFlag = new StrongBox<bool>(false);
+        var token = RentWaitToken();
         _queue.Enqueue(new FrameEntry
         {
             Type = type, StreamId = streamId, Flags = flags,
             Length = payload.Length, Payload = payload,
             ReturnToPool = null,
-            CompletionSignal = signal,
-            CancelFlag = cancelFlag
+            CompletionSignal = token.Signal,
+            CancelFlag = token.CancelFlag
         });
 
-        if (Volatile.Read(ref _waiting) != 0 && !_disposed)
+        if (Volatile.Read(ref _waiting) != 0 && _disposed == 0)
         {
             try { _readySignal.Set(); } catch (ObjectDisposedException) { }
         }
@@ -204,23 +260,19 @@ internal sealed class ShmFrameWriter : IDisposable
         // Block until WriterLoop has written the data to the ring.
         try
         {
-            if (!signal.Wait(5000, cancellationToken))
-            {
-                signal.Wait(cancellationToken);
-            }
+            token.Signal.Wait(cancellationToken);
         }
         catch (OperationCanceledException)
         {
-            // Mark the queued entry so the writer thread skips it.
-            // This prevents a cancelled message from hitting the wire
-            // and avoids flow-control skew (caller restores _sendWindow).
-            Volatile.Write(ref cancelFlag.Value, true);
+            Volatile.Write(ref token.CancelFlag.Value, true);
+#pragma warning disable CA2016
+            try { token.Signal.Wait(); }
+            catch (ObjectDisposedException) { /* writer already done */ }
+#pragma warning restore CA2016
+            ReturnWaitToken(token);
             throw;
         }
-        finally
-        {
-            signal.Dispose();
-        }
+        ReturnWaitToken(token);
     }
 
     private void WriterLoop()
@@ -244,7 +296,15 @@ internal sealed class ShmFrameWriter : IDisposable
                     // (e.g., WindowUpdate that arrived during handler setup).
                     if (!_controlQueue.IsEmpty)
                         DrainControlFrames();
-                    inlineAction();
+                    try
+                    {
+                        inlineAction();
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"WriterLoop inline action failed: {ex.Message}");
+                    }
                     _inlineSignal.Set();
                     continue;
                 }
@@ -436,7 +496,13 @@ internal sealed class ShmFrameWriter : IDisposable
             {
                 if (batch[i].ReturnToPool != null)
                     ArrayPool<byte>.Shared.Return(batch[i].ReturnToPool!);
-                batch[i].CompletionSignal?.Set();
+                var sig = batch[i].CompletionSignal;
+                if (sig != null)
+                {
+                    // Signal the waiting caller. Do NOT dispose — the signal
+                    // belongs to a pooled WaitToken, returned by the caller.
+                    sig.Set();
+                }
                 batch[i] = default;
             }
         }
@@ -491,7 +557,7 @@ internal sealed class ShmFrameWriter : IDisposable
         // the lost-wake entirely. Phase 2 spin + FlushBatch ignore Set()
         // (ManualResetEventSlim stays set until Reset in Phase 3, which
         // re-checks _inlineAction before Wait).
-        if (!_disposed)
+        if (_disposed == 0)
         {
             try { _readySignal.Set(); } catch (ObjectDisposedException) { }
         }
@@ -531,6 +597,16 @@ internal sealed class ShmFrameWriter : IDisposable
     {
         _paused = false;
         Volatile.Write(ref _inlineWriterActive, 0);
+
+        // In singleStreamMode with an empty queue, skip the wake —
+        // WriterLoop stays in Phase 3 idle for instant next TryPause.
+        // But if frames were enqueued while paused (other streams or
+        // control frames), we MUST wake WriterLoop to process them.
+        // Without this, s=16 concurrent streams regress 56% because
+        // queue consumers find WriterLoop asleep with no signal coming.
+        if (_singleStreamMode && _queue.IsEmpty && _controlQueue.IsEmpty)
+            return;
+
         try { _readySignal.Set(); } catch (ObjectDisposedException) { }
     }
 
@@ -558,62 +634,209 @@ internal sealed class ShmFrameWriter : IDisposable
     }
 
     /// <summary>
-    /// Tries to serialize a protobuf message directly into the ring buffer,
-    /// avoiding the intermediate ArrayPool buffer and memcpy. Pre-checks that
-    /// enough contiguous ring space exists so ReserveWrite won't wrap around.
-    /// If the ring would wrap, returns false immediately (no PAD frame, no
-    /// side effects) — the caller falls back to WriteInline.
-    /// Caller MUST have called PauseWriterLoop first (sole writer guarantee).
+    /// Serializes a protobuf message directly into the ring buffer as one or
+    /// more frames, bypassing any intermediate byte[] buffer. A custom
+    /// <see cref="RingFrameStream"/> feeds <see cref="CodedOutputStream"/>
+    /// writes into per-frame ring reservations. Each frame is committed as
+    /// it fills, allowing the reader to start processing early and freeing
+    /// ring space for subsequent frames. Works for all message sizes —
+    /// single-frame and multi-frame are handled uniformly.
+    /// Caller MUST have called TryPauseWriterLoop first.
     /// </summary>
-    internal bool TryWriteInlineDirect(uint streamId, int payloadSize, IMessage message, byte extraFlags, CancellationToken ct)
+    internal void WriteInlineDirectMultiFrame(uint streamId, int payloadSize, IMessage message, byte extraFlags, CancellationToken ct)
     {
-        var cap = (int)_ring.Capacity;
-        var maxFramePayload = Math.Max(1, cap / 4 - ShmConstants.FrameHeaderSize);
-
-        if (payloadSize > maxFramePayload)
-            return false;
-
-        var totalSize = ShmConstants.FrameHeaderSize + payloadSize;
-
-        // Drain queued frames first (response Headers etc.) so that
-        // space consumed by pending queue entries is freed before the
-        // contiguity check. Without this, the precheck may reject a
-        // direct-to-ring write that would succeed after draining.
         DrainAllQueued();
 
-        // Check contiguity after drain.
-        if (!_ring.HasContiguousWriteSpace(totalSize))
-            return false;
+        var cap = (int)_ring.Capacity;
+        var maxFramePayload = Math.Max(1, cap / 3);
 
-        var reservation = _ring.ReserveWrite(totalSize, ct);
-        if (!reservation.Second.IsEmpty)
-            return false; // lost contiguity — very rare
+        // Unified path for all sizes: RingFrameStream manages per-frame
+        // ReserveWrite/CommitWrite, handling single-frame and multi-frame
+        // transparently. COS buffer capped at 64KB to stay below LOH
+        // threshold (85KB) — avoids per-message LOH allocation while
+        // keeping flush overhead low (~256 flushes per 16MB frame).
+        var cosBuffer = Math.Max(256, Math.Min(payloadSize, 65536));
+        using var rfs = new RingFrameStream(_ring, streamId, payloadSize, maxFramePayload, extraFlags, ct);
+        using var cos = new CodedOutputStream(rfs, bufferSize: cosBuffer);
+        message.WriteTo(cos);
+        cos.Flush();
+        rfs.CommitFinalFrame();
+    }
 
-        // Write frame header.
-        var isLast = (extraFlags & MessageFlags.More) == 0;
-        var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
-        var header = new FrameHeader(FrameType.Message, streamId, (uint)payloadSize, flags);
-        Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
-        header.EncodeTo(headerBytes);
-        headerBytes.CopyTo(reservation.First.Span);
+    /// <summary>
+    /// A write-only <see cref="Stream"/> that feeds <see cref="CodedOutputStream"/>
+    /// data directly into the ring buffer, splitting across frame boundaries
+    /// automatically. Each frame is reserved, header-stamped, and committed
+    /// independently so the reader can pipeline consumption.
+    /// </summary>
+    private sealed class RingFrameStream : Stream
+    {
+        private readonly ShmRing _ring;
+        private readonly uint _streamId;
+        private readonly int _maxFramePayload;
+        private readonly byte _extraFlags;
+        private readonly CancellationToken _ct;
+        private int _remainingPayload;     // total protobuf bytes left to write
+        private int _currentFrameCapacity; // payload capacity of current frame
+        private int _currentFrameWritten;  // bytes written into current frame payload
+        private WriteReservation _currentReservation;
+        private bool _reservationActive;
 
-        // Zero-copy: serialize directly into ring memory via CodedOutputStream
-        // backed by an UnmanagedMemoryStream over the ring's mapped pointer.
-        var payloadSlice = reservation.First.Slice(ShmConstants.FrameHeaderSize, payloadSize);
-        using (var pin = payloadSlice.Pin())
+        public RingFrameStream(ShmRing ring, uint streamId, int totalPayload,
+            int maxFramePayload, byte extraFlags, CancellationToken ct)
         {
-            unsafe
+            _ring = ring;
+            _streamId = streamId;
+            _maxFramePayload = maxFramePayload;
+            _extraFlags = extraFlags;
+            _ct = ct;
+            _remainingPayload = totalPayload;
+            ReserveNextFrame();
+        }
+
+        private void ReserveNextFrame()
+        {
+            var chunkPayload = Math.Min(_maxFramePayload, _remainingPayload);
+            var totalSize = ShmConstants.FrameHeaderSize + chunkPayload;
+            _currentReservation = _ring.ReserveWrite(totalSize, _ct);
+            _currentFrameCapacity = chunkPayload;
+            _currentFrameWritten = 0;
+            _reservationActive = true;
+
+            // Write frame header. We know the payload size upfront.
+            var isLastFrame = (chunkPayload >= _remainingPayload);
+            var isLast = isLastFrame && (_extraFlags & MessageFlags.More) == 0;
+            byte flags;
+            if (isLast)
+                flags = _extraFlags;
+            else
+                flags = (byte)(MessageFlags.More | _extraFlags);
+            var header = new FrameHeader(FrameType.Message, _streamId, (uint)chunkPayload, flags);
+            Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+            header.EncodeTo(headerBytes);
+
+            // Write header to reservation (may wrap).
+            WriteToReservation(_currentReservation, 0, headerBytes);
+        }
+
+        /// <summary>Commits the current frame after all payload bytes have been written.</summary>
+        internal void CommitFinalFrame()
+        {
+            if (_reservationActive)
             {
-                using var ums = new System.IO.UnmanagedMemoryStream(
-                    (byte*)pin.Pointer, 0, payloadSize, System.IO.FileAccess.Write);
-                using var cos = new CodedOutputStream(ums);
-                message.WriteTo(cos);
-                cos.Flush();
+                var totalSize = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                _ring.CommitWrite(_currentReservation, totalSize);
+                _reservationActive = false;
             }
         }
 
-        _ring.CommitWrite(reservation, totalSize);
-        return true;
+        public override void Write(byte[] buffer, int offset, int count)
+            => Write(buffer.AsSpan(offset, count));
+
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            while (buffer.Length > 0)
+            {
+                var spaceInFrame = _currentFrameCapacity - _currentFrameWritten;
+                if (spaceInFrame <= 0)
+                {
+                    // Current frame full — commit and reserve next.
+                    // Do NOT use BeginBatchWrite here: the next ReserveWrite
+                    // may WaitForSpace, which needs the reader to consume
+                    // data. If the OS signal is deferred, the reader may be
+                    // blocked in a kernel wait and never see the data →
+                    // deadlock. Each per-frame signal costs ~10µs (futex
+                    // wake), negligible for multi-frame messages (≥16MB).
+                    var totalSize = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                    _ring.CommitWrite(_currentReservation, totalSize);
+                    _remainingPayload -= _currentFrameWritten;
+                    _reservationActive = false;
+                    ReserveNextFrame();
+                    spaceInFrame = _currentFrameCapacity;
+                }
+
+                var toCopy = Math.Min(buffer.Length, spaceInFrame);
+                var writeOffset = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                WriteToReservation(_currentReservation, writeOffset, buffer[..toCopy]);
+                _currentFrameWritten += toCopy;
+                buffer = buffer[toCopy..];
+            }
+        }
+
+        /// <summary>
+        /// Writes data into a reservation at a given byte offset, handling
+        /// the First/Second wrap-around split.
+        /// </summary>
+        private static void WriteToReservation(WriteReservation reservation, int offset, ReadOnlySpan<byte> data)
+        {
+            var firstLen = reservation.First.Length;
+            if (offset < firstLen)
+            {
+                var available = firstLen - offset;
+                if (data.Length <= available)
+                {
+                    data.CopyTo(reservation.First.Span.Slice(offset));
+                }
+                else
+                {
+                    data[..available].CopyTo(reservation.First.Span.Slice(offset));
+                    data[available..].CopyTo(reservation.Second.Span);
+                }
+            }
+            else
+            {
+                var secondOffset = offset - firstLen;
+                data.CopyTo(reservation.Second.Span.Slice(secondOffset));
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            // If an exception interrupted WriteTo/Flush, we have an
+            // uncommitted reservation with a header stamped for the
+            // full planned payload but only partial data written.
+            // We must NOT commit it as-is: the reader reads by header
+            // length, so it would block waiting for bytes that will
+            // never arrive, or interpret following data as this frame's
+            // tail — corrupting the connection.
+            //
+            // Instead, rewrite the header with the actual bytes written
+            // and commit only that. The frame contains truncated protobuf
+            // (will fail deserialization), but the ring stays consistent
+            // and the reader can skip/error the frame cleanly.
+            if (disposing && _reservationActive)
+            {
+                try
+                {
+                    // Rewrite header with actual payload length.
+                    var header = new FrameHeader(FrameType.Message, _streamId,
+                        (uint)_currentFrameWritten, _extraFlags);
+                    Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+                    header.EncodeTo(headerBytes);
+                    WriteToReservation(_currentReservation, 0, headerBytes);
+
+                    var written = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                    _ring.CommitWrite(_currentReservation, written);
+                }
+                catch { /* ring may be closed */ }
+                _reservationActive = false;
+            }
+            base.Dispose(disposing);
+        }
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
     }
 
     /// <summary>
@@ -672,9 +895,8 @@ internal sealed class ShmFrameWriter : IDisposable
 
     public void Dispose()
     {
-        if (!_disposed)
-        {
-            _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
 
             // 1. Stop accepting new entries and wake the writer thread.
             _completed = true;
@@ -686,8 +908,13 @@ internal sealed class ShmFrameWriter : IDisposable
             {
                 writerDone = _writerTask.Wait(TimeSpan.FromMilliseconds(500));
             }
-            catch (AggregateException)
+            catch (AggregateException ex) when (ex.InnerException is OperationCanceledException or RingClosedException)
             {
+                writerDone = true;
+            }
+            catch (AggregateException ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ShmFrameWriter.Dispose: writer task faulted: {ex.InnerException?.Message}");
                 writerDone = true; // task faulted — it's done
             }
 
@@ -701,8 +928,13 @@ internal sealed class ShmFrameWriter : IDisposable
                 {
                     writerDone = _writerTask.Wait(TimeSpan.FromMilliseconds(500));
                 }
-                catch (AggregateException)
+                catch (AggregateException ex2) when (ex2.InnerException is OperationCanceledException or RingClosedException)
                 {
+                    writerDone = true;
+                }
+                catch (AggregateException ex2)
+                {
+                    System.Diagnostics.Debug.WriteLine($"ShmFrameWriter.Dispose: writer task faulted after cancel: {ex2.InnerException?.Message}");
                     writerDone = true;
                 }
             }
@@ -741,6 +973,11 @@ internal sealed class ShmFrameWriter : IDisposable
                     ArrayPool<byte>.Shared.Return(lateCtl.ReturnToPool);
                 lateCtl.CompletionSignal?.Set();
             }
-        }
+
+            // 6. Dispose pooled wait tokens.
+            while (_waitTokenPool.TryTake(out var token))
+            {
+                token.Signal.Dispose();
+            }
     }
 }

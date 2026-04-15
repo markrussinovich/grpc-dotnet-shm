@@ -128,7 +128,7 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             // Clean up any stale segment
             Segment.TryRemoveSegment(segmentName);
 
-            Segment dataSegment;
+            Segment? dataSegment = null;
             try
             {
                 dataSegment = Segment.Create(segmentName, negotiatedRing, _maxStreams);
@@ -136,6 +136,8 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             }
             catch (Exception ex)
             {
+                dataSegment?.Dispose();
+                Segment.TryRemoveSegment(segmentName);
                 await SendRejectAsync($"Failed to create segment: {ex.Message}", ct).ConfigureAwait(false);
                 continue;
             }

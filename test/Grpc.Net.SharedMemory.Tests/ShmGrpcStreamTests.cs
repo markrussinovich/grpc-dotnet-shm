@@ -282,6 +282,112 @@ public class ShmGrpcStreamTests
         }
     }
 
+    [Test]
+    [Timeout(60000)]
+    public async Task UnaryLargePayload_256MB_RawRing_DataIntegrity()
+    {
+        // Reproduce 256MB hang: raw ring write/read to isolate from protobuf/ShmGrpcServer.
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        const int payloadSize = 256 * 1024 * 1024; // exactly 4 × ringCapacity
+
+        using var serverConn = ShmConnection.CreateAsServer(name, ringCapacity: 64 * 1024 * 1024, maxStreams: 100);
+        using var clientConn = ShmConnection.ConnectAsClient(name);
+
+        var requestPayload = new byte[payloadSize];
+        new Random(42).NextBytes(requestPayload);
+
+        var serverTask = Task.Run(async () =>
+        {
+            var stream = await serverConn.AcceptStreamAsync();
+            using var s = stream!;
+            await s.SendResponseHeadersAsync();
+            byte[]? msg = null;
+            await foreach (var m in s.ReceiveMessagesAsync())
+                msg = m;
+            // Echo back the same 256MB
+            await s.SendMessageAsync(msg!);
+            await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
+        });
+
+        using var cs = clientConn.CreateStream();
+        await cs.SendRequestHeadersAsync("/test/Echo256M", "localhost");
+        await cs.SendMessageAsync(requestPayload);
+        await cs.SendHalfCloseAsync();
+        await cs.ReceiveResponseHeadersAsync();
+
+        byte[]? resp = null;
+        await foreach (var m in cs.ReceiveMessagesAsync())
+            resp = m;
+
+        await serverTask;
+
+        Assert.That(resp, Is.Not.Null);
+        Assert.That(resp!.Length, Is.EqualTo(payloadSize));
+        Assert.That(resp.AsSpan(0, 1024).SequenceEqual(requestPayload.AsSpan(0, 1024)), Is.True);
+        Assert.That(resp.AsSpan(payloadSize - 1024).SequenceEqual(requestPayload.AsSpan(payloadSize - 1024)), Is.True);
+    }
+
+    [Test]
+    [Timeout(60000)]
+    public async Task MultiStream_1MB_ConcurrentEcho_DataIntegrity()
+    {
+        // Reproduce stream 1M s=4 crash: 4 concurrent streams on one connection.
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        const int payloadSize = 1024 * 1024;
+        const int streamCount = 4;
+
+        using var serverConn = ShmConnection.CreateAsServer(name, ringCapacity: 64 * 1024 * 1024, maxStreams: 100);
+        using var clientConn = ShmConnection.ConnectAsClient(name);
+
+        var serverTask = Task.Run(async () =>
+        {
+            for (int i = 0; i < streamCount; i++)
+            {
+                var stream = await serverConn.AcceptStreamAsync();
+                _ = Task.Run(async () =>
+                {
+                    using var s = stream!;
+                    await s.SendResponseHeadersAsync();
+                    byte[]? msg = null;
+                    await foreach (var m in s.ReceiveMessagesAsync())
+                        msg = m;
+                    if (msg != null)
+                        await s.SendMessageAsync(msg);
+                    await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
+                });
+            }
+        });
+
+        var tasks = new Task[streamCount];
+        for (int i = 0; i < streamCount; i++)
+        {
+            var idx = i;
+            tasks[i] = Task.Run(async () =>
+            {
+                var payload = new byte[payloadSize];
+                new Random(idx + 1).NextBytes(payload);
+
+                using var cs = clientConn.CreateStream();
+                await cs.SendRequestHeadersAsync($"/test/Echo{idx}", "localhost");
+                await cs.SendMessageAsync(payload);
+                await cs.SendHalfCloseAsync();
+                await cs.ReceiveResponseHeadersAsync();
+
+                byte[]? resp = null;
+                await foreach (var m in cs.ReceiveMessagesAsync())
+                    resp = m;
+
+                Assert.That(resp, Is.Not.Null, $"Stream {idx}: no response");
+                Assert.That(resp!.Length, Is.EqualTo(payloadSize), $"Stream {idx}: length mismatch");
+                Assert.That(resp.AsSpan(0, 64).SequenceEqual(payload.AsSpan(0, 64)), Is.True,
+                    $"Stream {idx}: data mismatch at start");
+            });
+        }
+
+        await Task.WhenAll(tasks);
+        await serverTask;
+    }
+
     private static int FindFirstMismatch(byte[] a, byte[] b)
     {
         var len = Math.Min(a.Length, b.Length);

@@ -83,6 +83,43 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// </summary>
     internal byte[]? CachedWriteBuffer;
 
+    /// <summary>
+    /// Per-connection reusable read/assembly buffer for multi-frame messages.
+    /// Used by server-side ReadSingleMessageAsync and client-side
+    /// ShmControlResponseContent to avoid repeated LOH allocations
+    /// (ArrayPool.Rent/Return of 64MB+ buffers) on every Unary call.
+    /// Access via BorrowReadBuffer/ReturnReadBuffer for thread safety.
+    /// </summary>
+    private byte[]? _cachedReadBuffer;
+
+    /// <summary>
+    /// Max buffer size to cache. Set to ring capacity so assembled buffers
+    /// for messages up to ring capacity (the common case) are reused across
+    /// calls. Messages exceeding ring capacity (e.g. 256MB on a 64MB ring)
+    /// require multi-round-trip assembly and produce oversized buffers that
+    /// are returned to ArrayPool to avoid inflating idle connection RSS.
+    /// </summary>
+    private readonly int _maxCachedReadBufferSize;
+
+    /// <summary>Atomically borrows the cached read buffer (may return null).</summary>
+    internal byte[]? BorrowReadBuffer()
+        => Interlocked.Exchange(ref _cachedReadBuffer, null);
+
+    /// <summary>
+    /// Returns a buffer to the cache. If the cache already has a buffer
+    /// (concurrent return) or the buffer exceeds the size cap, the buffer
+    /// is returned to ArrayPool instead.
+    /// </summary>
+    internal void ReturnReadBuffer(byte[]? buffer)
+    {
+        if (buffer == null) return;
+        if (buffer.Length > _maxCachedReadBufferSize
+            || Interlocked.CompareExchange(ref _cachedReadBuffer, buffer, null) != null)
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
     // Keepalive (A73 RFC)
     private readonly ShmKeepaliveOptions _keepaliveOptions;
     private readonly ShmKeepaliveEnforcementPolicy? _enforcementPolicy;
@@ -254,6 +291,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // SendFrame → _frameWriter.Enqueue. If the writer isn't initialized
         // yet, that's a NullReferenceException.
         _frameWriter = new ShmFrameWriter(TxRing, _disposeCts);
+
+        // Cache read buffers up to maxFramePayload (cap/3) — covers
+        // single-frame messages (4MB, 16MB). Larger assembled buffers
+        // from multi-frame messages go back to ArrayPool.
+        _maxCachedReadBufferSize = (int)TxRing.Capacity;
 
         // Start background frame reader
         _frameReaderTask = FrameReaderLoopAsync();
@@ -467,7 +509,20 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 {
                     var (header, payload) = FrameProtocol.ReadFramePayload(
                         RxRing, _disposeCts.Token, zeroCopy: ZeroCopyRead);
-                    ProcessFrame(header, payload);
+                    try
+                    {
+                        ProcessFrame(header, payload);
+                    }
+                    catch (Exception ex)
+                    {
+                        // ProcessFrame exceptions (e.g., from event handlers or
+                        // HandleHeadersFrame) must not kill the reader loop.
+                        // Log and continue — the individual stream may be
+                        // broken but other streams and control frames (Ping,
+                        // GoAway) must keep flowing.
+                        System.Diagnostics.Debug.WriteLine(
+                            $"ShmConnection.ProcessFrame error: {ex.Message}");
+                    }
                 }
 
                 tcs.TrySetResult();
@@ -546,8 +601,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 var message = payloadLength > 0
                     ? System.Text.Encoding.UTF8.GetString(payloadMemory.Span.Slice(0, payloadLength))
                     : null;
+                payload.Release(); // Release before invoking user callback to prevent leak on throw.
                 GoAwayReceived?.Invoke(this, new GoAwayEventArgs(header.Flags, message));
-                payload.Release();
                 break;
 
             case FrameType.WindowUpdate:
@@ -603,7 +658,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             }
 
             // Check if draining
-            if (_draining || _goAwaySent != 0 || _goAwayReceived)
+            if (_draining || Volatile.Read(ref _goAwaySent) != 0 || _goAwayReceived)
             {
                 RejectStream(streamId, "transport is draining");
                 payload.Release();
@@ -652,44 +707,46 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // channel. TryWrite should always succeed with this capacity.
             if (!_incomingStreamsChannel.Writer.TryWrite(newStream))
             {
-                // Should not happen with 2x capacity. If it does, wait briefly
-                // then fail-fast: reject the stream so the client gets an error
-                // instead of hanging in an orphaned state.
-                // Use a dedicated CTS with timeout so the WriteAsync is cancelled
-                // on timeout — not left orphaned. An uncancelled WriteAsync could
-                // enqueue the stream later, after we've already rejected it.
-                var written = false;
-                try
-                {
-                    using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_disposeCts.Token);
-                    timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(500));
-                    _incomingStreamsChannel.Writer.WriteAsync(newStream, timeoutCts.Token)
-                        .AsTask().GetAwaiter().GetResult();
-                    written = true;
-                }
-                catch { /* disposed, cancelled, or timed out */ }
-
-                if (!written)
-                {
-                    // Remove from _streams, dispose, and reject — the stream was
-                    // accepted into _streams but never delivered to AcceptStreamsAsync.
-                    // Dispose drains queued inbound frames and releases any borrowed
-                    // ring space they may hold.
-                    if (_streams.TryRemove(streamId, out var orphaned))
-                    {
-                        orphaned.Dispose();
-                    }
-
-                    RejectStream(streamId, "server overloaded");
-                    return;
-                }
+                // Channel transiently full. Fire-and-forget async delivery
+                // to avoid blocking the frame-reader thread (which would
+                // stall all inbound frame processing — HOL blocking).
+                // StreamReceived is raised inside DeliverStreamAsync only
+                // after successful delivery, so subscribers never see
+                // a stream that is later rejected.
+                _ = DeliverStreamAsync(newStream, streamId);
             }
-
-            StreamReceived?.Invoke(this, new StreamReceivedEventArgs(newStream));
+            else
+            {
+                StreamReceived?.Invoke(this, new StreamReceivedEventArgs(newStream));
+            }
         }
         else
         {
             payload.Release();
+        }
+    }
+
+    /// <summary>
+    /// Async fallback for stream delivery when the channel is transiently full.
+    /// Runs on the thread pool — keeps the frame-reader thread unblocked.
+    /// </summary>
+    private async Task DeliverStreamAsync(ShmGrpcStream newStream, uint streamId)
+    {
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_disposeCts.Token);
+            timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(500));
+            await _incomingStreamsChannel.Writer.WriteAsync(newStream, timeoutCts.Token).ConfigureAwait(false);
+            StreamReceived?.Invoke(this, new StreamReceivedEventArgs(newStream));
+        }
+        catch
+        {
+            // Timed out, disposed, or cancelled — reject the stream.
+            if (_streams.TryRemove(streamId, out var orphaned))
+            {
+                orphaned.Dispose();
+            }
+            RejectStream(streamId, "server overloaded");
         }
     }
 
@@ -738,19 +795,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// remote side (see ProcessFrame) for interop with implementations
     /// that enforce connection-level send quota.
     /// </summary>
-    internal void AddSendQuota(uint streamId, uint delta)
+    internal static void AddSendQuota(uint streamId, uint delta)
     {
-        if (streamId == 0)
-        {
-            // Connection-level: accepted but not enforced locally.
-            return;
-        }
-
-        // Stream-level - route to stream
-        if (_streams.TryGetValue(streamId, out var stream))
-        {
-            stream.OnWindowUpdate(delta);
-        }
+        // No-op: per-stream flow control is disabled.
+        // Ring WaitForSpace provides back-pressure.
     }
 
     /// <summary>
@@ -871,7 +919,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
     private void ThrowIfGoAway()
     {
-        if (_goAwaySent != 0 || _goAwayReceived)
+        if (Volatile.Read(ref _goAwaySent) != 0 || _goAwayReceived)
         {
             throw new InvalidOperationException("Connection is being closed due to GoAway");
         }
@@ -887,14 +935,15 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         _frameWriter?.Dispose();
 
-        // Return cached write buffer to pool.
         if (CachedWriteBuffer != null)
         {
             ArrayPool<byte>.Shared.Return(CachedWriteBuffer);
             CachedWriteBuffer = null;
         }
+        var cachedRead = Interlocked.Exchange(ref _cachedReadBuffer, null);
+        if (cachedRead != null) ArrayPool<byte>.Shared.Return(cachedRead);
 
-        if (_goAwaySent == 0)
+        if (Volatile.Read(ref _goAwaySent) == 0)
         {
             Interlocked.Exchange(ref _goAwaySent, 1);
             try
@@ -910,16 +959,19 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _incomingStreamsChannel.Writer.TryComplete();
         _disposeCts.Cancel();
 
-        try { _frameReaderTask.Wait(TimeSpan.FromMilliseconds(500)); } catch { }
+        try { _frameReaderTask.Wait(TimeSpan.FromMilliseconds(500)); }
+        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.Dispose: frame reader: {ex.Message}"); }
 
         if (_keepaliveTask != null)
         {
-            try { _keepaliveTask.Wait(TimeSpan.FromMilliseconds(200)); } catch { }
+            try { _keepaliveTask.Wait(TimeSpan.FromMilliseconds(200)); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.Dispose: keepalive: {ex.Message}"); }
         }
 
         foreach (var stream in _streams.Values)
         {
-            try { stream.Dispose(); } catch { }
+            try { stream.Dispose(); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.Dispose: stream {stream.StreamId}: {ex.Message}"); }
         }
         _streams.Clear();
 
@@ -942,8 +994,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             ArrayPool<byte>.Shared.Return(CachedWriteBuffer);
             CachedWriteBuffer = null;
         }
+        var cachedRead2 = Interlocked.Exchange(ref _cachedReadBuffer, null);
+        if (cachedRead2 != null) ArrayPool<byte>.Shared.Return(cachedRead2);
 
-        if (_goAwaySent == 0)
+        if (Volatile.Read(ref _goAwaySent) == 0)
         {
             Interlocked.Exchange(ref _goAwaySent, 1);
             try
@@ -959,16 +1013,19 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _incomingStreamsChannel.Writer.TryComplete();
         _disposeCts.Cancel();
 
-        try { await _frameReaderTask.WaitAsync(TimeSpan.FromMilliseconds(500)); } catch { }
+        try { await _frameReaderTask.WaitAsync(TimeSpan.FromMilliseconds(500)); }
+        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.DisposeAsync: frame reader: {ex.Message}"); }
 
         if (_keepaliveTask != null)
         {
-            try { await _keepaliveTask.WaitAsync(TimeSpan.FromMilliseconds(200)); } catch { }
+            try { await _keepaliveTask.WaitAsync(TimeSpan.FromMilliseconds(200)); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.DisposeAsync: keepalive: {ex.Message}"); }
         }
 
         foreach (var stream in _streams.Values)
         {
-            try { await stream.DisposeAsync(); } catch { }
+            try { await stream.DisposeAsync(); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.DisposeAsync: stream {stream.StreamId}: {ex.Message}"); }
         }
         _streams.Clear();
 

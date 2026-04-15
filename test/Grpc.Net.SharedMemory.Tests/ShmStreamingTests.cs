@@ -29,9 +29,6 @@ namespace Grpc.Net.SharedMemory.Tests;
 [TestFixture]
 public class ShmStreamingTests
 {
-    // Big enough to hit flow control if not immediately read by peer
-    private const int BigMessageSize = 1024 * 1024;
-    
     [Test]
     [Timeout(30000)]
     public async Task DuplexStream_SendLargeFileBatched_Success()
@@ -43,19 +40,23 @@ public class ShmStreamingTests
         using var server = ShmConnection.CreateAsServer(segmentName, 64 * 1024 * 1024, 100);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var receivedData = new MemoryStream();
+        var serverReceivedTotal = 0L;
         
-        // Server task - receives and echoes back
+        // Server task - receives all client batches and responds
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = server.CreateStream();
-            await serverStream.SendResponseHeadersAsync();
+            var serverStream = await server.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            using var s = serverStream!;
             
-            // Simulate receiving and echoing data
-            // In real implementation, this would read from the ring buffer
-            await Task.Delay(500);
+            await s.SendResponseHeadersAsync();
             
-            await serverStream.SendTrailersAsync(StatusCode.OK);
+            await foreach (var msg in s.ReceiveMessagesAsync())
+            {
+                Interlocked.Add(ref serverReceivedTotal, msg.Length);
+            }
+            
+            await s.SendTrailersAsync(StatusCode.OK);
         });
         
         // Client sends in batches
@@ -75,11 +76,16 @@ public class ShmStreamingTests
         }
         
         await clientStream.SendHalfCloseAsync();
+        
+        await clientStream.ReceiveResponseHeadersAsync();
+        await foreach (var _ in clientStream.ReceiveMessagesAsync()) { }
+        
         await serverTask;
         
         // Assert
         Assert.That(clientStream.IsLocalHalfClosed, Is.True);
         Assert.That(sent, Is.EqualTo(data.Length));
+        Assert.That(Interlocked.Read(ref serverReceivedTotal), Is.EqualTo(data.Length));
     }
     
     [Test]
@@ -139,53 +145,62 @@ public class ShmStreamingTests
     {
         // Arrange
         var segmentName = $"streaming_{Guid.NewGuid():N}";
-        var raceDuration = TimeSpan.FromMilliseconds(500);
+        var messageCount = 20;
         
         using var server = ShmConnection.CreateAsServer(segmentName, 8192, 100);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        var clientSent = 0;
-        var serverSent = 0;
+        var serverReceived = new List<string>();
+        var clientReceived = new List<string>();
         
-        // Server task - sends messages while receiving
+        // Server task - reads client messages, then sends responses
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = server.CreateStream();
-            await serverStream.SendResponseHeadersAsync();
+            var serverStream = await server.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            using var s = serverStream!;
             
-            var endTime = DateTime.UtcNow.Add(raceDuration);
-            while (DateTime.UtcNow < endTime)
+            await s.SendResponseHeadersAsync();
+            
+            // Read all client messages
+            await foreach (var msg in s.ReceiveMessagesAsync())
             {
-                await serverStream.SendMessageAsync(Encoding.UTF8.GetBytes($"ServerMsg{serverSent}"));
-                Interlocked.Increment(ref serverSent);
-                await Task.Delay(10);
+                lock (serverReceived)
+                    serverReceived.Add(Encoding.UTF8.GetString(msg));
             }
             
-            await serverStream.SendTrailersAsync(StatusCode.OK);
+            // Send server messages after reading
+            for (int i = 0; i < messageCount; i++)
+            {
+                await s.SendMessageAsync(Encoding.UTF8.GetBytes($"ServerMsg{i}"));
+            }
+            
+            await s.SendTrailersAsync(StatusCode.OK);
         });
         
-        // Client sends while receiving
+        // Client sends messages then reads server responses
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/Race", "localhost");
         
-        var clientTask = Task.Run(async () =>
+        for (int i = 0; i < messageCount; i++)
         {
-            var endTime = DateTime.UtcNow.Add(raceDuration);
-            while (DateTime.UtcNow < endTime)
-            {
-                await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes($"ClientMsg{clientSent}"));
-                Interlocked.Increment(ref clientSent);
-                await Task.Delay(10);
-            }
-            
-            await clientStream.SendHalfCloseAsync();
-        });
+            await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes($"ClientMsg{i}"));
+        }
+        await clientStream.SendHalfCloseAsync();
         
-        await Task.WhenAll(serverTask, clientTask);
+        await clientStream.ReceiveResponseHeadersAsync();
+        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        {
+            clientReceived.Add(Encoding.UTF8.GetString(msg));
+        }
         
-        // Assert - both sides sent messages
-        Assert.That(clientSent, Is.GreaterThan(0));
-        Assert.That(serverSent, Is.GreaterThan(0));
+        await serverTask;
+        
+        // Assert - both sides sent and received messages
+        Assert.That(serverReceived, Has.Count.EqualTo(messageCount));
+        Assert.That(clientReceived, Has.Count.EqualTo(messageCount));
+        Assert.That(serverReceived[0], Is.EqualTo("ClientMsg0"));
+        Assert.That(clientReceived[0], Is.EqualTo("ServerMsg0"));
     }
     
     [Test]
@@ -199,29 +214,45 @@ public class ShmStreamingTests
         using var server = ShmConnection.CreateAsServer(segmentName, 8192, 100);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
+        var clientReceived = new List<string>();
+        
         // Server sends many small messages
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = server.CreateStream();
-            await serverStream.SendResponseHeadersAsync();
+            var serverStream = await server.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            using var s = serverStream!;
+            
+            await s.SendResponseHeadersAsync();
+            
+            // Drain client half-close
+            await foreach (var _ in s.ReceiveMessagesAsync()) { }
             
             for (int i = 0; i < messageCount; i++)
             {
-                await serverStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Message {i}"));
+                await s.SendMessageAsync(Encoding.UTF8.GetBytes($"Message {i}"));
             }
             
-            await serverStream.SendTrailersAsync(StatusCode.OK);
+            await s.SendTrailersAsync(StatusCode.OK);
         });
         
-        // Client receives
+        // Client sends half-close then receives
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/ManyMessages", "localhost");
         await clientStream.SendHalfCloseAsync();
         
+        await clientStream.ReceiveResponseHeadersAsync();
+        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        {
+            clientReceived.Add(Encoding.UTF8.GetString(msg));
+        }
+        
         await serverTask;
         
         // Assert
-        Assert.That(clientStream.IsLocalHalfClosed, Is.True);
+        Assert.That(clientReceived, Has.Count.EqualTo(messageCount));
+        Assert.That(clientReceived[0], Is.EqualTo("Message 0"));
+        Assert.That(clientReceived[99], Is.EqualTo("Message 99"));
     }
     
     [Test]
@@ -235,13 +266,24 @@ public class ShmStreamingTests
         using var server = ShmConnection.CreateAsServer(segmentName, 8192, 100);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        // Server waits
+        var serverReceived = new List<string>();
+        
+        // Server reads all client messages
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = server.CreateStream();
-            await serverStream.SendResponseHeadersAsync();
-            await Task.Delay(200);
-            await serverStream.SendTrailersAsync(StatusCode.OK, $"Received {messageCount} messages");
+            var serverStream = await server.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            using var s = serverStream!;
+            
+            await s.SendResponseHeadersAsync();
+            
+            await foreach (var msg in s.ReceiveMessagesAsync())
+            {
+                lock (serverReceived)
+                    serverReceived.Add(Encoding.UTF8.GetString(msg));
+            }
+            
+            await s.SendTrailersAsync(StatusCode.OK);
         });
         
         // Client sends many messages
@@ -254,10 +296,16 @@ public class ShmStreamingTests
         }
         
         await clientStream.SendHalfCloseAsync();
+        
+        await clientStream.ReceiveResponseHeadersAsync();
+        await foreach (var _ in clientStream.ReceiveMessagesAsync()) { }
+        
         await serverTask;
         
         // Assert
-        Assert.That(clientStream.IsLocalHalfClosed, Is.True);
+        Assert.That(serverReceived, Has.Count.EqualTo(messageCount));
+        Assert.That(serverReceived[0], Is.EqualTo("Client 0"));
+        Assert.That(serverReceived[99], Is.EqualTo("Client 99"));
     }
     
     [Test]
@@ -271,37 +319,55 @@ public class ShmStreamingTests
         using var server = ShmConnection.CreateAsServer(segmentName, 8192, 100);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
-        // Server echoes
+        var serverReceived = new List<string>();
+        var clientReceived = new List<string>();
+        
+        // Server reads all then echoes back
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = server.CreateStream();
-            await serverStream.SendResponseHeadersAsync();
+            var serverStream = await server.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            using var s = serverStream!;
+            
+            await s.SendResponseHeadersAsync();
+            
+            await foreach (var msg in s.ReceiveMessagesAsync())
+            {
+                serverReceived.Add(Encoding.UTF8.GetString(msg));
+            }
             
             for (int i = 0; i < rounds; i++)
             {
-                // Receive one, send one (interleaved)
-                await Task.Delay(10);
-                await serverStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Echo {i}"));
+                await s.SendMessageAsync(Encoding.UTF8.GetBytes($"Echo {i}"));
             }
             
-            await serverStream.SendTrailersAsync(StatusCode.OK);
+            await s.SendTrailersAsync(StatusCode.OK);
         });
         
-        // Client sends/receives
+        // Client sends then reads
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/Interleaved", "localhost");
         
         for (int i = 0; i < rounds; i++)
         {
             await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Request {i}"));
-            await Task.Delay(10);
         }
         
         await clientStream.SendHalfCloseAsync();
+        
+        await clientStream.ReceiveResponseHeadersAsync();
+        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        {
+            clientReceived.Add(Encoding.UTF8.GetString(msg));
+        }
+        
         await serverTask;
         
         // Assert
-        Assert.That(clientStream.IsLocalHalfClosed, Is.True);
+        Assert.That(serverReceived, Has.Count.EqualTo(rounds));
+        Assert.That(clientReceived, Has.Count.EqualTo(rounds));
+        Assert.That(serverReceived[0], Is.EqualTo("Request 0"));
+        Assert.That(clientReceived[0], Is.EqualTo("Echo 0"));
     }
     
     [Test]
@@ -314,16 +380,26 @@ public class ShmStreamingTests
         using var server = ShmConnection.CreateAsServer(segmentName, 4096, 100);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
+        byte[]? serverReceivedMsg = null;
+        byte[]? clientReceivedMsg = null;
+        
         // Server
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = server.CreateStream();
-            await serverStream.SendResponseHeadersAsync();
+            var serverStream = await server.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            using var s = serverStream!;
             
-            // Send empty message
-            await serverStream.SendMessageAsync(Array.Empty<byte>());
+            await s.SendResponseHeadersAsync();
             
-            await serverStream.SendTrailersAsync(StatusCode.OK);
+            await foreach (var msg in s.ReceiveMessagesAsync())
+            {
+                serverReceivedMsg = msg;
+            }
+            
+            // Echo back an empty message
+            await s.SendMessageAsync(Array.Empty<byte>());
+            await s.SendTrailersAsync(StatusCode.OK);
         });
         
         // Client
@@ -332,9 +408,18 @@ public class ShmStreamingTests
         await clientStream.SendMessageAsync(Array.Empty<byte>());
         await clientStream.SendHalfCloseAsync();
         
+        await clientStream.ReceiveResponseHeadersAsync();
+        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        {
+            clientReceivedMsg = msg;
+        }
+        
         await serverTask;
         
-        Assert.Pass("Empty messages handled correctly");
+        Assert.That(serverReceivedMsg, Is.Not.Null);
+        Assert.That(serverReceivedMsg!.Length, Is.EqualTo(0));
+        Assert.That(clientReceivedMsg, Is.Not.Null);
+        Assert.That(clientReceivedMsg!.Length, Is.EqualTo(0));
     }
     
     [Test]
@@ -348,9 +433,32 @@ public class ShmStreamingTests
         using var server = ShmConnection.CreateAsServer(segmentName, 16384, 100);
         using var client = ShmConnection.ConnectAsClient(segmentName);
         
+        var serverReceivedMessages = new string[streamCount];
+        
         var tasks = new List<Task>();
         
-        // Create multiple parallel streams
+        // Server accepts each stream and reads its message
+        for (int i = 0; i < streamCount; i++)
+        {
+            var idx = i;
+            tasks.Add(Task.Run(async () =>
+            {
+                var serverStream = await server.AcceptStreamAsync();
+                Assert.That(serverStream, Is.Not.Null);
+                using var s = serverStream!;
+                
+                await s.SendResponseHeadersAsync();
+                
+                await foreach (var msg in s.ReceiveMessagesAsync())
+                {
+                    serverReceivedMessages[idx] = Encoding.UTF8.GetString(msg);
+                }
+                
+                await s.SendTrailersAsync(StatusCode.OK);
+            }));
+        }
+        
+        // Create multiple parallel client streams
         for (int i = 0; i < streamCount; i++)
         {
             var streamId = i;
@@ -360,23 +468,20 @@ public class ShmStreamingTests
                 await clientStream.SendRequestHeadersAsync($"/test/Parallel/{streamId}", "localhost");
                 await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Stream {streamId}"));
                 await clientStream.SendHalfCloseAsync();
-            }));
-        }
-        
-        // Server handles streams
-        for (int i = 0; i < streamCount; i++)
-        {
-            tasks.Add(Task.Run(async () =>
-            {
-                var serverStream = server.CreateStream();
-                await serverStream.SendResponseHeadersAsync();
-                await serverStream.SendTrailersAsync(StatusCode.OK);
+                
+                await clientStream.ReceiveResponseHeadersAsync();
+                await foreach (var _ in clientStream.ReceiveMessagesAsync()) { }
             }));
         }
         
         await Task.WhenAll(tasks);
         
-        Assert.Pass($"Successfully handled {streamCount} parallel streams");
+        // Assert every server task received a message
+        for (int i = 0; i < streamCount; i++)
+        {
+            Assert.That(serverReceivedMessages[i], Is.Not.Null, $"Server stream {i} received no message");
+            Assert.That(serverReceivedMessages[i], Does.StartWith("Stream "));
+        }
     }
     
     private static byte[] CreateTestData(int size)

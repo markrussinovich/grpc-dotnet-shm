@@ -181,6 +181,28 @@ public class SegmentTests
         Assert.Throws<ArgumentException>(() => Segment.Create(name, ringCapacity: 1000, maxStreams: 100));
     }
 
+    [Test]
+    public async Task WaitForServerAsync_DisposeWhileWaiting_ThrowsObjectDisposedException()
+    {
+        var name = $"grpc_test_{Guid.NewGuid():N}";
+        var segment = Segment.Create(name, ringCapacity: 4096, maxStreams: 100);
+        segment.SetServerReady(false);
+
+        try
+        {
+            var waitTask = segment.WaitForServerAsync();
+            await Task.Delay(20);
+
+            segment.Dispose();
+
+            Assert.That(async () => await waitTask, Throws.InstanceOf<ObjectDisposedException>());
+        }
+        finally
+        {
+            segment.Dispose();
+        }
+    }
+
     // Note: Cross-segment communication tests require proper shared memory implementation
     // which needs unsafe/pointer-based memory access or native interop.
     // Skipping for now - to be implemented in Phase 2.

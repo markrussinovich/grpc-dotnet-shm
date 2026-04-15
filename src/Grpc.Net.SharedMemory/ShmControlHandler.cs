@@ -46,7 +46,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
     private readonly string _baseName;
     private readonly ShmClientTransportOptions _options;
     private readonly ShmConnectionPool? _pool;
-    private bool _disposed;
+    private int _disposed;
 
     // --- Pool-bypass mode (EnableMultipleConnections = false) ---
     // Holds a single direct connection, lazily initialized on first use.
@@ -112,7 +112,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
     /// <inheritdoc/>
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_disposed != 0, this);
 
         ShmGrpcStream stream;
 
@@ -237,10 +237,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
         {
             foreach (var kv in responseHeaders.Metadata)
             {
-                var values = kv.Key.EndsWith("-bin", StringComparison.OrdinalIgnoreCase)
-                    ? kv.Values.Select(Convert.ToBase64String)
-                    : kv.Values.Select(v => System.Text.Encoding.UTF8.GetString(v));
-                response.Headers.TryAddWithoutValidation(kv.Key, values);
+                AddMetadataToHeaders(response.Headers, kv);
             }
         }
 
@@ -265,20 +262,18 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Any failure to send the request body (serialization, ring write,
-            // or unexpected errors) must cancel the stream so that
-            // ReceiveResponseHeadersAsync fails fast instead of hanging.
-            // Log the original exception for diagnostics — without this,
-            // callers only see the generic "Stream closed" error.
+            // Store the real exception so ReceiveResponseHeadersAsync can
+            // surface it as InnerException instead of generic "Stream closed".
+            stream.SetSendFailure(ex);
             System.Diagnostics.Debug.WriteLine(
                 $"ShmControlHandler.SendBodyAsync failed: {ex}");
             try { await stream.CancelAsync().ConfigureAwait(false); }
             catch { /* best effort */ }
             stream.CompleteInbound();
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException ex)
         {
-            // Normal cancellation — cancel stream without logging.
+            stream.SetSendFailure(ex);
             try { await stream.CancelAsync().ConfigureAwait(false); }
             catch { /* best effort */ }
             stream.CompleteInbound();
@@ -338,6 +333,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
                         if (_options.SingleStreamMode)
                         {
                             conn.ZeroCopyRead = true;
+                            conn.FrameWriter?.EnableSingleStreamMode();
                         }
                         return conn;
                     }
@@ -416,6 +412,16 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
     }
 
+    internal static void AddMetadataToHeaders(HttpHeaders headers, MetadataKV kv)
+    {
+        var isBin = kv.Key.EndsWith("-bin", StringComparison.OrdinalIgnoreCase);
+        foreach (var v in kv.Values)
+        {
+            headers.TryAddWithoutValidation(kv.Key,
+                isBin ? Convert.ToBase64String(v) : System.Text.Encoding.UTF8.GetString(v));
+        }
+    }
+
     private static Metadata? ExtractMetadata(HttpRequestHeaders headers)
     {
         var metadata = new Metadata();
@@ -437,8 +443,12 @@ public sealed class ShmControlHandler : HttpMessageHandler
             {
                 if (header.Key.EndsWith("-bin", StringComparison.OrdinalIgnoreCase))
                 {
-                    // Binary metadata
-                    metadata.Add(new Metadata.Entry(header.Key, Convert.FromBase64String(value)));
+                    // Binary metadata — skip malformed base64 instead of crashing.
+                    try
+                    {
+                        metadata.Add(new Metadata.Entry(header.Key, Convert.FromBase64String(value)));
+                    }
+                    catch (FormatException) { /* malformed base64 — skip */ }
                 }
                 else
                 {
@@ -511,7 +521,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
         try
         {
             // Abort if handler was disposed while we waited for the lock.
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ObjectDisposedException.ThrowIf(_disposed != 0, this);
 
             // Double-check after acquiring the lock.
             var existing = _directConnection;
@@ -530,7 +540,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
             var conn = await ConnectViaControlSegmentAsync(cancellationToken).ConfigureAwait(false);
 
             // Re-check disposed after the potentially long connect.
-            if (_disposed)
+            if (_disposed != 0)
             {
                 await conn.DisposeAsync().ConfigureAwait(false);
                 throw new ObjectDisposedException(nameof(ShmControlHandler));
@@ -552,10 +562,13 @@ public sealed class ShmControlHandler : HttpMessageHandler
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _disposed = true;
-            if (disposing)
+            base.Dispose(disposing);
+            return;
+        }
+
+        if (disposing)
             {
                 if (_pool != null)
                 {
@@ -585,7 +598,6 @@ public sealed class ShmControlHandler : HttpMessageHandler
                     _directConnectLock?.Dispose();
                 }
             }
-        }
         base.Dispose(disposing);
     }
 
@@ -773,13 +785,12 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
             if (writer != null)
             {
                 var size = protoMsg.CalculateSize();
-                var maxFrame = Math.Max(1, (int)_shmStream.Connection.TxRing.Capacity / 4 - ShmConstants.FrameHeaderSize);
-                if (size > 0 && size <= maxFrame && writer.TryPauseWriterLoop())
+                if (size > 0 && writer.TryPauseWriterLoop())
                 {
                     try
                     {
-                        if (writer.TryWriteInlineDirect(_shmStream.StreamId, size, protoMsg, 0, default))
-                            return Task.CompletedTask;
+                        writer.WriteInlineDirectMultiFrame(_shmStream.StreamId, size, protoMsg, 0, default);
+                        return Task.CompletedTask;
                     }
                     finally
                     {
@@ -828,6 +839,9 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         public override void Complete(byte[] payload)
         {
             // Old-style Complete(byte[]): copy into our pooled buffer.
+            // Return any previously-rented buffer from GetBufferWriter().
+            if (_buffer != null)
+                ArrayPool<byte>.Shared.Return(_buffer);
             _buffer = ArrayPool<byte>.Shared.Rent(payload.Length);
             payload.AsSpan().CopyTo(_buffer);
             _position = payload.Length;
@@ -886,33 +900,38 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
                     var ringCap = (long)_stream.Connection.TxRing.Capacity;
                     if (_position <= ringCap && writer.TryPauseWriterLoop())
                     {
+                        var buf = _buffer;
+                        _buffer = null;
                         try
                         {
-                            writer.WriteInline(_stream.StreamId, _buffer.AsSpan(0, _position), 0, default);
+                            writer.WriteInline(_stream.StreamId, buf.AsSpan(0, _position), 0, default);
                         }
                         finally
                         {
                             writer.ResumeWriterLoop();
+                            ArrayPool<byte>.Shared.Return(buf);
                         }
-                        ArrayPool<byte>.Shared.Return(_buffer);
-                        _buffer = null;
                         return Task.CompletedTask;
                     }
 
                     // Large message or TryPause failed: ExecuteInline.
-                    // ExecuteInline internally handles WriterLoop-idle case
-                    // via TryPause to avoid kernel wakeup penalty on Linux.
                     if (_position <= ringCap)
                     {
                         var buf = _buffer;
                         var bufLen = _position;
                         var streamId = _stream.StreamId;
                         _buffer = null;
-                        writer.ExecuteInline(() =>
+                        try
                         {
-                            writer.WriteInline(streamId, buf.AsSpan(0, bufLen), 0, default);
-                        });
-                        ArrayPool<byte>.Shared.Return(buf);
+                            writer.ExecuteInline(() =>
+                            {
+                                writer.WriteInline(streamId, buf.AsSpan(0, bufLen), 0, default);
+                            });
+                        }
+                        finally
+                        {
+                            ArrayPool<byte>.Shared.Return(buf);
+                        }
                         return Task.CompletedTask;
                     }
                 }
@@ -945,8 +964,9 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
     private readonly ShmGrpcStream _stream;
     private HttpHeaders? _trailingHeaders;
     private InboundFrame _currentFrame;
-    // Multi-frame accumulation: single pre-allocated buffer.
-    // Single-frame messages ParseFrom directly from frame memory (zero-copy).
+    // Multi-frame accumulation: connection-level cached buffer.
+    // Borrowed from ShmConnection.CachedReadBuffer on construction,
+    // returned on Dispose to avoid LOH churn on repeated Unary calls.
     private byte[]? _assembled;
     private int _assembledPos;
 
@@ -954,6 +974,8 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
     {
         _stream = stream;
         Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
+        // Borrow cached read buffer from connection (may be null on first call).
+        _assembled = stream.Connection.BorrowReadBuffer();
     }
 
     internal void SetTrailingHeaders(HttpHeaders trailingHeaders)
@@ -1026,10 +1048,10 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
                 }
 
                 // Final frame or single-frame message.
-                if (_assembled != null)
+                if (_assembledPos > 0)
                 {
                     // Multi-frame final: copy last chunk.
-                    if (_assembledPos + frame.Length > _assembled.Length)
+                    if (_assembledPos + frame.Length > _assembled!.Length)
                     {
                         var newBuf = ArrayPool<byte>.Shared.Rent(_assembledPos + frame.Length);
                         _assembled.AsSpan(0, _assembledPos).CopyTo(newBuf);
@@ -1088,6 +1110,9 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
 #endif
                 if (!await _stream.WaitForFrameAsync(ct).ConfigureAwait(false))
                 {
+                    var sendEx = _stream.SendFailure;
+                    if (sendEx != null)
+                        throw new InvalidOperationException("Request body send failed during streaming", sendEx);
                     ApplyTrailers();
                     return (ReadOnlySequence<byte>.Empty, true);
                 }
@@ -1113,6 +1138,9 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
         }
         catch (ChannelClosedException)
         {
+            var sendEx2 = _stream.SendFailure;
+            if (sendEx2 != null)
+                throw new InvalidOperationException("Request body send failed during streaming", sendEx2);
             ApplyTrailers();
             return (ReadOnlySequence<byte>.Empty, true);
         }
@@ -1122,7 +1150,7 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
     {
         _currentFrame.ReturnToPool();
         _currentFrame = default;
-        // Keep assembled buffer for reuse (returned in Dispose).
+        // Keep assembled buffer for reuse (returned to connection in Dispose).
         _assembledPos = 0;
     }
 
@@ -1183,10 +1211,7 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
             {
                 foreach (var kv in trailers.Metadata)
                 {
-                    var values = kv.Key.EndsWith("-bin", StringComparison.OrdinalIgnoreCase)
-                        ? kv.Values.Select(Convert.ToBase64String)
-                        : kv.Values.Select(v => System.Text.Encoding.UTF8.GetString(v));
-                    _trailingHeaders.TryAddWithoutValidation(kv.Key, values);
+                    ShmControlHandler.AddMetadataToHeaders(_trailingHeaders, kv);
                 }
             }
         }
@@ -1204,7 +1229,8 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
         {
             if (_assembled != null)
             {
-                ArrayPool<byte>.Shared.Return(_assembled);
+                // Return to connection cache instead of ArrayPool.
+                _stream.Connection.ReturnReadBuffer(_assembled);
                 _assembled = null;
             }
             _stream.Dispose();
