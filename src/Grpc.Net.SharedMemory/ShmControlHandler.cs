@@ -22,6 +22,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Threading.Channels;
+using Google.Protobuf;
 using Grpc.Core;
 
 namespace Grpc.Net.SharedMemory;
@@ -959,7 +960,9 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 /// directly on the caller's thread — no Pipe, no Task.Run, no resource
 /// accumulation across thousands of calls.
 /// </summary>
-internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.IDirectMessageReader
+internal sealed class ShmControlResponseContent : HttpContent,
+    Grpc.Net.Client.IDirectMessageReader,
+    Grpc.Net.Client.IPooledDeserializer
 {
     private readonly ShmGrpcStream _stream;
     private HttpHeaders? _trailingHeaders;
@@ -969,6 +972,53 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
     // returned on Dispose to avoid LOH churn on repeated Unary calls.
     private byte[]? _assembled;
     private int _assembledPos;
+
+    // Cached pooled parser delegate — set once by SetPooledDeserializer.
+    private Func<ReadOnlySequence<byte>, object>? _pooledDeserializer;
+    public Func<ReadOnlySequence<byte>, object>? PooledDeserializer => _pooledDeserializer;
+
+    public void SetPooledDeserializer(Type responseType)
+    {
+        if (_pooledDeserializer != null) return;
+        try
+        {
+            // One-time generic specialization via MakeGenericMethod.
+            // Creates a cached delegate calling PooledProtoParser.ParseFrom<T>
+            // with full JIT optimization — no descriptor reflection per field.
+            // Called once per stream, not per message.
+            typeof(ShmControlResponseContent)
+                .GetMethod(nameof(EnablePooledDeserialization),
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .MakeGenericMethod(responseType)
+                .Invoke(this, null);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException
+            or System.Reflection.TargetInvocationException or NotSupportedException)
+        {
+            // Non-IMessage type or constraint mismatch — PooledDeserializer stays null.
+        }
+    }
+
+    private void EnablePooledDeserialization<T>() where T : class, IMessage<T>, new()
+    {
+        // Use Interlocked to prevent double-init from concurrent MoveNext calls.
+        var del = new Func<ReadOnlySequence<byte>, object>((payload) =>
+        {
+            if (payload.IsSingleSegment)
+                return PooledProtoParser.ParseFrom<T>(payload.FirstSpan);
+            var arr = ArrayPool<byte>.Shared.Rent((int)payload.Length);
+            try
+            {
+                payload.CopyTo(arr);
+                return PooledProtoParser.ParseFrom<T>(arr.AsSpan(0, (int)payload.Length));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(arr);
+            }
+        });
+        Interlocked.CompareExchange(ref _pooledDeserializer, del, null);
+    }
 
     public ShmControlResponseContent(ShmGrpcStream stream)
     {
@@ -989,35 +1039,23 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
     /// Uses sync fast path when data is already in the channel to avoid
     /// async state machine allocation (~200ns per await).
     /// </summary>
-#if SHM_TRACE
-    // Profiling counters — compile with /d:SHM_TRACE to enable.
-    internal static long _drSyncHit, _drSlowPath, _drSlowTicks, _drWaitTicks, _drProcessTicks;
-#endif
 
     public ValueTask<(ReadOnlySequence<byte> Payload, bool EndOfStream)> ReadNextMessageAsync(
         CancellationToken cancellationToken)
     {
         _currentFrame.ReturnToPool();
         _currentFrame = default;
-        // Reset assembled buffer position (keep buffer for reuse).
         _assembledPos = 0;
 
         // Fast path: try sync read.
         while (_stream.TryReceiveFrame(out var frame))
         {
-#if SHM_TRACE
-            Interlocked.Increment(ref _drSyncHit);
-#endif
             var result = ProcessReceivedFrame(frame);
-            // Empty payload + not EOS = continuation frame (More), keep reading
             if (result.Payload.Length == 0 && !result.EndOfStream)
                 continue;
             return new ValueTask<(ReadOnlySequence<byte>, bool)>(result);
         }
 
-#if SHM_TRACE
-        Interlocked.Increment(ref _drSlowPath);
-#endif
         return ReadNextMessageSlowAsync(cancellationToken);
     }
 
@@ -1036,7 +1074,7 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
                     }
                     else if (_assembledPos + frame.Length > _assembled.Length)
                     {
-                        var newBuf = ArrayPool<byte>.Shared.Rent(_assembled.Length * 2);
+                        var newBuf = ArrayPool<byte>.Shared.Rent(Math.Max(_assembled.Length * 2, _assembledPos + frame.Length));
                         _assembled.AsSpan(0, _assembledPos).CopyTo(newBuf);
                         ArrayPool<byte>.Shared.Return(_assembled);
                         _assembled = newBuf;
@@ -1105,9 +1143,6 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
         {
             while (true)
             {
-#if SHM_TRACE
-                var _wt0 = Stopwatch.GetTimestamp();
-#endif
                 if (!await _stream.WaitForFrameAsync(ct).ConfigureAwait(false))
                 {
                     var sendEx = _stream.SendFailure;
@@ -1122,12 +1157,6 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
                     var result = ProcessReceivedFrame(frame);
                     if (result.Payload.Length == 0 && !result.EndOfStream)
                         continue;
-#if SHM_TRACE
-                    var _wt2 = Stopwatch.GetTimestamp();
-                    Interlocked.Add(ref _drSlowTicks, _wt2 - _wt0);
-                    Interlocked.Add(ref _drWaitTicks, _wt2 - _wt0);
-                    Interlocked.Add(ref _drProcessTicks, 0);
-#endif
                     return result;
                 }
             }
@@ -1229,7 +1258,6 @@ internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.I
         {
             if (_assembled != null)
             {
-                // Return to connection cache instead of ArrayPool.
                 _stream.Connection.ReturnReadBuffer(_assembled);
                 _assembled = null;
             }

@@ -34,31 +34,6 @@ public static class FrameProtocol
     /// </summary>
     internal const int MaxFramePayloadSize = 128 * 1024 * 1024;
 
-#if SHM_TRACE
-    // Profiling counters — compile with /d:SHM_TRACE to enable.
-    public static long _rpCount, _rpReserve, _rpCopy, _rpTotal;
-
-    public static void DumpDirectReaderBreakdown()
-    {
-        var freq = (double)System.Diagnostics.Stopwatch.Frequency;
-        long syncHit = ShmControlResponseContent._drSyncHit;
-        long slowPath = ShmControlResponseContent._drSlowPath;
-        long slowTicks = ShmControlResponseContent._drSlowTicks;
-        long total = syncHit + slowPath;
-        if (total <= 0) return;
-        Console.WriteLine();
-        Console.WriteLine($"DirectReader path breakdown ({total} total calls):");
-        Console.WriteLine($"  SyncHit (TryReceive): {syncHit} ({100.0 * syncHit / total:F1}%)");
-        Console.WriteLine($"  SlowPath (await):     {slowPath} ({100.0 * slowPath / total:F1}%)");
-        if (slowPath > 0)
-        {
-            Console.WriteLine($"  SlowPath avg:         {slowTicks / freq * 1e6 / slowPath:F1} us/call");
-            Console.WriteLine($"    WaitForFrame:       {ShmControlResponseContent._drWaitTicks / freq * 1e6 / slowPath:F1} us/call");
-            Console.WriteLine($"    ProcessFrame:       {ShmControlResponseContent._drProcessTicks / freq * 1e6 / slowPath:F1} us/call");
-        }
-    }
-#endif
-
     /// <summary>
     /// Reads a frame from the ring and returns a pooled-buffer payload.
     /// </summary>
@@ -121,13 +96,7 @@ public static class FrameProtocol
             }
 
             var payloadLength = (int)header.Length;
-#if SHM_TRACE
-            var _pt0 = System.Diagnostics.Stopwatch.GetTimestamp();
-#endif
             var payloadReservation = ring.ReserveRead(payloadLength, cancellationToken);
-#if SHM_TRACE
-            var _pt1 = System.Diagnostics.Stopwatch.GetTimestamp();
-#endif
 
             // Zero-copy read strategy:
             //
@@ -170,17 +139,6 @@ public static class FrameProtocol
             }
 
             ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize + payloadLength);
-
-#if SHM_TRACE
-            var _pt2 = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (payloadLength >= 65536)
-            {
-                Interlocked.Increment(ref _rpCount);
-                Interlocked.Add(ref _rpReserve, _pt1 - _pt0);
-                Interlocked.Add(ref _rpCopy, _pt2 - _pt1);
-                Interlocked.Add(ref _rpTotal, _pt2 - _pt0);
-            }
-#endif
 
             return (header, FramePayload.FromPooled(payload, payloadLength));
         }

@@ -650,16 +650,42 @@ internal sealed class ShmFrameWriter : IDisposable
         var cap = (int)_ring.Capacity;
         var maxFramePayload = Math.Max(1, cap / 3);
 
-        // Unified path for all sizes: RingFrameStream manages per-frame
-        // ReserveWrite/CommitWrite, handling single-frame and multi-frame
-        // transparently. COS buffer capped at 64KB to stay below LOH
-        // threshold (85KB) — avoids per-message LOH allocation while
-        // keeping flush overhead low (~256 flushes per 16MB frame).
-        var cosBuffer = Math.Max(256, Math.Min(payloadSize, 65536));
+        // Single-frame + contiguous: use WriteTo(Span<byte>) to serialize
+        // protobuf directly into the ring reservation. No CodedOutputStream,
+        // no intermediate buffer, no Stream abstraction — one copy from
+        // protobuf fields to ring memory.
+        if (payloadSize <= maxFramePayload)
+        {
+            var totalSize = ShmConstants.FrameHeaderSize + payloadSize;
+            var reservation = _ring.ReserveWrite(totalSize, ct);
+            if (reservation.Second.IsEmpty)
+            {
+                // Write frame header
+                var isLast = (extraFlags & MessageFlags.More) == 0;
+                var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
+                var header = new FrameHeader(FrameType.Message, streamId, (uint)payloadSize, flags);
+                Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+                header.EncodeTo(headerBytes);
+                headerBytes.CopyTo(reservation.First.Span);
+
+                // Serialize directly into ring span — zero intermediate buffer
+                if (payloadSize > 0)
+                {
+                    var payloadSpan = reservation.First.Span.Slice(ShmConstants.FrameHeaderSize, payloadSize);
+                    message.WriteTo(payloadSpan);
+                }
+
+                _ring.CommitWrite(reservation, totalSize);
+                return;
+            }
+            // Wrap-around: fall through to RingFrameStream
+        }
+
+        // Multi-frame or wrap-around: WriteTo(IBufferWriter) through
+        // RingFrameStream — protobuf writes directly into per-frame ring
+        // spans via GetSpan/Advance, no COS intermediate buffer.
         using var rfs = new RingFrameStream(_ring, streamId, payloadSize, maxFramePayload, extraFlags, ct);
-        using var cos = new CodedOutputStream(rfs, bufferSize: cosBuffer);
-        message.WriteTo(cos);
-        cos.Flush();
+        message.WriteTo((IBufferWriter<byte>)rfs);
         rfs.CommitFinalFrame();
     }
 
@@ -669,7 +695,7 @@ internal sealed class ShmFrameWriter : IDisposable
     /// automatically. Each frame is reserved, header-stamped, and committed
     /// independently so the reader can pipeline consumption.
     /// </summary>
-    private sealed class RingFrameStream : Stream
+    private sealed class RingFrameStream : Stream, IBufferWriter<byte>
     {
         private readonly ShmRing _ring;
         private readonly uint _streamId;
@@ -728,6 +754,75 @@ internal sealed class ShmFrameWriter : IDisposable
                 _ring.CommitWrite(_currentReservation, totalSize);
                 _reservationActive = false;
             }
+        }
+
+        // IBufferWriter<byte>: protobuf WriteTo(IBufferWriter) calls GetSpan →
+        // writes directly into ring span → Advance. No COS, no intermediate
+        // buffer. Frame boundaries are handled automatically in Advance.
+
+        public Span<byte> GetSpan(int sizeHint = 0)
+        {
+            var spaceInFrame = _currentFrameCapacity - _currentFrameWritten;
+            if (spaceInFrame <= 0)
+            {
+                var totalSize = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                _ring.CommitWrite(_currentReservation, totalSize);
+                _remainingPayload -= _currentFrameWritten;
+                _reservationActive = false;
+                ReserveNextFrame();
+                spaceInFrame = _currentFrameCapacity;
+            }
+
+            var writeOffset = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+            // Return contiguous span within current reservation's First slice.
+            // If reservation wraps (Second non-empty), limit to First's remaining.
+            var firstLen = _currentReservation.First.Length;
+            if (writeOffset < firstLen)
+            {
+                var available = Math.Min(spaceInFrame, firstLen - writeOffset);
+                return _currentReservation.First.Span.Slice(writeOffset, available);
+            }
+            else
+            {
+                var secondOffset = writeOffset - firstLen;
+                var available = Math.Min(spaceInFrame, _currentReservation.Second.Length - secondOffset);
+                return _currentReservation.Second.Span.Slice(secondOffset, available);
+            }
+        }
+
+        public Memory<byte> GetMemory(int sizeHint = 0)
+        {
+            var spaceInFrame = _currentFrameCapacity - _currentFrameWritten;
+            if (spaceInFrame <= 0)
+            {
+                var totalSize = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                _ring.CommitWrite(_currentReservation, totalSize);
+                _remainingPayload -= _currentFrameWritten;
+                _reservationActive = false;
+                ReserveNextFrame();
+                spaceInFrame = _currentFrameCapacity;
+            }
+
+            var writeOffset = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+            var firstLen = _currentReservation.First.Length;
+            if (writeOffset < firstLen)
+            {
+                var available = Math.Min(spaceInFrame, firstLen - writeOffset);
+                return _currentReservation.First.Slice(writeOffset, available);
+            }
+            else
+            {
+                var secondOffset = writeOffset - firstLen;
+                var available = Math.Min(spaceInFrame, _currentReservation.Second.Length - secondOffset);
+                return _currentReservation.Second.Slice(secondOffset, available);
+            }
+        }
+
+        public void Advance(int count)
+        {
+            if ((uint)count > (uint)(_currentFrameCapacity - _currentFrameWritten))
+                throw new ArgumentOutOfRangeException(nameof(count));
+            _currentFrameWritten += count;
         }
 
         public override void Write(byte[] buffer, int offset, int count)
@@ -873,7 +968,14 @@ internal sealed class ShmFrameWriter : IDisposable
         while (_queue.TryDequeue(out var entry))
         {
             if (entry.CancelFlag != null && Volatile.Read(ref entry.CancelFlag.Value))
+            {
+                // Signal the waiting caller even though we skipped the write.
+                // Without this, EnqueueZeroCopyAndWait blocks indefinitely.
+                if (entry.ReturnToPool != null)
+                    ArrayPool<byte>.Shared.Return(entry.ReturnToPool);
+                entry.CompletionSignal?.Set();
                 continue;
+            }
 
             if (entry.Type == FrameType.Message)
             {

@@ -44,6 +44,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     private readonly ulong _ringCapacity;
     private readonly uint _maxStreams;
     private readonly bool _singleStreamMode;
+    private readonly bool _pooledDeserialization;
     private readonly Dictionary<string, IMethodHandler> _methods = new(StringComparer.Ordinal);
     private ShmControlListener? _listener;
     private readonly CancellationTokenSource _shutdownCts = new();
@@ -58,12 +59,17 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     /// <param name="singleStreamMode">When true, enables single-stream optimizations:
     /// the server writes large response frames directly to the ring when the
     /// WriterLoop is idle, saving ~80µs wakeup latency per message.</param>
-    public ShmGrpcServer(string segmentName, ulong ringCapacity = 64 * 1024 * 1024, uint maxStreams = 100, bool singleStreamMode = false)
+    /// <param name="pooledDeserialization">When true, uses ArrayPool for
+    /// protobuf <c>bytes</c> fields ≥ 85 KB during deserialization to avoid
+    /// LOH allocations and Gen2 GC pauses. Default: false.</param>
+    public ShmGrpcServer(string segmentName, ulong ringCapacity = 64 * 1024 * 1024, uint maxStreams = 100,
+        bool singleStreamMode = false, bool pooledDeserialization = false)
     {
         _segmentName = segmentName ?? throw new ArgumentNullException(nameof(segmentName));
         _ringCapacity = ringCapacity;
         _maxStreams = maxStreams;
         _singleStreamMode = singleStreamMode;
+        _pooledDeserialization = pooledDeserialization;
     }
 
     /// <summary>
@@ -235,7 +241,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
             try
             {
-                await handler.HandleAsync(stream, context, ct);
+                await handler.HandleAsync(stream, context, _pooledDeserialization, ct);
             }
             catch (RpcException ex)
             {
@@ -335,7 +341,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
     private interface IMethodHandler
     {
-        Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct);
+        Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, bool pooledDeserialization, CancellationToken ct);
     }
 
     private sealed class UnaryHandler<TReq, TResp> : IMethodHandler
@@ -350,9 +356,10 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             _handler = handler;
         }
 
-        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct)
+        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, bool pooledDeserialization, CancellationToken ct)
         {
-            var request = await ReadSingleMessageAsync(stream, _parser, ct);
+            var request = await ReadSingleMessageAsync(stream, _parser, pooledDeserialization, ct);
+
             var response = await _handler(request, context);
 
             // In singleStreamMode with one active stream, serialize the
@@ -444,9 +451,10 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         public ServerStreamingHandler(Func<TReq, IServerStreamWriter<TResp>, ServerCallContext, Task> handler)
             => _handler = handler;
 
-        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct)
+        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, bool pooledDeserialization, CancellationToken ct)
         {
-            var request = await ReadSingleMessageAsync(stream, _parser, ct);
+            var request = await ReadSingleMessageAsync(stream, _parser, pooledDeserialization, ct);
+
             var singleStream = stream.Connection.SingleStreamMode;
 
             if (!singleStream || stream.Connection.ActiveStreamCount > 1)
@@ -498,13 +506,13 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         public ClientStreamingHandler(Func<IAsyncStreamReader<TReq>, ServerCallContext, Task<TResp>> handler)
             => _handler = handler;
 
-        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct)
+        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, bool pooledDeserialization, CancellationToken ct)
         {
             var singleStream = stream.Connection.SingleStreamMode;
             if (!singleStream || stream.Connection.ActiveStreamCount > 1)
                 await context.EnsureResponseHeadersSentAsync();
 
-            using var reader = new ShmAsyncStreamReader<TReq>(stream);
+            using var reader = new ShmAsyncStreamReader<TReq>(stream, pooledDeserialization);
             var response = await _handler(reader, context);
 
             if (singleStream && stream.Connection.ActiveStreamCount <= 1)
@@ -588,7 +596,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         public DuplexStreamingHandler(Func<IAsyncStreamReader<TReq>, IServerStreamWriter<TResp>, ServerCallContext, Task> handler)
             => _handler = handler;
 
-        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct)
+        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, bool pooledDeserialization, CancellationToken ct)
         {
             var singleStream = stream.Connection.SingleStreamMode;
             // Headers: if truly single stream (1 active), WriteAsync sends
@@ -596,7 +604,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             if (!singleStream || stream.Connection.ActiveStreamCount > 1)
                 await context.EnsureResponseHeadersSentAsync();
 
-            using var reader = new ShmAsyncStreamReader<TReq>(stream);
+            using var reader = new ShmAsyncStreamReader<TReq>(stream, pooledDeserialization);
             var writer = new ShmServerStreamWriter<TResp>(stream, context, singleStream);
             try
             {
@@ -638,7 +646,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     #region Stream Adapters
 
     private static async Task<TReq> ReadSingleMessageAsync<TReq>(
-        ShmGrpcStream stream, MessageParser<TReq> parser, CancellationToken ct)
+        ShmGrpcStream stream, MessageParser<TReq> parser, bool pooledDeserialization, CancellationToken ct)
         where TReq : class, IMessage<TReq>, new()
     {
         // Use connection-level cached read buffer to avoid LOH churn.
@@ -671,7 +679,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         }
                         else if (assembledPos + f.Length > assembled!.Length)
                         {
-                            var newBuf = ArrayPool<byte>.Shared.Rent(assembled.Length * 2);
+                            var newBuf = ArrayPool<byte>.Shared.Rent(Math.Max(assembled.Length * 2, assembledPos + f.Length));
                             if (assembledPos > 0)
                                 assembled.AsSpan(0, assembledPos).CopyTo(newBuf);
                             ArrayPool<byte>.Shared.Return(assembled);
@@ -685,8 +693,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     }
 
                     // Final frame or single-frame message.
-                    ReadOnlySequence<byte> sequence;
-
                     if (usedAssembled)
                     {
                         // Multi-frame final: copy last frame into assembled.
@@ -701,19 +707,19 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         assembledPos += f.Length;
                         f.ReturnToPool();
 
-                        sequence = new ReadOnlySequence<byte>(assembled.AsMemory(0, assembledPos));
+                        return (pooledDeserialization
+                            ? PooledProtoParser.ParseFrom<TReq>(assembled.AsSpan(0, assembledPos))
+                            : parser.ParseFrom(new ReadOnlySequence<byte>(assembled.AsMemory(0, assembledPos))));
                     }
                     else
                     {
-                        sequence = new ReadOnlySequence<byte>(f.Memory);
-                    }
-
-                    var result = parser.ParseFrom(sequence);
-
-                    if (!usedAssembled)
+                        // Single frame — pooled ParseFrom to avoid LOH.
+                        var result = pooledDeserialization
+                            ? PooledProtoParser.ParseFrom<TReq>(f.Memory.Span)
+                            : parser.ParseFrom(f.Memory.Span);
                         f.ReturnToPool();
-
-                    return result;
+                        return result;
+                    }
                 }
                 else if (f.Type == FrameType.HalfClose || f.Type == FrameType.Cancel || f.Type == FrameType.Trailers)
                 {
@@ -744,6 +750,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         where T : class, IMessage<T>, new()
     {
         private readonly ShmGrpcStream _stream;
+        private readonly bool _pooledDeserialization;
         private readonly MessageParser<T> _parser = new(() => new T());
         private InboundFrame _previousFrame;
         private T? _current;
@@ -752,9 +759,10 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         private byte[]? _assembled;
         private int _assembledPos;
 
-        public ShmAsyncStreamReader(ShmGrpcStream stream)
+        public ShmAsyncStreamReader(ShmGrpcStream stream, bool pooledDeserialization)
         {
             _stream = stream;
+            _pooledDeserialization = pooledDeserialization;
             // Borrow cached read buffer from connection (may be null).
             _assembled = stream.Connection.BorrowReadBuffer();
         }
@@ -781,8 +789,8 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             {
                 if (ProcessFrame(frame))
                     return true;
-                if (_assembledPos == 0)
-                    return false; // real end-of-stream (HalfClose/Trailers)
+                if (_endOfStream || _assembledPos == 0)
+                    return false;
             }
 
             // Slow path: wait for frame with minimal async layers
@@ -798,7 +806,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     {
                         if (ProcessFrame(frame))
                             return true;
-                        if (_assembledPos == 0)
+                        if (_endOfStream || _assembledPos == 0)
                             return false;
                     }
                 }
@@ -828,7 +836,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         }
                         else if (_assembledPos + frame.Length > _assembled.Length)
                         {
-                            var newBuf = ArrayPool<byte>.Shared.Rent(_assembled.Length * 2);
+                            var newBuf = ArrayPool<byte>.Shared.Rent(Math.Max(_assembled.Length * 2, _assembledPos + frame.Length));
                             _assembled.AsSpan(0, _assembledPos).CopyTo(newBuf);
                             ArrayPool<byte>.Shared.Return(_assembled);
                             _assembled = newBuf;
@@ -840,7 +848,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     }
 
                     // Final frame or single-frame message.
-                    ReadOnlySequence<byte> sequence;
                     if (_assembledPos > 0)
                     {
                         // Multi-frame final: copy last frame into assembled.
@@ -854,26 +861,30 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         frame.Memory.Span.CopyTo(_assembled.AsSpan(_assembledPos));
                         _assembledPos += frame.Length;
                         frame.ReturnToPool();
-                        sequence = new ReadOnlySequence<byte>(_assembled.AsMemory(0, _assembledPos));
+
+                        _current = _pooledDeserialization
+                            ? PooledProtoParser.ParseFrom<T>(_assembled.AsSpan(0, _assembledPos))
+                            : _parser.ParseFrom(new ReadOnlySequence<byte>(_assembled.AsMemory(0, _assembledPos)));
                     }
                     else
                     {
-                        // Single frame — ParseFrom directly (zero-copy for pre-committed).
-                        sequence = new ReadOnlySequence<byte>(frame.Memory);
+                        // Single frame — pooled ParseFrom to avoid LOH.
+                        _current = _pooledDeserialization
+                            ? PooledProtoParser.ParseFrom<T>(frame.Memory.Span)
+                            : _parser.ParseFrom(frame.Memory.Span);
+
+                        _previousFrame = frame;
+                        var eosSingle = (frame.Flags & MessageFlags.EndStream) != 0;
+                        if (eosSingle)
+                        {
+                            _stream.MarkHalfCloseReceived();
+                            _endOfStream = true;
+                        }
+                        return true;
                     }
 
-                    _current = _parser.ParseFrom(sequence);
-
-                    if (_assembledPos > 0)
-                    {
-                        // Keep assembled buffer for reuse across messages
-                        // (streaming with same-sized messages avoids re-allocation).
-                        _assembledPos = 0;
-                    }
-                    else
-                    {
-                        frame.ReturnToPool();
-                    }
+                    // Multi-frame: keep assembled buffer for reuse.
+                    _assembledPos = 0;
                     _previousFrame = default;
 
                     var eos = (frame.Flags & MessageFlags.EndStream) != 0;
@@ -887,12 +898,14 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 case FrameType.HalfClose:
                     frame.ReturnToPool();
                     _stream.MarkHalfCloseReceived();
+                    _endOfStream = true;
                     return false;
 
                 case FrameType.Trailers:
                     _stream.SetTrailers(frame);
                     frame.ReturnToPool();
                     _stream.MarkHalfCloseReceived();
+                    _endOfStream = true;
                     return false;
 
                 default:

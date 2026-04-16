@@ -52,10 +52,22 @@ public interface IDirectMessageReader
     void ReleaseCurrentMessage();
 }
 
-#if SHM_TRACE
-/// <summary>Profiling counters for IDirectMessageReader path — compile with /d:SHM_TRACE to enable.</summary>
-public static class DirectReaderProf
+/// <summary>
+/// Optional extension for transports that support pooled deserialization
+/// to avoid LOH allocations for large <c>bytes</c> fields.
+/// </summary>
+public interface IPooledDeserializer
 {
-    public static long Count, ReadTicks, DeserTicks;
+    /// <summary>
+    /// Cached pooled deserializer delegate. When non-null, the client reader
+    /// uses this instead of ContextualDeserializer.
+    /// </summary>
+    Func<ReadOnlySequence<byte>, object>? PooledDeserializer { get; }
+
+    /// <summary>
+    /// One-time setup: the transport uses the response type to build a
+    /// JIT-specialized pooled parser via internal generic instantiation.
+    /// Called once per stream by the client reader.
+    /// </summary>
+    void SetPooledDeserializer(Type responseType);
 }
-#endif

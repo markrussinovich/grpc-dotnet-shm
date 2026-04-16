@@ -204,38 +204,6 @@ var jsonPath = Path.Combine(outDir, "results.json");
 File.WriteAllText(jsonPath, JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
 Console.WriteLine($"Results written to: {jsonPath}");
 
-#if false // SHM_TRACE — legacy profiling hooks (fields removed)
-// Dump IDirectMessageReader profiling
-{
-    // Ring read profiling
-    if (FrameProtocol._rpCount > 0)
-    {
-        var freq = (double)Stopwatch.Frequency;
-        var n = FrameProtocol._rpCount;
-        Console.WriteLine();
-        Console.WriteLine($"Ring read profiling ({n} large frames):");
-        Console.WriteLine($"  ReserveRead:  {FrameProtocol._rpReserve / freq * 1e6 / n:F1} us/frame  (wait + reserve)");
-        Console.WriteLine($"  Rent+memcpy:  {FrameProtocol._rpCopy / freq * 1e6 / n:F1} us/frame  (ArrayPool + copy)");
-        Console.WriteLine($"  TOTAL ring:   {FrameProtocol._rpTotal / freq * 1e6 / n:F1} us/frame");
-    }
-
-    // IDirectMessageReader profiling
-    if (Grpc.Net.Client.DirectReaderProf.Count > 0)
-    {
-        var freq3 = (double)Stopwatch.Frequency;
-        var n3 = Grpc.Net.Client.DirectReaderProf.Count;
-        Console.WriteLine();
-        Console.WriteLine($"IDirectMessageReader profiling ({n3} large msgs):");
-        Console.WriteLine($"  ReadNextMsg: {Grpc.Net.Client.DirectReaderProf.ReadTicks / freq3 * 1e6 / n3:F1} us/msg");
-        Console.WriteLine($"  Deserialize: {Grpc.Net.Client.DirectReaderProf.DeserTicks / freq3 * 1e6 / n3:F1} us/msg");
-        Console.WriteLine($"  TOTAL:       {(Grpc.Net.Client.DirectReaderProf.ReadTicks + Grpc.Net.Client.DirectReaderProf.DeserTicks) / freq3 * 1e6 / n3:F1} us/msg");
-    }
-
-    // Sync/Slow path breakdown
-    FrameProtocol.DumpDirectReaderBreakdown();
-}
-#endif
-
 var csvPath = Path.Combine(outDir, "results.csv");
 WriteCsv(csvPath, unaryResults, streamingResults);
 Console.WriteLine($"CSV written to: {csvPath}");
@@ -564,7 +532,7 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
     Segment.TryRemoveSegment(segmentName);
     Segment.TryRemoveSegment(segmentName + "_ctl");
 
-    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, singleStreamMode: ShmBenchConfig.SingleStream);
+    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, singleStreamMode: ShmBenchConfig.SingleStream, pooledDeserialization: true);
 
     server.MapUnary<SimpleRequest, SimpleResponse>(
         "/grpc.testing.BenchmarkService/UnaryCall",
@@ -577,7 +545,8 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
             while (await reader.MoveNext(ctx.CancellationToken).ConfigureAwait(false))
             {
                 var req = reader.Current;
-                await writer.WriteAsync(new SimpleResponse { Payload = MakePayload(req.ResponseSize) }).ConfigureAwait(false);
+                var resp = new SimpleResponse { Payload = MakePayload(req.ResponseSize) };
+                await writer.WriteAsync(resp).ConfigureAwait(false);
             }
         });
 
@@ -1002,7 +971,8 @@ sealed class BenchmarkServiceImpl : BenchmarkService.BenchmarkServiceBase
         while (await requestStream.MoveNext(context.CancellationToken))
         {
             var req = requestStream.Current;
-            await responseStream.WriteAsync(new SimpleResponse { Payload = MakePayload(req.ResponseSize) });
+            var resp = new SimpleResponse { Payload = MakePayload(req.ResponseSize) };
+            await responseStream.WriteAsync(resp);
         }
     }
 

@@ -560,12 +560,68 @@ internal sealed partial class GrpcCall<TRequest, TResponse> : GrpcCall, IGrpcCal
                     {
                         // Read entire response body immediately and read status from trailers
                         // Trailers are only available once the response body had been read
-                        var responseStream = await HttpResponse.Content.ReadAsStreamAsync().ConfigureAwait(false);
-                        var message = await ReadMessageAsync(
-                            responseStream,
-                            GrpcProtocolHelpers.GetGrpcEncoding(HttpResponse),
-                            singleMessage: true,
-                            _callCts.Token).ConfigureAwait(false);
+                        TResponse? message;
+
+                        // SHM fast path: IDirectMessageReader bypasses Stream abstraction
+                        // and provides pooled deserialization for large bytes fields.
+                        if (HttpResponse.Content is IDirectMessageReader directReader)
+                        {
+                            // 1. Read the response message
+                            var (payload, eos) = await directReader.ReadNextMessageAsync(_callCts.Token).ConfigureAwait(false);
+                            if (payload.Length > 0 || !eos)
+                            {
+                                try
+                                {
+                                    var pooled = directReader as IPooledDeserializer;
+                                    if (pooled != null)
+                                    {
+                                        if (pooled.PooledDeserializer == null)
+                                            pooled.SetPooledDeserializer(typeof(TResponse));
+                                        if (pooled.PooledDeserializer != null)
+                                        {
+                                            message = (TResponse)pooled.PooledDeserializer(payload);
+                                        }
+                                        else
+                                        {
+                                            DeserializationContext.SetPayload(payload);
+                                            try { message = Method.ResponseMarshaller.ContextualDeserializer(DeserializationContext); }
+                                            finally { DeserializationContext.SetPayload(null); }
+                                        }
+                                    }
+                                    else
+                                    {
+                                        DeserializationContext.SetPayload(payload);
+                                        try { message = Method.ResponseMarshaller.ContextualDeserializer(DeserializationContext); }
+                                        finally { DeserializationContext.SetPayload(null); }
+                                    }
+                                }
+                                finally
+                                {
+                                    directReader.ReleaseCurrentMessage();
+                                }
+                                MessagesRead++;
+
+                                // 2. Read trailers (next frame after message)
+                                if (!eos)
+                                {
+                                    await directReader.ReadNextMessageAsync(_callCts.Token).ConfigureAwait(false);
+                                    directReader.ReleaseCurrentMessage();
+                                }
+                            }
+                            else
+                            {
+                                message = null;
+                            }
+                        }
+                        else
+                        {
+                            var responseStream = await HttpResponse.Content.ReadAsStreamAsync().ConfigureAwait(false);
+                            message = await ReadMessageAsync(
+                                responseStream,
+                                GrpcProtocolHelpers.GetGrpcEncoding(HttpResponse),
+                                singleMessage: true,
+                                _callCts.Token).ConfigureAwait(false);
+                        }
                         status = GrpcProtocolHelpers.GetResponseStatus(HttpResponse, Channel.OperatingSystem.IsBrowser, Channel.HttpHandlerType == HttpHandlerType.WinHttpHandler);
 
                         if (message == null)
