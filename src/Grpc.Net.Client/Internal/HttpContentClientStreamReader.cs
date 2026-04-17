@@ -44,6 +44,10 @@ internal sealed class HttpContentClientStreamReader<TRequest, TResponse> : IAsyn
     private string? _grpcEncoding;
     private Stream? _responseStream;
     private Task<bool>? _moveNextTask;
+    // Cached pooled deserializer — set once on first MoveNext, avoids
+    // per-call interface cast and null check in the hot path.
+    private Func<System.Buffers.ReadOnlySequence<byte>, object>? _pooledDeserializer;
+    private bool _pooledDeserializerChecked;
 
     public HttpContentClientStreamReader(GrpcCall<TRequest, TResponse> call)
     {
@@ -169,13 +173,7 @@ internal sealed class HttpContentClientStreamReader<TRequest, TResponse> : IAsyn
             // 5-byte gRPC header parse.
             if (_httpResponse.Content is Grpc.Net.Client.IDirectMessageReader directReader)
             {
-#if SHM_TRACE
-                var _pt0 = System.Diagnostics.Stopwatch.GetTimestamp();
-#endif
                 var (payload, eos) = await directReader.ReadNextMessageAsync(_call.CancellationToken).ConfigureAwait(false);
-#if SHM_TRACE
-                var _pt1 = System.Diagnostics.Stopwatch.GetTimestamp();
-#endif
 
                 if (payload.Length == 0 && eos)
                 {
@@ -185,29 +183,39 @@ internal sealed class HttpContentClientStreamReader<TRequest, TResponse> : IAsyn
                 {
                     try
                     {
-                        _call.DeserializationContext.SetPayload(payload);
-                        readMessage = _call.Method.ResponseMarshaller.ContextualDeserializer(
-                            _call.DeserializationContext);
-                        _call.DeserializationContext.SetPayload(null);
+                        // One-time setup: discover and cache pooled deserializer.
+                        if (!_pooledDeserializerChecked)
+                        {
+                            _pooledDeserializerChecked = true;
+                            if (_httpResponse!.Content is IPooledDeserializer pooled)
+                            {
+                                pooled.SetPooledDeserializer(typeof(TResponse));
+                                _pooledDeserializer = pooled.PooledDeserializer;
+                            }
+                        }
+
+                        if (_pooledDeserializer != null)
+                        {
+                            readMessage = (TResponse)_pooledDeserializer(payload);
+                        }
+                        else
+                        {
+                            _call.DeserializationContext.SetPayload(payload);
+                            try
+                            {
+                                readMessage = _call.Method.ResponseMarshaller.ContextualDeserializer(
+                                    _call.DeserializationContext);
+                            }
+                            finally
+                            {
+                                _call.DeserializationContext.SetPayload(null);
+                            }
+                        }
                     }
                     finally
                     {
-                        // Release ring/pooled memory immediately after deserialization.
-                        // Must be in finally: if deserialization throws, unreleased
-                        // zero-copy frames occupy ring space indefinitely, eventually
-                        // causing WaitForSpace stalls.
                         directReader.ReleaseCurrentMessage();
                     }
-
-#if SHM_TRACE
-                    var _pt2 = System.Diagnostics.Stopwatch.GetTimestamp();
-                    if (payload.Length >= 65536)
-                    {
-                        System.Threading.Interlocked.Increment(ref Grpc.Net.Client.DirectReaderProf.Count);
-                        System.Threading.Interlocked.Add(ref Grpc.Net.Client.DirectReaderProf.ReadTicks, _pt1 - _pt0);
-                        System.Threading.Interlocked.Add(ref Grpc.Net.Client.DirectReaderProf.DeserTicks, _pt2 - _pt1);
-                    }
-#endif
                 }
             }
             else
