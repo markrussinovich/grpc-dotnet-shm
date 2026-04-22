@@ -22,7 +22,6 @@ using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Threading.Channels;
-using Google.Protobuf;
 using Grpc.Core;
 
 namespace Grpc.Net.SharedMemory;
@@ -649,16 +648,6 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         _shmStream = shmStream;
     }
 
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing && _bodyBuf != null)
-        {
-            ArrayPool<byte>.Shared.Return(_bodyBuf);
-            _bodyBuf = null;
-        }
-        base.Dispose(disposing);
-    }
-
     public override bool CanRead => false;
     public override bool CanSeek => false;
     public override bool CanWrite => true;
@@ -669,24 +658,21 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
     {
         var remaining = buffer;
 
-        // Resume partial body from previous write.
-        // _bodyExpected is the protobuf-only length (excluding the 5-byte gRPC header).
-        // _bodyBufLen is the total bytes in _bodyBuf (including the 5-byte header).
-        // So the total expected is 5 + _bodyExpected.
-        if (_bodyExpected > 0 && _bodyBufLen < 5 + _bodyExpected)
+        // Resume partial body from previous write
+        if (_bodyExpected > 0 && _bodyBufLen < _bodyExpected)
         {
-            var needed = (5 + _bodyExpected) - _bodyBufLen;
+            var needed = _bodyExpected - _bodyBufLen;
             var toCopy = Math.Min(needed, remaining.Length);
             remaining.Slice(0, toCopy).CopyTo(_bodyBuf.AsMemory(_bodyBufLen));
             _bodyBufLen += toCopy;
             remaining = remaining.Slice(toCopy);
 
-            if (_bodyBufLen < 5 + _bodyExpected)
+            if (_bodyBufLen < _bodyExpected)
             {
                 return; // Still incomplete
             }
 
-            await _shmStream.SendMessageAsync(_bodyBuf.AsMemory(0, 5 + _bodyExpected), cancellationToken).ConfigureAwait(false);
+            await _shmStream.SendMessageAsync(_bodyBuf.AsMemory(0, _bodyExpected), cancellationToken).ConfigureAwait(false);
             _bodyBufLen = 0;
             _bodyExpected = 0;
         }
@@ -712,31 +698,16 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 
             if (remaining.Length < length)
             {
-                // Partial body — buffer gRPC header + available body
-                var totalNeeded = 5 + length;
-                if (_bodyBuf == null || _bodyBuf.Length < totalNeeded)
-                {
-                    if (_bodyBuf != null) ArrayPool<byte>.Shared.Return(_bodyBuf);
-                    _bodyBuf = ArrayPool<byte>.Shared.Rent(totalNeeded);
-                }
-                // Copy the 5-byte gRPC header first
-                _headerBuf.AsSpan(0, 5).CopyTo(_bodyBuf);
-                remaining.CopyTo(_bodyBuf.AsMemory(5));
-                _bodyBufLen = 5 + remaining.Length;
+                // Partial body — buffer it
+                _bodyBuf ??= new byte[length];
+                if (_bodyBuf.Length < length) _bodyBuf = new byte[length];
+                remaining.CopyTo(_bodyBuf);
+                _bodyBufLen = remaining.Length;
                 _bodyExpected = length;
                 return;
             }
 
-            // Reconstruct: 5-byte header + body using reusable pooled _bodyBuf
-            var fullMsgLen = 5 + length;
-            if (_bodyBuf == null || _bodyBuf.Length < fullMsgLen)
-            {
-                if (_bodyBuf != null) ArrayPool<byte>.Shared.Return(_bodyBuf);
-                _bodyBuf = ArrayPool<byte>.Shared.Rent(fullMsgLen);
-            }
-            _headerBuf.AsSpan(0, 5).CopyTo(_bodyBuf);
-            remaining.Slice(0, length).Span.CopyTo(_bodyBuf.AsSpan(5));
-            await _shmStream.SendMessageAsync(_bodyBuf.AsMemory(0, fullMsgLen), cancellationToken).ConfigureAwait(false);
+            await _shmStream.SendMessageAsync(remaining.Slice(0, length), cancellationToken).ConfigureAwait(false);
             remaining = remaining.Slice(length);
         }
 
@@ -757,20 +728,17 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 
             if (remaining.Length < 5 + msgLen)
             {
-                // Partial body — buffer header + available body (include gRPC 5-byte header)
+                // Partial body — buffer header + available body
                 _bodyExpected = msgLen;
-                var totalNeeded = 5 + msgLen;
-                if (_bodyBuf == null || _bodyBuf.Length < totalNeeded)
-                {
-                    if (_bodyBuf != null) ArrayPool<byte>.Shared.Return(_bodyBuf);
-                    _bodyBuf = ArrayPool<byte>.Shared.Rent(totalNeeded);
-                }
-                remaining.Slice(0, remaining.Length).CopyTo(_bodyBuf);
-                _bodyBufLen = remaining.Length;
+                _bodyBuf ??= new byte[msgLen];
+                if (_bodyBuf.Length < msgLen) _bodyBuf = new byte[msgLen];
+                var available = remaining.Length - 5;
+                remaining.Slice(5, available).CopyTo(_bodyBuf);
+                _bodyBufLen = available;
                 return;
             }
 
-            await _shmStream.SendMessageAsync(remaining.Slice(0, 5 + msgLen), cancellationToken).ConfigureAwait(false);
+            await _shmStream.SendMessageAsync(remaining.Slice(5, msgLen), cancellationToken).ConfigureAwait(false);
             remaining = remaining.Slice(5 + msgLen);
         }
     }
@@ -795,8 +763,20 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         CancellationToken cancellationToken)
     {
         // Fast path: for protobuf IMessage types in singleStreamMode,
-        // serialize directly into the ring buffer via
-        // WriteInlineDirectMultiFrame (zero intermediate buffer).
+        // serialize directly into the ring buffer (zero intermediate buffer)
+        // using IMessage.WriteTo. This bypasses the provided serializer
+        // delegate entirely — IMessage.WriteTo produces the canonical
+        // protobuf binary encoding, identical to the default
+        // ContextualSerializer generated by protoc/Grpc.Tools.
+        //
+        // Trade-off: if a user registers a custom contextual serializer on
+        // an IMessage type (e.g., an encryption or compression layer that
+        // modifies the wire payload), it will NOT be called on this path.
+        // This is an intentional design choice: custom marshallers on
+        // IMessage types are extremely rare in practice, and the
+        // performance benefit (eliminating one full-message copy) justifies
+        // the specialization. Non-IMessage types always go through the
+        // serializer delegate below.
         if (_shmStream.Connection.SingleStreamMode
             && _shmStream.Connection.ActiveStreamCount <= 1
             && message is Google.Protobuf.IMessage protoMsg)
@@ -829,12 +809,11 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 
     /// <summary>
     /// Minimal SerializationContext that writes directly into a pooled buffer
-    /// without the 5-byte gRPC frame header. Implements IBufferWriter so
-    /// protobuf can serialize using the fast WriteContext path.
+    /// with a 5-byte gRPC LPM header reserved at offset 0. Implements
+    /// IBufferWriter so protobuf can serialize using the fast WriteContext path.
     /// </summary>
     private sealed class DirectWriteSerializationContext : Grpc.Core.SerializationContext, IBufferWriter<byte>
     {
-        private static readonly byte[] EmptyGrpcLpm = new byte[5];
         private readonly ShmGrpcStream _stream;
         private byte[]? _buffer;
         private int _position;
@@ -851,10 +830,7 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         {
             if (_buffer == null && _payloadLength > 0)
             {
-                // Reserve 5 bytes at start for gRPC length-prefix header
-                // (needed for Go interop compatibility)
-                _buffer = ArrayPool<byte>.Shared.Rent(5 + _payloadLength);
-                _position = 5; // Start writing protobuf after the header
+                _buffer = ArrayPool<byte>.Shared.Rent(_payloadLength);
             }
 
             return this;
@@ -862,13 +838,13 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 
         public override void Complete(byte[] payload)
         {
-            // Old-style Complete(byte[]): copy into our pooled buffer
-            // with 5-byte gRPC header reservation at the front.
+            // Old-style Complete(byte[]): copy into our pooled buffer.
+            // Return any previously-rented buffer from GetBufferWriter().
             if (_buffer != null)
                 ArrayPool<byte>.Shared.Return(_buffer);
-            _buffer = ArrayPool<byte>.Shared.Rent(5 + payload.Length);
-            payload.AsSpan().CopyTo(_buffer.AsSpan(5));
-            _position = 5 + payload.Length;
+            _buffer = ArrayPool<byte>.Shared.Rent(payload.Length);
+            payload.AsSpan().CopyTo(_buffer);
+            _position = payload.Length;
         }
 
         public override void Complete()
@@ -907,18 +883,10 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 
         internal Task SendResult(CancellationToken cancellationToken)
         {
-            if (_buffer == null || _position <= 5)
+            if (_buffer == null || _position == 0)
             {
-                // Empty protobuf message — send cached 5-byte gRPC LPM header.
-                return _stream.SendMessageAsync(EmptyGrpcLpm, cancellationToken);
+                return _stream.SendMessageAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
             }
-
-            // Write the 5-byte gRPC length-prefix header at offset 0.
-            // Protobuf payload starts at offset 5, so payload length = _position - 5.
-            var protoLen = _position - 5;
-            _buffer[0] = 0; // no compression
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
-                _buffer.AsSpan(1, 4), (uint)protoLen);
 
             // In singleStreamMode with one active stream, bypass the queue.
             // - ≤ ringCapacity: TryPauseWriterLoop or ExecuteInline
@@ -991,9 +959,7 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 /// directly on the caller's thread — no Pipe, no Task.Run, no resource
 /// accumulation across thousands of calls.
 /// </summary>
-internal sealed class ShmControlResponseContent : HttpContent,
-    Grpc.Net.Client.IDirectMessageReader,
-    Grpc.Net.Client.IPooledDeserializer
+internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.IDirectMessageReader
 {
     private readonly ShmGrpcStream _stream;
     private HttpHeaders? _trailingHeaders;
@@ -1003,53 +969,6 @@ internal sealed class ShmControlResponseContent : HttpContent,
     // returned on Dispose to avoid LOH churn on repeated Unary calls.
     private byte[]? _assembled;
     private int _assembledPos;
-
-    // Cached pooled parser delegate — set once by SetPooledDeserializer.
-    private Func<ReadOnlySequence<byte>, object>? _pooledDeserializer;
-    public Func<ReadOnlySequence<byte>, object>? PooledDeserializer => _pooledDeserializer;
-
-    public void SetPooledDeserializer(Type responseType)
-    {
-        if (_pooledDeserializer != null) return;
-        try
-        {
-            // One-time generic specialization via MakeGenericMethod.
-            // Creates a cached delegate calling PooledProtoParser.ParseFrom<T>
-            // with full JIT optimization — no descriptor reflection per field.
-            // Called once per stream, not per message.
-            typeof(ShmControlResponseContent)
-                .GetMethod(nameof(EnablePooledDeserialization),
-                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
-                .MakeGenericMethod(responseType)
-                .Invoke(this, null);
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException
-            or System.Reflection.TargetInvocationException or NotSupportedException)
-        {
-            // Non-IMessage type or constraint mismatch — PooledDeserializer stays null.
-        }
-    }
-
-    private void EnablePooledDeserialization<T>() where T : class, IMessage<T>, new()
-    {
-        // Use Interlocked to prevent double-init from concurrent MoveNext calls.
-        var del = new Func<ReadOnlySequence<byte>, object>((payload) =>
-        {
-            if (payload.IsSingleSegment)
-                return PooledProtoParser.ParseFrom<T>(payload.FirstSpan);
-            var arr = ArrayPool<byte>.Shared.Rent((int)payload.Length);
-            try
-            {
-                payload.CopyTo(arr);
-                return PooledProtoParser.ParseFrom<T>(arr.AsSpan(0, (int)payload.Length));
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(arr);
-            }
-        });
-        Interlocked.CompareExchange(ref _pooledDeserializer, del, null);
-    }
 
     public ShmControlResponseContent(ShmGrpcStream stream)
     {
@@ -1070,23 +989,35 @@ internal sealed class ShmControlResponseContent : HttpContent,
     /// Uses sync fast path when data is already in the channel to avoid
     /// async state machine allocation (~200ns per await).
     /// </summary>
+#if SHM_TRACE
+    // Profiling counters — compile with /d:SHM_TRACE to enable.
+    internal static long _drSyncHit, _drSlowPath, _drSlowTicks, _drWaitTicks, _drProcessTicks;
+#endif
 
     public ValueTask<(ReadOnlySequence<byte> Payload, bool EndOfStream)> ReadNextMessageAsync(
         CancellationToken cancellationToken)
     {
         _currentFrame.ReturnToPool();
         _currentFrame = default;
+        // Reset assembled buffer position (keep buffer for reuse).
         _assembledPos = 0;
 
         // Fast path: try sync read.
         while (_stream.TryReceiveFrame(out var frame))
         {
+#if SHM_TRACE
+            Interlocked.Increment(ref _drSyncHit);
+#endif
             var result = ProcessReceivedFrame(frame);
+            // Empty payload + not EOS = continuation frame (More), keep reading
             if (result.Payload.Length == 0 && !result.EndOfStream)
                 continue;
             return new ValueTask<(ReadOnlySequence<byte>, bool)>(result);
         }
 
+#if SHM_TRACE
+        Interlocked.Increment(ref _drSlowPath);
+#endif
         return ReadNextMessageSlowAsync(cancellationToken);
     }
 
@@ -1105,7 +1036,7 @@ internal sealed class ShmControlResponseContent : HttpContent,
                     }
                     else if (_assembledPos + frame.Length > _assembled.Length)
                     {
-                        var newBuf = ArrayPool<byte>.Shared.Rent(Math.Max(_assembled.Length * 2, _assembledPos + frame.Length));
+                        var newBuf = ArrayPool<byte>.Shared.Rent(_assembled.Length * 2);
                         _assembled.AsSpan(0, _assembledPos).CopyTo(newBuf);
                         ArrayPool<byte>.Shared.Return(_assembled);
                         _assembled = newBuf;
@@ -1133,19 +1064,15 @@ internal sealed class ShmControlResponseContent : HttpContent,
 
                     var eos = (frame.Flags & MessageFlags.EndStream) != 0;
                     if (eos) _stream.MarkHalfCloseReceived();
-                    // Skip the 5-byte gRPC length-prefix header per G3 spec.
-                    var startOffset = 5;
-                    return (new ReadOnlySequence<byte>(_assembled.AsMemory(startOffset, _assembledPos - startOffset)), eos);
+                    return (new ReadOnlySequence<byte>(_assembled.AsMemory(0, _assembledPos)), eos);
                 }
                 else
                 {
                     // Single frame — direct reference (zero-copy for pre-committed).
-                    // Skip the 5-byte gRPC length-prefix header per G3 spec.
                     _currentFrame = frame;
                     var eos2 = (frame.Flags & MessageFlags.EndStream) != 0;
                     if (eos2) _stream.MarkHalfCloseReceived();
-                    var mem = frame.Memory.Slice(5);
-                    return (new ReadOnlySequence<byte>(mem), eos2);
+                    return (new ReadOnlySequence<byte>(frame.Memory), eos2);
                 }
 
             case FrameType.HalfClose:
@@ -1178,6 +1105,9 @@ internal sealed class ShmControlResponseContent : HttpContent,
         {
             while (true)
             {
+#if SHM_TRACE
+                var _wt0 = Stopwatch.GetTimestamp();
+#endif
                 if (!await _stream.WaitForFrameAsync(ct).ConfigureAwait(false))
                 {
                     var sendEx = _stream.SendFailure;
@@ -1192,6 +1122,12 @@ internal sealed class ShmControlResponseContent : HttpContent,
                     var result = ProcessReceivedFrame(frame);
                     if (result.Payload.Length == 0 && !result.EndOfStream)
                         continue;
+#if SHM_TRACE
+                    var _wt2 = Stopwatch.GetTimestamp();
+                    Interlocked.Add(ref _drSlowTicks, _wt2 - _wt0);
+                    Interlocked.Add(ref _drWaitTicks, _wt2 - _wt0);
+                    Interlocked.Add(ref _drProcessTicks, 0);
+#endif
                     return result;
                 }
             }
@@ -1293,6 +1229,7 @@ internal sealed class ShmControlResponseContent : HttpContent,
         {
             if (_assembled != null)
             {
+                // Return to connection cache instead of ArrayPool.
                 _stream.Connection.ReturnReadBuffer(_assembled);
                 _assembled = null;
             }
