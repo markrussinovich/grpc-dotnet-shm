@@ -362,18 +362,23 @@ internal sealed class ShmFrameWriter : IDisposable
                 // If broke due to _inlineAction/_paused, loop back to top.
                 if (_inlineAction != null || _paused) continue;
 
-                // Phase 2.5: yield before blocking. Thread.Yield() is much
-                // cheaper than a kernel wait (~1µs vs ~80µs). In ping-pong
-                // benchmarks the response often arrives within this window.
-                Thread.Yield();
-                if (_inlineAction != null || _paused) continue;
-                if (_queue.TryDequeue(out batch[0]))
+                // Phase 2.5: yield before blocking (singleStreamMode only).
+                // Thread.Yield() is much cheaper than a kernel wait (~1us
+                // vs ~80us). In ping-pong the response often arrives during
+                // this window. Skip in multi-stream mode where the queue
+                // refills quickly and Yield wastes a scheduler quantum.
+                if (_singleStreamMode)
                 {
-                    var count = 1;
-                    while (count < maxBatch && _queue.TryDequeue(out batch[count]))
-                        count++;
-                    FlushBatch(batch, count);
-                    continue;
+                    Thread.Yield();
+                    if (_inlineAction != null || _paused) continue;
+                    if (_queue.TryDequeue(out batch[0]))
+                    {
+                        var count = 1;
+                        while (count < maxBatch && _queue.TryDequeue(out batch[count]))
+                            count++;
+                        FlushBatch(batch, count);
+                        continue;
+                    }
                 }
 
                 // Phase 3: blocking wait (lost-wake-safe pattern)
