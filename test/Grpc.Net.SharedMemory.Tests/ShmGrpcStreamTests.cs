@@ -428,7 +428,14 @@ public class ShmGrpcStreamTests
 
                                     await stream.SendResponseHeadersAsync();
                                     if (msg != null)
-                                        await stream.SendMessageAsync(msg);
+                                    {
+                                        // ReceiveMessagesAsync returns raw ring payload
+                                        // which now includes the 5-byte gRPC LPM header.
+                                        // SendMessageAsync will add its own header, so
+                                        // strip the received header to avoid double-wrapping.
+                                        var body = msg.AsMemory(5);
+                                        await stream.SendMessageAsync(body);
+                                    }
                                     await stream.SendTrailersAsync(StatusCode.OK);
                                 }
                                 catch { }
