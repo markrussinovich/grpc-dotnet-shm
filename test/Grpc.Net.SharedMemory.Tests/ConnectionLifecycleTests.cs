@@ -159,7 +159,7 @@ public class ConnectionLifecycleTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task GoAwayReceived_RaisesEvent()
     {
         var segmentName = $"lifecycle_test_{Guid.NewGuid():N}";

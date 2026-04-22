@@ -158,7 +158,7 @@ public class KeepaliveIntegrationTests
 {
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public void Connection_WithKeepalive_SendsPings()
     {
         var segmentName = $"keepalive_test_{Guid.NewGuid():N}";
@@ -184,7 +184,7 @@ public class KeepaliveIntegrationTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public void Connection_WithoutKeepalive_DoesNotSendPings()
     {
         var segmentName = $"no_keepalive_test_{Guid.NewGuid():N}";

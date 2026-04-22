@@ -1,4 +1,4 @@
-﻿#region Copyright notice and license
+#region Copyright notice and license
 
 // Copyright 2025 The gRPC Authors
 //
@@ -40,6 +40,12 @@ namespace Grpc.Net.SharedMemory;
 /// </example>
 public sealed class ShmGrpcServer : IAsyncDisposable
 {
+    /// <summary>
+    /// Cached 5-byte gRPC LPM header for empty messages (compression=0, length=0).
+    /// Avoids per-call allocation on the empty-message fast path.
+    /// </summary>
+    private static readonly byte[] EmptyGrpcLpm = new byte[5];
+
     private readonly string _segmentName;
     private readonly ulong _ringCapacity;
     private readonly uint _maxStreams;
@@ -297,17 +303,19 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         var size = message.CalculateSize();
         if (size == 0)
         {
-            return stream.SendMessageAsync(ReadOnlyMemory<byte>.Empty, ct);
+            // Empty protobuf message — send cached 5-byte gRPC LPM header.
+            return stream.SendMessageAsync(EmptyGrpcLpm, ct);
         }
 
-        var buffer = ArrayPool<byte>.Shared.Rent(size);
+        var buffer = ArrayPool<byte>.Shared.Rent(5 + size);
         try
         {
-            // Serialize directly into the rented buffer — no intermediate byte[].
-            using (var cos = new CodedOutputStream(buffer))
-            {
-                message.WriteTo(cos);
-            }
+            // Write 5-byte gRPC LPM header at offset 0.
+            buffer[0] = 0; // no compression
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                buffer.AsSpan(1, 4), (uint)size);
+            // Serialize protobuf at offset 5.
+            message.WriteTo(buffer.AsSpan(5, size));
         }
         catch
         {
@@ -316,7 +324,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         }
         // Transfer buffer ownership to SendMessageZeroCopyAsync — it returns
         // the buffer to ArrayPool after the ring write completes.
-        return stream.SendMessageZeroCopyAsync(buffer.AsMemory(0, size), buffer, ct);
+        return stream.SendMessageZeroCopyAsync(buffer.AsMemory(0, 5 + size), buffer, ct);
     }
 
     /// <inheritdoc/>
@@ -386,7 +394,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         if (size > 0)
                             writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default);
                         else
-                            writer.WriteInline(stream.StreamId, ReadOnlySpan<byte>.Empty, 0, default);
+                            writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default);
                         stream.SendTrailersInline(writer, context.Status.StatusCode,
                             context.Status.Detail, context.ResponseTrailers);
                     }
@@ -398,21 +406,29 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 }
 
                 // TryPause failed: ExecuteInline with intermediate buffer.
-                byte[]? serializedBuffer = null;
-                int serializedSize = size;
+                byte[] serializedBuffer;
+                int serializedSize;
                 if (size > 0)
                 {
                     var cached = stream.Connection.CachedWriteBuffer;
-                    if (cached != null && cached.Length >= size)
+                    if (cached != null && cached.Length >= 5 + size)
                         serializedBuffer = cached;
                     else
                     {
                         if (cached != null) ArrayPool<byte>.Shared.Return(cached);
-                        serializedBuffer = ArrayPool<byte>.Shared.Rent(size);
+                        serializedBuffer = ArrayPool<byte>.Shared.Rent(5 + size);
                         stream.Connection.CachedWriteBuffer = serializedBuffer;
                     }
-                    using (var cos = new CodedOutputStream(serializedBuffer))
-                        msg.WriteTo(cos);
+                    serializedBuffer[0] = 0;
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                        serializedBuffer.AsSpan(1, 4), (uint)size);
+                    msg.WriteTo(serializedBuffer.AsSpan(5, size));
+                    serializedSize = 5 + size;
+                }
+                else
+                {
+                    serializedBuffer = EmptyGrpcLpm;
+                    serializedSize = 5;
                 }
 
                 writer.ExecuteInline(() =>
@@ -422,12 +438,8 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         stream.SendResponseHeadersInline(writer);
                         context.MarkHeadersSent();
                     }
-                    if (serializedBuffer != null)
-                        writer.WriteInline(stream.StreamId,
-                            serializedBuffer.AsSpan(0, serializedSize), 0, default);
-                    else
-                        writer.WriteInline(stream.StreamId,
-                            ReadOnlySpan<byte>.Empty, 0, default);
+                    writer.WriteInline(stream.StreamId,
+                        serializedBuffer.AsSpan(0, serializedSize), 0, default);
                     stream.SendTrailersInline(writer, context.Status.StatusCode,
                         context.Status.Detail, context.ResponseTrailers);
                 });
@@ -533,7 +545,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         if (size > 0)
                             writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default);
                         else
-                            writer.WriteInline(stream.StreamId, ReadOnlySpan<byte>.Empty, 0, default);
+                            writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default);
                         stream.SendTrailersInline(writer, context.Status.StatusCode,
                             context.Status.Detail, context.ResponseTrailers);
                     }
@@ -545,21 +557,29 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 }
 
                 // TryPause failed: ExecuteInline with intermediate buffer.
-                byte[]? serializedBuffer = null;
-                var serializedSize = size;
+                byte[] serializedBuffer;
+                int serializedSize;
                 if (size > 0)
                 {
                     var cached = stream.Connection.CachedWriteBuffer;
-                    if (cached != null && cached.Length >= size)
+                    if (cached != null && cached.Length >= 5 + size)
                         serializedBuffer = cached;
                     else
                     {
                         if (cached != null) ArrayPool<byte>.Shared.Return(cached);
-                        serializedBuffer = ArrayPool<byte>.Shared.Rent(size);
+                        serializedBuffer = ArrayPool<byte>.Shared.Rent(5 + size);
                         stream.Connection.CachedWriteBuffer = serializedBuffer;
                     }
-                    using (var cos = new CodedOutputStream(serializedBuffer))
-                        msg.WriteTo(cos);
+                    serializedBuffer[0] = 0;
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                        serializedBuffer.AsSpan(1, 4), (uint)size);
+                    msg.WriteTo(serializedBuffer.AsSpan(5, size));
+                    serializedSize = 5 + size;
+                }
+                else
+                {
+                    serializedBuffer = EmptyGrpcLpm;
+                    serializedSize = 5;
                 }
 
                 writer.ExecuteInline(() =>
@@ -569,10 +589,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         stream.SendResponseHeadersInline(writer);
                         context.MarkHeadersSent();
                     }
-                    if (serializedBuffer != null)
-                        writer.WriteInline(stream.StreamId, serializedBuffer.AsSpan(0, serializedSize), 0, default);
-                    else
-                        writer.WriteInline(stream.StreamId, ReadOnlySpan<byte>.Empty, 0, default);
+                    writer.WriteInline(stream.StreamId, serializedBuffer.AsSpan(0, serializedSize), 0, default);
                     stream.SendTrailersInline(writer, context.Status.StatusCode,
                         context.Status.Detail, context.ResponseTrailers);
                 });
@@ -708,15 +725,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         f.ReturnToPool();
 
                         return (pooledDeserialization
-                            ? PooledProtoParser.ParseFrom<TReq>(assembled.AsSpan(0, assembledPos))
-                            : parser.ParseFrom(new ReadOnlySequence<byte>(assembled.AsMemory(0, assembledPos))));
+                            ? PooledProtoParser.ParseFrom<TReq>(assembled.AsSpan(5, assembledPos - 5))
+                            : parser.ParseFrom(new ReadOnlySequence<byte>(assembled.AsMemory(5, assembledPos - 5))));
                     }
                     else
                     {
-                        // Single frame — pooled ParseFrom to avoid LOH.
+                        // Single frame — skip 5-byte gRPC LPM header per G3 spec.
+                        var protoSpan = f.Memory.Span.Slice(5);
                         var result = pooledDeserialization
-                            ? PooledProtoParser.ParseFrom<TReq>(f.Memory.Span)
-                            : parser.ParseFrom(f.Memory.Span);
+                            ? PooledProtoParser.ParseFrom<TReq>(protoSpan)
+                            : parser.ParseFrom(protoSpan);
                         f.ReturnToPool();
                         return result;
                     }
@@ -863,15 +881,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         frame.ReturnToPool();
 
                         _current = _pooledDeserialization
-                            ? PooledProtoParser.ParseFrom<T>(_assembled.AsSpan(0, _assembledPos))
-                            : _parser.ParseFrom(new ReadOnlySequence<byte>(_assembled.AsMemory(0, _assembledPos)));
+                            ? PooledProtoParser.ParseFrom<T>(_assembled.AsSpan(5, _assembledPos - 5))
+                            : _parser.ParseFrom(new ReadOnlySequence<byte>(_assembled.AsMemory(5, _assembledPos - 5)));
                     }
                     else
                     {
-                        // Single frame — pooled ParseFrom to avoid LOH.
+                        // Single frame — skip 5-byte gRPC LPM header per G3 spec.
+                        var protoSpan = frame.Memory.Span.Slice(5);
                         _current = _pooledDeserialization
-                            ? PooledProtoParser.ParseFrom<T>(frame.Memory.Span)
-                            : _parser.ParseFrom(frame.Memory.Span);
+                            ? PooledProtoParser.ParseFrom<T>(protoSpan)
+                            : _parser.ParseFrom(protoSpan);
 
                         _previousFrame = frame;
                         var eosSingle = (frame.Flags & MessageFlags.EndStream) != 0;
@@ -984,7 +1003,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         if (size > 0)
                             writer.WriteInlineDirectMultiFrame(_stream.StreamId, size, msg, 0, default);
                         else
-                            writer.WriteInline(_stream.StreamId, ReadOnlySpan<byte>.Empty, 0, default);
+                            writer.WriteInline(_stream.StreamId, EmptyGrpcLpm, 0, default);
                     }
                     finally
                     {
@@ -994,24 +1013,32 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 }
 
                 // TryPause failed: ExecuteInline with intermediate buffer.
-                byte[]? buf = null;
+                byte[] buf;
+                int bufSize;
                 if (size > 0)
                 {
-                    if (_writeBuf != null && _writeBuf.Length >= size)
+                    if (_writeBuf != null && _writeBuf.Length >= 5 + size)
                         buf = _writeBuf;
                     else
                     {
                         if (_writeBuf != null) ArrayPool<byte>.Shared.Return(_writeBuf);
-                        buf = ArrayPool<byte>.Shared.Rent(size);
+                        buf = ArrayPool<byte>.Shared.Rent(5 + size);
                         _writeBuf = buf;
                     }
-                    using (var cos = new CodedOutputStream(buf))
-                        msg.WriteTo(cos);
+                    buf[0] = 0;
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                        buf.AsSpan(1, 4), (uint)size);
+                    msg.WriteTo(buf.AsSpan(5, size));
+                    bufSize = 5 + size;
+                }
+                else
+                {
+                    buf = EmptyGrpcLpm;
+                    bufSize = 5;
                 }
 
                 {
                     var streamId = _stream.StreamId;
-                    var bufSize = size;
                     var ctx = _context;
                     var stream = _stream;
                     writer.ExecuteInline(() =>
@@ -1021,10 +1048,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                             stream.SendResponseHeadersInline(writer);
                             ctx.MarkHeadersSent();
                         }
-                        if (buf != null)
-                            writer.WriteInline(streamId, buf.AsSpan(0, bufSize), 0, default);
-                        else
-                            writer.WriteInline(streamId, ReadOnlySpan<byte>.Empty, 0, default);
+                        writer.WriteInline(streamId, buf.AsSpan(0, bufSize), 0, default);
                     });
                 }
 

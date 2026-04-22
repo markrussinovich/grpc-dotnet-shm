@@ -30,7 +30,7 @@ public class StatusCodeTests
 {
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task StatusCode_OK_InTrailers()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -51,7 +51,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task StatusCode_NotFound_InTrailers()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -72,7 +72,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task StatusMessage_InTrailers()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -95,7 +95,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task StatusCode_Cancelled_AfterCancel()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -142,7 +142,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task ResourceExhausted_Status()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -161,7 +161,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task Internal_Status()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -180,7 +180,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task Unavailable_Status()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -199,7 +199,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task PermissionDenied_Status()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -218,7 +218,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task Unauthenticated_Status()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -237,7 +237,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task EmptyStatusMessage_IsAllowed()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -256,7 +256,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task NullStatusMessage_IsAllowed()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";
@@ -275,7 +275,7 @@ public class StatusCodeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task UnicodeStatusMessage_IsPreserved()
     {
         var segmentName = $"status_test_{Guid.NewGuid():N}";

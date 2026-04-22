@@ -69,7 +69,7 @@ public class ShmInterceptorTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnaryCall_InterceptorCalled_CountIncremented()
     {
         // Arrange
@@ -103,7 +103,7 @@ public class ShmInterceptorTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ClientStreaming_InterceptorCalled_CountIncremented()
     {
         // Arrange
@@ -143,7 +143,7 @@ public class ShmInterceptorTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ServerStreaming_InterceptorCalled_CountIncremented()
     {
         // Arrange
@@ -183,7 +183,7 @@ public class ShmInterceptorTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task DuplexStreaming_InterceptorCalled_CountIncremented()
     {
         // Arrange
@@ -228,7 +228,7 @@ public class ShmInterceptorTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task MultipleInterceptors_CalledInOrder()
     {
         // Arrange
@@ -273,7 +273,7 @@ public class ShmInterceptorTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task HeaderModifyingInterceptor_AddsHeaders()
     {
         // Arrange
@@ -311,7 +311,7 @@ public class ShmInterceptorTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task InterceptorOnError_InterceptorSeesError()
     {
         // Arrange

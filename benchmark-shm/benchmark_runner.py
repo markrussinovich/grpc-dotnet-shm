@@ -126,15 +126,16 @@ def extract_data(results: dict) -> dict:
 
     # --- Size groups (matching Go's split) ---
     # Small streaming sizes  (Go: 64B-1MB; .NET: 1B-4MB)
-    sizes = [1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304]
+    # Small streaming sizes  (0B-4MB)
+    sizes = [0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304]
     size_labels = [format_size(s) for s in sizes]
 
-    # Small unary/roundtrip sizes  (Go: 64B-4KB; .NET: 1B-64KB)
-    rt_sizes = [1, 1024, 4096, 16384, 65536]
+    # Small unary/roundtrip sizes  (0B-64KB)
+    rt_sizes = [0, 1, 1024, 4096, 16384, 65536]
     rt_labels = [format_size(s) for s in rt_sizes]
 
-    # Large payload sizes  (Go: 1MB-256MB; .NET: 1MB-128MB)
-    large_sizes = [1048576, 2097152, 4194304, 16777216, 33554432, 134217728]
+    # Large payload sizes  (Go: 1MB-256MB; .NET: 1MB-256MB)
+    large_sizes = [1048576, 2097152, 4194304, 16777216, 67108864, 268435456]
     large_size_labels = [format_size(s) for s in large_sizes]
 
     # --- Helpers ---

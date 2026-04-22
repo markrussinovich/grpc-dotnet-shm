@@ -31,7 +31,7 @@ public class CancellationTests
 {
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task CancelStream_BeforeSendingData_SetsCancelledFlag()
     {
         var segmentName = $"cancel_test_{Guid.NewGuid():N}";
@@ -53,7 +53,7 @@ public class CancellationTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task CancelStream_AfterSendingHeaders_SetsCancelledFlag()
     {
         var segmentName = $"cancel_test_{Guid.NewGuid():N}";
@@ -75,7 +75,7 @@ public class CancellationTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task CancelStream_AfterSendingMessage_SetsCancelledFlag()
     {
         var segmentName = $"cancel_test_{Guid.NewGuid():N}";
@@ -95,7 +95,7 @@ public class CancellationTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task CancelStream_MultipleTimes_IsIdempotent()
     {
         var segmentName = $"cancel_test_{Guid.NewGuid():N}";
@@ -116,7 +116,7 @@ public class CancellationTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task CancelledStream_SendMessage_Throws()
     {
         var segmentName = $"cancel_test_{Guid.NewGuid():N}";
@@ -137,7 +137,7 @@ public class CancellationTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task CancellationToken_PropagatestoStream()
     {
         var segmentName = $"cancel_test_{Guid.NewGuid():N}";
@@ -160,7 +160,7 @@ public class CancellationTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public void CancelStream_AfterDispose_Throws()
     {
         var segmentName = $"cancel_test_{Guid.NewGuid():N}";
@@ -179,7 +179,7 @@ public class CancellationTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task MultipleStreams_CancelOne_OthersUnaffected()
     {
         var segmentName = $"cancel_test_{Guid.NewGuid():N}";

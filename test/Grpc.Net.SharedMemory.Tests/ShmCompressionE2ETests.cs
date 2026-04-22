@@ -32,7 +32,7 @@ namespace Grpc.Net.SharedMemory.Tests;
 public class ShmCompressionE2ETests : TransportTestBase
 {
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task GzipCompression_UnaryCall_DataDecompressedCorrectly()
     {
         // Arrange — both sides configured with gzip compression
@@ -97,7 +97,7 @@ public class ShmCompressionE2ETests : TransportTestBase
     }
 
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task NoCompression_UnaryCall_StillWorks()
     {
         // Arrange — no compression configured (default null)
@@ -138,7 +138,7 @@ public class ShmCompressionE2ETests : TransportTestBase
     }
 
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task GzipCompression_SmallMessageBelowThreshold_NotCompressed()
     {
         // Arrange — compression enabled but min size is large
@@ -188,7 +188,7 @@ public class ShmCompressionE2ETests : TransportTestBase
     }
 
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task GzipCompression_MultipleMessages_AllDecompressCorrectly()
     {
         // Arrange
@@ -263,7 +263,7 @@ public class ShmCompressionE2ETests : TransportTestBase
     }
 
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task DeflateCompression_UnaryCall_DataDecompressedCorrectly()
     {
         // Arrange — both sides configured with deflate compression

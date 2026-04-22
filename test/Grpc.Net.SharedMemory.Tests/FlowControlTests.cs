@@ -45,7 +45,7 @@ public class FlowControlTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task Stream_InitialSendWindow_IsCorrect()
     {
         var segmentName = $"flow_test_{Guid.NewGuid():N}";
@@ -87,7 +87,7 @@ public class FlowControlTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SendMessage_WithinWindow_CompletesImmediately()
     {
         var segmentName = $"flow_test_{Guid.NewGuid():N}";
@@ -129,7 +129,7 @@ public class FlowControlTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task MultipleSmallMessages_ConsumeWindow()
     {
         var segmentName = $"flow_test_{Guid.NewGuid():N}";
@@ -289,7 +289,7 @@ public class ConcurrentStreamTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task ConcurrentStreams_CanSendIndependently()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";
@@ -351,7 +351,7 @@ public class ConcurrentStreamTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task ManyStreams_Created_InParallel()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";
@@ -400,7 +400,7 @@ public class ConcurrentStreamTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task StreamIsClientStream_ReflectsConnection()
     {
         var segmentName = $"concurrent_test_{Guid.NewGuid():N}";

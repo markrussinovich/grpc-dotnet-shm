@@ -31,7 +31,7 @@ public class ShmLifetimeTests
 {
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ServerDispose_ActiveStreams_StreamsClosed()
     {
         // Arrange
@@ -55,7 +55,7 @@ public class ShmLifetimeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ClientDispose_ActiveStreams_StreamsClosed()
     {
         // Arrange
@@ -76,7 +76,7 @@ public class ShmLifetimeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task GracefulShutdown_WaitsForActiveStreams()
     {
         // Arrange
@@ -113,7 +113,7 @@ public class ShmLifetimeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task GoAway_NewStreamsRejected()
     {
         // Arrange
@@ -133,7 +133,7 @@ public class ShmLifetimeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task MultipleConnections_IndependentLifetimes()
     {
         // Arrange
@@ -164,7 +164,7 @@ public class ShmLifetimeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task StreamDispose_BeforeCompletion_NoLeak()
     {
         // Arrange
@@ -187,7 +187,7 @@ public class ShmLifetimeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ConnectionReuse_AfterStreamCompletion()
     {
         // Arrange
@@ -219,7 +219,7 @@ public class ShmLifetimeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public void ServerRestart_ClientReconnects()
     {
         // Arrange
@@ -246,7 +246,7 @@ public class ShmLifetimeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ConcurrentStreams_AllComplete()
     {
         // Arrange
@@ -287,7 +287,7 @@ public class ShmLifetimeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task MaxStreamsEnforced_ExcessRejected()
     {
         // Arrange - create server with max 5 streams

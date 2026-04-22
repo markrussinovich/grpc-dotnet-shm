@@ -29,7 +29,7 @@ public class MetadataTests
 {
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task TextMetadata_IsPreserved()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -60,7 +60,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task BinaryMetadata_WithBinSuffix_IsAccepted()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -93,7 +93,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task LargeBinaryMetadata_IsAccepted()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -129,7 +129,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task MultipleMetadataHeaders_ArePreserved()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -163,7 +163,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task DuplicateMetadataKeys_AreAllowed()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -198,7 +198,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task EmptyMetadataValue_IsAllowed()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -228,7 +228,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task MixedTextAndBinaryMetadata_IsAccepted()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -276,7 +276,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task NullMetadata_IsAccepted()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -302,7 +302,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task EmptyMetadata_IsAccepted()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -328,7 +328,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SpecialCharactersInValue_ArePreserved()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -358,7 +358,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task UnicodeInValue_IsPreserved()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -402,7 +402,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task TrailerMetadata_IsPreserved()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";
@@ -428,7 +428,7 @@ public class MetadataTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task GrpcStatusInTrailers_IsSet()
     {
         var segmentName = $"metadata_test_{Guid.NewGuid():N}";

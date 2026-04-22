@@ -40,7 +40,7 @@ public class ShmConnectionPoolConcurrencyTests
     #region CA. GetConnectionAsync Concurrency
 
     [Test]
-    [Timeout(15000)]
+    [CancelAfter(15000)]
     public async Task GetConnection_100ConcurrentCalls_AllSucceed()
     {
         var name = $"conc_test_{Guid.NewGuid():N}";
@@ -61,7 +61,7 @@ public class ShmConnectionPoolConcurrencyTests
     }
 
     [Test]
-    [Timeout(15000)]
+    [CancelAfter(15000)]
     public async Task GetConnection_RaceWithDispose_NoDeadlock()
     {
         var name = $"conc_test_{Guid.NewGuid():N}";
@@ -103,7 +103,7 @@ public class ShmConnectionPoolConcurrencyTests
     }
 
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task GetConnection_DisposeWhileFactoryBlocked_FailsFastAndNoLeak()
     {
         // This test verifies that when DisposeAsync() races with a slow
@@ -160,7 +160,7 @@ public class ShmConnectionPoolConcurrencyTests
     #region CB. Connect Lock Serialization
 
     [Test]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task ConnectLock_ConcurrentThreads_FactoryCalledSerially()
     {
         var name = $"conc_test_{Guid.NewGuid():N}";
@@ -224,7 +224,7 @@ public class ShmConnectionPoolConcurrencyTests
     }
 
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ConnectLock_FactoryThrows_WaitersGetException()
     {
         var callCount = 0;
@@ -250,7 +250,7 @@ public class ShmConnectionPoolConcurrencyTests
     #region CC. StreamRemoved Concurrency
 
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task StreamRemoved_50StreamsDisposeConcurrently_CountConsistent()
     {
         var name = $"conc_test_{Guid.NewGuid():N}";
@@ -279,7 +279,7 @@ public class ShmConnectionPoolConcurrencyTests
     #region CF. Stress Tests
 
     [Test]
-    [Timeout(15000)]
+    [CancelAfter(15000)]
     public async Task StressTest_200Tasks_RandomCreateDispose_2Seconds()
     {
         var name = $"stress_test_{Guid.NewGuid():N}";
@@ -323,7 +323,7 @@ public class ShmConnectionPoolConcurrencyTests
     #region CE. Direct-Mode (No Pool) Dispose Race
 
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task DirectMode_DisposeWhileConnecting_NoLeakOrCrash()
     {
         // Verifies that when ShmControlHandler is in direct-connection mode

@@ -30,7 +30,7 @@ namespace Grpc.Net.SharedMemory.Tests;
 public class ShmStreamingTests
 {
     [Test]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task DuplexStream_SendLargeFileBatched_Success()
     {
         // Arrange - create 1MB of test data
@@ -89,7 +89,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task ClientStream_SendLargeFileBatched_Success()
     {
         // Arrange
@@ -140,7 +140,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task DuplexStream_SimultaneousSendAndReceive_Success()
     {
         // Arrange
@@ -204,7 +204,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ServerStreaming_ManySmallMessages_Success()
     {
         // Arrange
@@ -256,7 +256,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ClientStreaming_ManySmallMessages_Success()
     {
         // Arrange
@@ -309,7 +309,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task BidirectionalStreaming_InterleavedMessages_Success()
     {
         // Arrange
@@ -371,7 +371,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task Stream_EmptyMessages_Success()
     {
         // Arrange
@@ -423,7 +423,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task ParallelStreams_MultipleConnections_Success()
     {
         // Arrange

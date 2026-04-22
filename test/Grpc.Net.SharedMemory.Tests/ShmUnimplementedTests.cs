@@ -30,7 +30,7 @@ public class ShmUnimplementedTests
 {
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnimplementedMethod_ReturnsUnimplementedStatus()
     {
         // Arrange
@@ -60,7 +60,7 @@ public class ShmUnimplementedTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnimplementedService_ReturnsUnimplementedStatus()
     {
         // Arrange
@@ -90,7 +90,7 @@ public class ShmUnimplementedTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnimplementedMethod_ServerStreaming_ReturnsUnimplementedStatus()
     {
         // Arrange
@@ -119,7 +119,7 @@ public class ShmUnimplementedTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnimplementedMethod_ClientStreaming_ReturnsUnimplementedStatus()
     {
         // Arrange
@@ -151,7 +151,7 @@ public class ShmUnimplementedTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnimplementedMethod_BidirectionalStreaming_ReturnsUnimplementedStatus()
     {
         // Arrange
@@ -181,7 +181,7 @@ public class ShmUnimplementedTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task EmptyServiceName_ReturnsUnimplementedStatus()
     {
         // Arrange
@@ -211,7 +211,7 @@ public class ShmUnimplementedTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task MalformedPath_ReturnsUnimplementedStatus()
     {
         // Arrange
@@ -240,7 +240,7 @@ public class ShmUnimplementedTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnimplementedWithMetadata_MetadataPreserved()
     {
         // Arrange

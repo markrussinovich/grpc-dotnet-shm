@@ -169,7 +169,7 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task UnaryLargePayload_64KB_DataIntegrity()
     {
         // Reproduces: "Failed to deserialize response message" for unary ≥64KB.
@@ -235,7 +235,7 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task UnaryLargePayload_1MB_DataIntegrity()
     {
         var name = $"grpc_test_{Guid.NewGuid():N}";
@@ -283,7 +283,7 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Timeout(60000)]
+    [CancelAfter(60000)]
     public async Task UnaryLargePayload_256MB_RawRing_DataIntegrity()
     {
         // Reproduce 256MB hang: raw ring write/read to isolate from protobuf/ShmGrpcServer.
@@ -328,7 +328,7 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Timeout(60000)]
+    [CancelAfter(60000)]
     public async Task MultiStream_1MB_ConcurrentEcho_DataIntegrity()
     {
         // Reproduce stream 1M s=4 crash: 4 concurrent streams on one connection.
@@ -397,7 +397,7 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task E2E_Unary64KB_ViaControlHandler_DataIntegrity()
     {
         // End-to-end through ShmControlHandler (same path as GrpcChannel).
@@ -428,7 +428,14 @@ public class ShmGrpcStreamTests
 
                                     await stream.SendResponseHeadersAsync();
                                     if (msg != null)
-                                        await stream.SendMessageAsync(msg);
+                                    {
+                                        // ReceiveMessagesAsync returns raw ring payload
+                                        // which now includes the 5-byte gRPC LPM header.
+                                        // SendMessageAsync will add its own header, so
+                                        // strip the received header to avoid double-wrapping.
+                                        var body = msg.AsMemory(5);
+                                        await stream.SendMessageAsync(body);
+                                    }
                                     await stream.SendTrailersAsync(StatusCode.OK);
                                 }
                                 catch { }
@@ -480,7 +487,7 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task SendMessageAndHalfClose_64KB_DataIntegrity()
     {
         // Exercises SendMessageAndHalfCloseAsync: a single frame with

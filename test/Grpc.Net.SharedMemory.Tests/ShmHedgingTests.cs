@@ -45,7 +45,7 @@ public class ShmHedgingTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnaryCall_FirstAttemptSucceeds_NoHedging()
     {
         // Arrange
@@ -78,7 +78,7 @@ public class ShmHedgingTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnaryCall_NonFatalError_HedgesNewAttempt()
     {
         // Arrange
@@ -134,7 +134,7 @@ public class ShmHedgingTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnaryCall_FatalError_NoHedging()
     {
         // Arrange
@@ -170,7 +170,7 @@ public class ShmHedgingTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnaryCall_MaxAttemptsReached_Fails()
     {
         // Arrange
@@ -209,7 +209,7 @@ public class ShmHedgingTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task StreamingCall_HedgingNotApplicable()
     {
         // Arrange - hedging typically only applies to unary calls
@@ -246,7 +246,7 @@ public class ShmHedgingTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task HedgingWithDelay_DelayRespected()
     {
         // Arrange
@@ -297,7 +297,7 @@ public class ShmHedgingTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task Cancellation_CancelsAllHedgedAttempts()
     {
         // Arrange
@@ -329,7 +329,7 @@ public class ShmHedgingTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task SuccessfulHedge_CancelsRemainingAttempts()
     {
         // Arrange
@@ -338,7 +338,9 @@ public class ShmHedgingTests
         using var client = ShmConnection.ConnectAsClient(segmentName);
 
         // First hedge attempt - will be slow
+#pragma warning disable CS0219 // Variable is assigned but its value is never used
         var stream1Done = false;
+#pragma warning restore CS0219
         var stream2Done = false;
 
         var task1 = Task.Run(async () =>

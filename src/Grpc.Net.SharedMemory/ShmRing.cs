@@ -741,10 +741,13 @@ public sealed class ShmRing : IDisposable
             var readIdx = Volatile.Read(ref header.ReadIdx);
             if (_capacity - (writeIdx - readIdx) >= needed)
             {
-                // Success - adapt spin limit upward
+                // Success - adapt spin limit: maintain or raise when we
+                // waited longer than 75% of the limit.
                 if (i > 0)
                 {
-                    var newCutoff = Math.Min(ShmConstants.SpinIterationsMax, (7 * spinLimit + i * 2) / 8);
+                    var newCutoff = i > (spinLimit * 3 / 4)
+                        ? Math.Min(ShmConstants.SpinIterationsMax, spinLimit + spinLimit / 8)
+                        : spinLimit;
                     Volatile.Write(ref _spaceSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, newCutoff));
                 }
                 return;
@@ -835,10 +838,17 @@ public sealed class ShmRing : IDisposable
             var readIdx = Volatile.Read(ref header.ReadIdx);
             if (writeIdx > readIdx)
             {
-                // Success - adapt spin limit upward
+                // Success - adapt spin limit: if we found data within the
+                // spin window, keep the cutoff at least at the current level.
+                // Previous formula (7*limit + i*2)/8 would reduce the cutoff
+                // when i < 3*limit/8, causing unnecessary kernel waits.
                 if (i > 0)
                 {
-                    var newCutoff = Math.Min(ShmConstants.SpinIterationsMax, (7 * spinLimit + i * 2) / 8);
+                    // Maintain current cutoff or raise slightly if we waited
+                    // longer than 75% of the limit.
+                    var newCutoff = i > (spinLimit * 3 / 4)
+                        ? Math.Min(ShmConstants.SpinIterationsMax, spinLimit + spinLimit / 8)
+                        : spinLimit;
                     Volatile.Write(ref _dataSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, newCutoff));
                 }
                 return;

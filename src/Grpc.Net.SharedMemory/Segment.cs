@@ -595,7 +595,40 @@ public sealed partial class Segment : IDisposable
         if (ready)
         {
             SignalHeaderFlagWaiters(ClientReadyOffset);
+            // Also signal the named event used by grpc-go-shmem's WaitForClient.
+            // Go waits on WaitForSingleObject(named event), which is NOT woken by
+            // WakeByAddressSingle. Both mechanisms are needed for cross-language compat.
+            SignalClientReadyNamedEvent(Name);
         }
+    }
+
+    /// <summary>
+    /// Best-effort signal of the Windows named event that Go's WaitForClient
+    /// blocks on. The real readiness flag is already persisted in shared
+    /// memory; this is only an optimization to wake the Go side faster.
+    /// All failures are silently swallowed — matching WindowsRingSync's
+    /// treatment of event access problems as non-fatal.
+    /// Event name format: Local\grpc_shm_{segmentName}_clientReady
+    /// </summary>
+    private static void SignalClientReadyNamedEvent(string segmentName)
+    {
+#if WINDOWS
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            var eventName = $"Local\\grpc_shm_{segmentName}_clientReady";
+            using var evt = EventWaitHandle.OpenExisting(eventName);
+            evt.Set();
+        }
+        catch
+        {
+            // Best-effort: named event may not exist (Go server not started,
+            // or .NET-to-.NET where this event isn't used), or may be
+            // inaccessible (session/ACL mismatch). The shared memory
+            // clientReady flag is the authoritative signal; this wake is
+            // purely an optimization.
+        }
+#endif
     }
 
     /// <summary>

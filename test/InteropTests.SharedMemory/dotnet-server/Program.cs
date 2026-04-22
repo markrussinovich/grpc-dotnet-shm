@@ -16,11 +16,9 @@
 
 #endregion
 
-using System.Text;
 using Grpc.Core;
 using Grpc.Net.SharedMemory;
 using Greet;
-using Google.Protobuf;
 
 Console.WriteLine("==========================================");
 Console.WriteLine(".NET Greeter Server - Shared Memory Transport");
@@ -46,78 +44,30 @@ Console.CancelKeyPress += (_, e) =>
     cts.Cancel();
 };
 
-// Create the shared memory listener with grpc-go-shmem compatible control segment
-using var listener = new ShmControlListener(segmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+// Use ShmGrpcServer high-level API — handles gRPC LPM framing,
+// protobuf serialization, and stream lifecycle automatically.
+await using var server = new ShmGrpcServer(segmentName, ringCapacity: 1024 * 1024);
+
+server.MapUnary<HelloRequest, HelloReply>(
+    "/greet.Greeter/SayHello",
+    (request, context) =>
+    {
+        Console.WriteLine($"Received request: /greet.Greeter/SayHello");
+        Console.WriteLine($"  Name: {request.Name}");
+
+        var reply = new HelloReply
+        {
+            Message = $"Hello {request.Name} from .NET server!"
+        };
+
+        Console.WriteLine($"  Response sent: {reply.Message}");
+        return Task.FromResult(reply);
+    });
 
 try
 {
     Console.WriteLine("Waiting for connections...");
-    
-    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
-    {
-        Console.WriteLine($"New connection accepted: {connection.Name}");
-        
-        // Handle streams from this connection
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
-                {
-                    try
-                    {
-                        // Wait for request headers
-                        var headers = await stream.ReceiveRequestHeadersAsync(cts.Token);
-
-                        if (headers != null)
-                        {
-                            Console.WriteLine($"Received request: {headers.Method}");
-
-                            // Read the request message using async enumerable
-                            byte[]? requestBytes = null;
-                            await foreach (var msg in stream.ReceiveMessagesAsync(cts.Token))
-                            {
-                                requestBytes = msg;
-                                break; // Unary: only expect one message
-                            }
-
-                            if (requestBytes == null)
-                            {
-                                Console.WriteLine("  No request message received");
-                                await stream.SendTrailersAsync(StatusCode.InvalidArgument, "No message");
-                                continue;
-                            }
-
-                            var request = HelloRequest.Parser.ParseFrom(requestBytes);
-                            Console.WriteLine($"  Name: {request.Name}");
-
-                            // Create response
-                            var reply = new HelloReply
-                            {
-                                Message = $"Hello {request.Name} from .NET server!"
-                            };
-
-                            // Send response
-                            await stream.SendResponseHeadersAsync();
-                            await stream.SendMessageAsync(reply.ToByteArray());
-                            await stream.SendTrailersAsync(StatusCode.OK);
-
-                            Console.WriteLine($"  Response sent: {reply.Message}");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"  Stream error: {ex.Message}");
-                        await stream.SendTrailersAsync(StatusCode.Internal, ex.Message);
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // Normal shutdown
-            }
-        });
-    }
+    await server.RunAsync(cts.Token);
 }
 catch (OperationCanceledException)
 {
