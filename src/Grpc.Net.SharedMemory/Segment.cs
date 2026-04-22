@@ -603,7 +603,11 @@ public sealed partial class Segment : IDisposable
     }
 
     /// <summary>
-    /// Signals the Windows named event that Go's WaitForClient blocks on.
+    /// Best-effort signal of the Windows named event that Go's WaitForClient
+    /// blocks on. The real readiness flag is already persisted in shared
+    /// memory; this is only an optimization to wake the Go side faster.
+    /// All failures are silently swallowed — matching WindowsRingSync's
+    /// treatment of event access problems as non-fatal.
     /// Event name format: Local\grpc_shm_{segmentName}_clientReady
     /// </summary>
     private static void SignalClientReadyNamedEvent(string segmentName)
@@ -616,10 +620,13 @@ public sealed partial class Segment : IDisposable
             using var evt = EventWaitHandle.OpenExisting(eventName);
             evt.Set();
         }
-        catch (WaitHandleCannotBeOpenedException)
+        catch
         {
-            // Named event doesn't exist — Go server may not have created it yet,
-            // or we're running Go-to-Go where this event isn't needed.
+            // Best-effort: named event may not exist (Go server not started,
+            // or .NET-to-.NET where this event isn't used), or may be
+            // inaccessible (session/ACL mismatch). The shared memory
+            // clientReady flag is the authoritative signal; this wake is
+            // purely an optimization.
         }
 #endif
     }
