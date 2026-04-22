@@ -34,14 +34,11 @@ public class ShmMaxMessageSizeTests
     /// </summary>
     private const int DefaultMaxReceiveSize = 4 * 1024 * 1024;
 
-    /// <summary>
-    /// Default max send message size is unlimited (int.MaxValue effectively).
-    /// </summary>
-    private const int DefaultMaxSendSize = int.MaxValue;
+
 
     [Test]
     [Platform("Win")]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task ReceivedMessageWithinDefaultSize_Succeeds()
     {
         // Arrange - message under 4MB limit
@@ -75,7 +72,7 @@ public class ShmMaxMessageSizeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task ReceivedMessageExceedsDefaultSize_ShouldEnforceLimit()
     {
         // Arrange - message over 4MB limit (4MB + 1 byte)
@@ -115,7 +112,7 @@ public class ShmMaxMessageSizeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task SendMessageExceedsConfiguredLimit_ShouldEnforceLimit()
     {
         // Arrange - configure a smaller send limit
@@ -154,7 +151,7 @@ public class ShmMaxMessageSizeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task EmptyMessage_Succeeds()
     {
         // Arrange
@@ -187,7 +184,7 @@ public class ShmMaxMessageSizeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task ExactlyMaxSize_Succeeds()
     {
         // Arrange - message exactly at 4MB limit
@@ -222,7 +219,7 @@ public class ShmMaxMessageSizeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task MultipleSmallMessages_TotalExceedsMax_Succeeds()
     {
         // Arrange - multiple small messages that together exceed max
@@ -263,7 +260,7 @@ public class ShmMaxMessageSizeTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task StreamingWithVaryingMessageSizes_Succeeds()
     {
         // Arrange

@@ -32,7 +32,7 @@ namespace Grpc.Net.SharedMemory.Tests;
 public class ShmConnectionPoolE2ETests
 {
     [Test]
-    [Timeout(15000)]
+    [CancelAfter(15000)]
     public async Task E2E_SingleConnDefault_UnaryWorks()
     {
         var segmentName = $"pool_e2e_{Guid.NewGuid():N}";
@@ -54,12 +54,12 @@ public class ShmConnectionPoolE2ETests
         // Send a unary "call" — send headers + message + half-close, receive headers + message + trailers.
         await PerformUnaryCallAsync(handler);
 
-        Assert.That(pool.ConnectionCount, Is.EqualTo(1));
+        Assert.That(pool!.ConnectionCount, Is.EqualTo(1));
         Assert.That(pool.TotalConnectionsCreated, Is.EqualTo(1));
     }
 
     [Test]
-    [Timeout(30000)]
+    [CancelAfter(30000)]
     public async Task E2E_MultiConn_ConcurrentUnary_AllSucceed()
     {
         var segmentName = $"pool_e2e_{Guid.NewGuid():N}";
@@ -97,7 +97,7 @@ public class ShmConnectionPoolE2ETests
         await Task.WhenAll(tasks);
 
         // Should have created multiple connections since maxStreams=5 < 20 concurrent.
-        Assert.That(pool.ConnectionCount, Is.GreaterThan(1),
+        Assert.That(pool!.ConnectionCount, Is.GreaterThan(1),
             "Pool should have scaled up under concurrent load");
         Assert.That(pool.TotalConnectionsCreated, Is.GreaterThan(1));
 
@@ -105,7 +105,7 @@ public class ShmConnectionPoolE2ETests
     }
 
     [Test]
-    [Timeout(15000)]
+    [CancelAfter(15000)]
     public async Task E2E_MultiConn_ServerSees_MultipleConnections()
     {
         var segmentName = $"pool_e2e_{Guid.NewGuid():N}";
@@ -149,7 +149,7 @@ public class ShmConnectionPoolE2ETests
     #region RingCapacity Negotiation
 
     [Test]
-    [Timeout(15000)]
+    [CancelAfter(15000)]
     public async Task E2E_RingCapacity_ClientPreference_UsedWhenSmallerThanServer()
     {
         // Server allows up to 65536, client prefers 4096 → negotiated = 4096
@@ -193,7 +193,7 @@ public class ShmConnectionPoolE2ETests
     }
 
     [Test]
-    [Timeout(15000)]
+    [CancelAfter(15000)]
     public async Task E2E_RingCapacity_ClientLargerThanServer_CappedByServer()
     {
         // Server allows 4096, client wants 65536 → negotiated = 4096
@@ -236,7 +236,7 @@ public class ShmConnectionPoolE2ETests
     }
 
     [Test]
-    [Timeout(15000)]
+    [CancelAfter(15000)]
     public async Task E2E_RingCapacity_ClientZero_UsesServerDefault()
     {
         // Client sends 0 (no preference) → server uses its default (8192)

@@ -29,7 +29,7 @@ public class StreamingEdgeCaseTests
 {
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SendEmptyMessage_Succeeds()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -54,7 +54,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SendSingleByteMessage_Succeeds()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -79,7 +79,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task SendLargeMessage_Succeeds()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -107,7 +107,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SendMultipleEmptyMessages_Succeeds()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -134,7 +134,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task RapidSmallMessages_Succeeds()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -161,7 +161,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task AlternatingMessageSizes_Succeeds()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -193,7 +193,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task HeadersOnly_NoMessage_IsValid()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -214,7 +214,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task RequestHeaders_Method_IsPreserved()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -233,7 +233,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SendMessage_BeforeHeaders_Throws()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -252,7 +252,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SendTrailers_BeforeHeaders_Throws()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -270,7 +270,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SendTrailers_AfterTrailers_Throws()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";
@@ -293,7 +293,7 @@ public class StreamingEdgeCaseTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SendMessage_AfterTrailers_Throws()
     {
         var segmentName = $"streaming_test_{Guid.NewGuid():N}";

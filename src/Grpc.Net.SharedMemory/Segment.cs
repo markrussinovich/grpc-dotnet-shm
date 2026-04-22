@@ -598,7 +598,7 @@ public sealed partial class Segment : IDisposable
             // Also signal the named event used by grpc-go-shmem's WaitForClient.
             // Go waits on WaitForSingleObject(named event), which is NOT woken by
             // WakeByAddressSingle. Both mechanisms are needed for cross-language compat.
-            SignalClientReadyNamedEvent();
+            SignalClientReadyNamedEvent(Name);
         }
     }
 
@@ -606,13 +606,13 @@ public sealed partial class Segment : IDisposable
     /// Signals the Windows named event that Go's WaitForClient blocks on.
     /// Event name format: Local\grpc_shm_{segmentName}_clientReady
     /// </summary>
-    private void SignalClientReadyNamedEvent()
+    private static void SignalClientReadyNamedEvent(string segmentName)
     {
 #if WINDOWS
         if (!OperatingSystem.IsWindows()) return;
         try
         {
-            var eventName = $"Local\\grpc_shm_{Name}_clientReady";
+            var eventName = $"Local\\grpc_shm_{segmentName}_clientReady";
             using var evt = EventWaitHandle.OpenExisting(eventName);
             evt.Set();
         }

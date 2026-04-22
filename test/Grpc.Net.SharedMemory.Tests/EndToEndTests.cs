@@ -31,7 +31,7 @@ public class EndToEndTests
 {
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnaryCall_SimpleRequestResponse_Works()
     {
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
@@ -80,7 +80,7 @@ public class EndToEndTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ServerStreaming_MultipleMessages_Works()
     {
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
@@ -127,7 +127,7 @@ public class EndToEndTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ClientStreaming_MultipleMessages_Works()
     {
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
@@ -182,7 +182,7 @@ public class EndToEndTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task BidirectionalStreaming_Works()
     {
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
@@ -236,7 +236,7 @@ public class EndToEndTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ErrorResponse_ReturnsStatusCode()
     {
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
@@ -272,7 +272,7 @@ public class EndToEndTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task Cancellation_CancelsStream()
     {
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
@@ -301,7 +301,7 @@ public class EndToEndTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task Deadline_PropagatesInHeaders()
     {
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
@@ -342,7 +342,7 @@ public class EndToEndTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task Metadata_RoundTrips()
     {
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
@@ -392,7 +392,7 @@ public class EndToEndTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task LargeMessage_TransfersCorrectly()
     {
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";

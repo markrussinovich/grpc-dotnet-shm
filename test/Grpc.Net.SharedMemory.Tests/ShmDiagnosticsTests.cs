@@ -33,7 +33,7 @@ public class ShmDiagnosticsTests
 {
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnaryCall_TelemetryRecorded()
     {
         // Arrange
@@ -70,7 +70,7 @@ public class ShmDiagnosticsTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ErrorResponse_TelemetryRecordsError()
     {
         // Arrange
@@ -107,7 +107,7 @@ public class ShmDiagnosticsTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task StreamingCall_TelemetryRecordsMessages()
     {
         // Arrange
@@ -150,7 +150,7 @@ public class ShmDiagnosticsTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task CancelledCall_TelemetryRecordsCancellation()
     {
         // Arrange
@@ -175,7 +175,7 @@ public class ShmDiagnosticsTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task Duration_TelemetryRecordsCallDuration()
     {
         // Arrange
@@ -214,7 +214,7 @@ public class ShmDiagnosticsTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task MessageSize_TelemetryRecordsSizes()
     {
         // Arrange
@@ -254,7 +254,7 @@ public class ShmDiagnosticsTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task MultipleRequests_TelemetryAggregates()
     {
         // Arrange
@@ -290,7 +290,7 @@ public class ShmDiagnosticsTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task ConnectionMetrics_TelemetryRecorded()
     {
         // Arrange
@@ -325,7 +325,7 @@ public class ShmDiagnosticsTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public void ActivitySource_TracesCreated()
     {
         // Arrange

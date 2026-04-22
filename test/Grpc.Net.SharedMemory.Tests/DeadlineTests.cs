@@ -60,7 +60,7 @@ public class DeadlineTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SendRequestHeaders_WithDeadline_SetsDeadlineInHeaders()
     {
         var segmentName = $"deadline_test_{Guid.NewGuid():N}";
@@ -80,7 +80,7 @@ public class DeadlineTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task SendRequestHeaders_WithoutDeadline_DeadlineIsZero()
     {
         var segmentName = $"deadline_test_{Guid.NewGuid():N}";
@@ -140,7 +140,7 @@ public class DeadlineTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task MultipleStreams_CanHaveDifferentDeadlines()
     {
         var segmentName = $"deadline_test_{Guid.NewGuid():N}";
@@ -179,7 +179,7 @@ public class TimeoutPropagationTests
 
     [Test]
     [Platform("Win")]
-    [Timeout(3000)]
+    [CancelAfter(3000)]
     public async Task CancellationToken_Timeout_CancelsOperation()
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));

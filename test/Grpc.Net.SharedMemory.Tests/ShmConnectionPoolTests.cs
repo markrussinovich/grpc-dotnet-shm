@@ -282,7 +282,7 @@ public class ShmConnectionPoolTests
     }
 
     [Test]
-    [Timeout(5000)]
+    [CancelAfter(5000)]
     public async Task StreamRemoved_WakesWaiter()
     {
         var opts = DefaultOptions();

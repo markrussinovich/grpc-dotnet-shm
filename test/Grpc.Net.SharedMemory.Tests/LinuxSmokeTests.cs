@@ -30,7 +30,7 @@ namespace Grpc.Net.SharedMemory.Tests;
 public class LinuxSmokeTests : TransportTestBase
 {
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public void CreateAndConnect_Works()
     {
         var (server, client) = CreateConnectionPair(ringCapacity: 4096);
@@ -42,7 +42,7 @@ public class LinuxSmokeTests : TransportTestBase
     }
 
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task UnaryCall_Works()
     {
         var (server, client) = CreateConnectionPair(ringCapacity: 4096);
@@ -71,7 +71,7 @@ public class LinuxSmokeTests : TransportTestBase
     }
 
     [Test]
-    [Timeout(10000)]
+    [CancelAfter(10000)]
     public async Task SendReceiveMessages_ZeroCopyOptimization_Works()
     {
         // This test validates the new zero-copy write path (scatter write)

@@ -331,7 +331,7 @@ public class ShmSecurityTests
         // Reader immediately throws because token is cancelled
         Assert.That(async () => await hs.ClientHandshakeAsync(
             writer: (_, _, ct) => Task.CompletedTask,
-            reader: (ct) => { ct.ThrowIfCancellationRequested(); return default; },
+            reader: (ct) => { ct.ThrowIfCancellationRequested(); return default!; },
             cts.Token),
             Throws.InstanceOf<OperationCanceledException>());
     }
