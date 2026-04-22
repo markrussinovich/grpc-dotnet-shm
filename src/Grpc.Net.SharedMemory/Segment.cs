@@ -595,7 +595,33 @@ public sealed partial class Segment : IDisposable
         if (ready)
         {
             SignalHeaderFlagWaiters(ClientReadyOffset);
+            // Also signal the named event used by grpc-go-shmem's WaitForClient.
+            // Go waits on WaitForSingleObject(named event), which is NOT woken by
+            // WakeByAddressSingle. Both mechanisms are needed for cross-language compat.
+            SignalClientReadyNamedEvent();
         }
+    }
+
+    /// <summary>
+    /// Signals the Windows named event that Go's WaitForClient blocks on.
+    /// Event name format: Local\grpc_shm_{segmentName}_clientReady
+    /// </summary>
+    private void SignalClientReadyNamedEvent()
+    {
+#if WINDOWS
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            var eventName = $"Local\\grpc_shm_{Name}_clientReady";
+            using var evt = EventWaitHandle.OpenExisting(eventName);
+            evt.Set();
+        }
+        catch (WaitHandleCannotBeOpenedException)
+        {
+            // Named event doesn't exist — Go server may not have created it yet,
+            // or we're running Go-to-Go where this event isn't needed.
+        }
+#endif
     }
 
     /// <summary>

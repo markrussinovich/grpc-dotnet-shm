@@ -648,30 +648,46 @@ internal sealed class ShmFrameWriter : IDisposable
         DrainAllQueued();
 
         var cap = (int)_ring.Capacity;
-        var maxFramePayload = Math.Max(1, cap / 3);
+        // Single-frame threshold: payload ≤ cap/3 → WriteTo(Span) direct ring write.
+        // Kept high to maximize speculative zero-copy on the reader side.
+        var singleFrameThreshold = Math.Max(1, cap / 3);
+        // Multi-frame chunk size: cap/8 for deeper pipeline (~8 chunks in-flight).
+        // More reader/writer overlap reduces WaitForSpace stalls on large messages.
+        var chunkSize = Math.Max(1, cap / 8);
+
+        // The MESSAGE frame payload includes a 5-byte gRPC length-prefix
+        // header (compression flag + big-endian uint32 length) followed by
+        // the protobuf bytes. This is required for cross-language interop.
+        const int GrpcHeaderSize = 5;
+        var framePayloadSize = GrpcHeaderSize + payloadSize;
 
         // Single-frame + contiguous: use WriteTo(Span<byte>) to serialize
         // protobuf directly into the ring reservation. No CodedOutputStream,
         // no intermediate buffer, no Stream abstraction — one copy from
         // protobuf fields to ring memory.
-        if (payloadSize <= maxFramePayload)
+        if (framePayloadSize <= singleFrameThreshold)
         {
-            var totalSize = ShmConstants.FrameHeaderSize + payloadSize;
+            var totalSize = ShmConstants.FrameHeaderSize + framePayloadSize;
             var reservation = _ring.ReserveWrite(totalSize, ct);
             if (reservation.Second.IsEmpty)
             {
-                // Write frame header
+                // Write SHM frame header
                 var isLast = (extraFlags & MessageFlags.More) == 0;
                 var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
-                var header = new FrameHeader(FrameType.Message, streamId, (uint)payloadSize, flags);
+                var header = new FrameHeader(FrameType.Message, streamId, (uint)framePayloadSize, flags);
                 Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
                 header.EncodeTo(headerBytes);
                 headerBytes.CopyTo(reservation.First.Span);
 
+                // Write 5-byte gRPC length-prefix header
+                var grpcHdr = reservation.First.Span.Slice(ShmConstants.FrameHeaderSize, GrpcHeaderSize);
+                grpcHdr[0] = 0; // no compression
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcHdr.Slice(1), (uint)payloadSize);
+
                 // Serialize directly into ring span — zero intermediate buffer
                 if (payloadSize > 0)
                 {
-                    var payloadSpan = reservation.First.Span.Slice(ShmConstants.FrameHeaderSize, payloadSize);
+                    var payloadSpan = reservation.First.Span.Slice(ShmConstants.FrameHeaderSize + GrpcHeaderSize, payloadSize);
                     message.WriteTo(payloadSpan);
                 }
 
@@ -681,10 +697,15 @@ internal sealed class ShmFrameWriter : IDisposable
             // Wrap-around: fall through to RingFrameStream
         }
 
-        // Multi-frame or wrap-around: WriteTo(IBufferWriter) through
-        // RingFrameStream — protobuf writes directly into per-frame ring
-        // spans via GetSpan/Advance, no COS intermediate buffer.
-        using var rfs = new RingFrameStream(_ring, streamId, payloadSize, maxFramePayload, extraFlags, ct);
+        // Multi-frame or wrap-around: prepend 5-byte gRPC header, then
+        // WriteTo(IBufferWriter) through RingFrameStream.
+        using var rfs = new RingFrameStream(_ring, streamId, framePayloadSize, chunkSize, extraFlags, ct);
+        // Write gRPC header as first 5 bytes
+        Span<byte> grpcHeader = stackalloc byte[GrpcHeaderSize];
+        grpcHeader[0] = 0; // no compression
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcHeader.Slice(1), (uint)payloadSize);
+        rfs.Write(grpcHeader);
+        // Serialize protobuf directly into ring spans
         message.WriteTo((IBufferWriter<byte>)rfs);
         rfs.CommitFinalFrame();
     }
