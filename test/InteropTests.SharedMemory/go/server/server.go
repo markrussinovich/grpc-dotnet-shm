@@ -4,51 +4,45 @@
 package main
 
 import (
-"context"
-"flag"
-"fmt"
-"log"
-"os"
-"os/signal"
-"syscall"
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
-pb "interop-shm/greetpb"
+	pb "interop-shm/greetpb"
 
-"google.golang.org/grpc"
-"google.golang.org/grpc/internal/transport"
+	"google.golang.org/grpc"
 )
 
 var (
-segment = flag.String("segment", "interop_greeter", "Shared memory segment name")
+	segment = flag.String("segment", "interop_greeter", "Shared memory segment name")
 )
 
 type server struct {
-pb.UnimplementedGreeterServer
+	pb.UnimplementedGreeterServer
 }
 
 func (s *server) SayHello(ctx context.Context, req *pb.HelloRequest) (*pb.HelloReply, error) {
-log.Printf("Received request: name=%q", req.GetName())
-return &pb.HelloReply{
-Message: fmt.Sprintf("Hello %s from Go server!", req.GetName()),
-}, nil
+	log.Printf("Received request: name=%q", req.GetName())
+	return &pb.HelloReply{
+		Message: fmt.Sprintf("Hello %s from Go server!", req.GetName()),
+	}, nil
 }
 
 func main() {
-flag.Parse()
+	flag.Parse()
 
-fmt.Println("Go Greeter Server - Shared Memory")
-fmt.Printf("Segment: %s\n", *segment)
+	fmt.Println("Go Greeter Server - Shared Memory")
+	fmt.Printf("Segment: %s\n", *segment)
 
-lis, err := transport.NewShmListener(
-&transport.ShmAddr{Name: *segment},
-transport.DefaultSegmentSize,
-transport.DefaultRingASize,
-transport.DefaultRingBSize,
-)
-if err != nil {
-log.Fatalf("Failed to listen: %v", err)
-}
-defer lis.Close()
+	lis, err := grpc.NewShmListener(*segment, nil)
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+	defer lis.Close()
 
 s := grpc.NewServer()
 pb.RegisterGreeterServer(s, &server{})
