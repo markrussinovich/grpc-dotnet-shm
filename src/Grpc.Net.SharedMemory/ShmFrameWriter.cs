@@ -362,6 +362,20 @@ internal sealed class ShmFrameWriter : IDisposable
                 // If broke due to _inlineAction/_paused, loop back to top.
                 if (_inlineAction != null || _paused) continue;
 
+                // Phase 2.5: yield before blocking. Thread.Yield() is much
+                // cheaper than a kernel wait (~1µs vs ~80µs). In ping-pong
+                // benchmarks the response often arrives within this window.
+                Thread.Yield();
+                if (_inlineAction != null || _paused) continue;
+                if (_queue.TryDequeue(out batch[0]))
+                {
+                    var count = 1;
+                    while (count < maxBatch && _queue.TryDequeue(out batch[count]))
+                        count++;
+                    FlushBatch(batch, count);
+                    continue;
+                }
+
                 // Phase 3: blocking wait (lost-wake-safe pattern)
                 // Set _waiting BEFORE Reset to ensure writers see it and call Set().
                 phase3:
@@ -576,6 +590,15 @@ internal sealed class ShmFrameWriter : IDisposable
         // CAS guard: only one inline writer at a time.
         if (Interlocked.CompareExchange(ref _inlineWriterActive, 1, 0) != 0)
             return false;
+
+        // Fast path: WriterLoop is already idle in Phase 3 wait.
+        // In ping-pong benchmarks this is the common case — the queue
+        // is empty and WriterLoop is sleeping. Skip the 2000-spin.
+        if (_idleInWait)
+        {
+            _paused = true;
+            return true;
+        }
 
         _paused = true;
         // Spin until WriterLoop is truly idle (_idleInWait = true).
