@@ -162,6 +162,16 @@ public sealed class ShmControlHandler : HttpMessageHandler
         {
             return await SendOnStreamAsync(stream, request, cancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            await stream.CancelAsync().ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
+        {
+            await stream.CancelAsync().ConfigureAwait(false);
+            throw new OperationCanceledException(cancellationToken);
+        }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             await stream.CancelAsync().ConfigureAwait(false);
@@ -206,6 +216,11 @@ public sealed class ShmControlHandler : HttpMessageHandler
     private static async Task<HttpResponseMessage> SendOnStreamAsync(
         ShmGrpcStream stream, HttpRequestMessage request, CancellationToken cancellationToken)
     {
+        using var cancellationRegistration = cancellationToken.UnsafeRegister(static state =>
+        {
+            _ = CancelStreamAsync((ShmGrpcStream)state!);
+        }, stream);
+
         var method = request.RequestUri?.AbsolutePath ?? "/";
         var authority = request.RequestUri?.Authority ?? "localhost";
         var metadata = ExtractMetadata(request.Headers);
@@ -223,7 +238,15 @@ public sealed class ShmControlHandler : HttpMessageHandler
             await stream.SendHalfCloseAsync().ConfigureAwait(false);
         }
 
-        var responseHeaders = await stream.ReceiveResponseHeadersAsync(cancellationToken).ConfigureAwait(false);
+        HeadersV1 responseHeaders;
+        try
+        {
+            responseHeaders = await stream.ReceiveResponseHeadersAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
 
         var responseContent = new ShmControlResponseContent(stream);
         var response = new HttpResponseMessage(HttpStatusCode.OK)
@@ -243,6 +266,18 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
 
         return response;
+    }
+
+    private static async Task CancelStreamAsync(ShmGrpcStream stream)
+    {
+        try
+        {
+            await stream.CancelAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            // Best effort: cancellation may race with stream disposal.
+        }
     }
 
     /// <summary>

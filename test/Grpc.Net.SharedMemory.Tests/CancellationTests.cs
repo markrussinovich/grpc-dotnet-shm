@@ -16,7 +16,12 @@
 
 #endregion
 
+using System.Buffers.Binary;
+using System.Globalization;
+using System.Net.Http.Headers;
 using System.Text;
+using Google.Protobuf;
+using Google.Protobuf.WellKnownTypes;
 using NUnit.Framework;
 using Grpc.Core;
 
@@ -29,6 +34,107 @@ namespace Grpc.Net.SharedMemory.Tests;
 [TestFixture]
 public class CancellationTests
 {
+    [Test]
+    [Platform("Win")]
+    [CancelAfter(10000)]
+    public async Task UnaryCall_ClientCancellationBeforeHeaders_CancellationSentToServerContext()
+    {
+        var segmentName = $"cancel_contract_{Guid.NewGuid():N}";
+        var serverStartedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var serverCancellationTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var server = new ShmGrpcServer(segmentName);
+        server.MapUnary<StringValue, StringValue>(
+            "/test.Cancellation/WaitForCancel",
+            async (_, context) =>
+            {
+                serverStartedTcs.SetResult();
+                using var registration = context.CancellationToken.Register(
+                    static state => ((TaskCompletionSource)state!).TrySetResult(), serverCancellationTcs);
+
+                await serverCancellationTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                return new StringValue { Value = "cancelled" };
+            });
+
+        using var serverCts = new CancellationTokenSource();
+        var serverTask = Task.Run(() => server.RunAsync(serverCts.Token));
+        await WaitForServerAsync(segmentName);
+
+        using var handler = new ShmControlHandler(segmentName, new ShmClientTransportOptions
+        {
+            EnableMultipleConnections = false,
+            ConnectTimeout = TimeSpan.FromSeconds(5)
+        });
+        using var invoker = new HttpMessageInvoker(handler, disposeHandler: false);
+        using var requestCts = new CancellationTokenSource();
+        using var request = CreateGrpcRequest(
+            "/test.Cancellation/WaitForCancel",
+            new StringValue { Value = "hello" });
+
+        var sendTask = invoker.SendAsync(request, requestCts.Token);
+
+        await serverStartedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        requestCts.Cancel();
+
+        Assert.That(async () => await sendTask.WaitAsync(TimeSpan.FromSeconds(5)), Throws.InstanceOf<OperationCanceledException>());
+        await serverCancellationTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        serverCts.Cancel();
+        await Task.WhenAny(serverTask, Task.Delay(TimeSpan.FromSeconds(5)));
+    }
+
+    [Test]
+    [Platform("Win")]
+    [CancelAfter(10000)]
+    public async Task UnaryCall_DeadlineExceeded_CancelsServerContextAndReturnsDeadlineExceeded()
+    {
+        var segmentName = $"deadline_contract_{Guid.NewGuid():N}";
+        var serverStartedTcs = new TaskCompletionSource<DateTime>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var serverCancellationTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var server = new ShmGrpcServer(segmentName);
+        server.MapUnary<StringValue, StringValue>(
+            "/test.Cancellation/WaitForDeadline",
+            async (_, context) =>
+            {
+                serverStartedTcs.SetResult(context.Deadline);
+                using var registration = context.CancellationToken.Register(
+                    static state => ((TaskCompletionSource)state!).TrySetResult(), serverCancellationTcs);
+
+                await serverCancellationTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                return new StringValue { Value = "deadline" };
+            });
+
+        using var serverCts = new CancellationTokenSource();
+        var serverTask = Task.Run(() => server.RunAsync(serverCts.Token));
+        await WaitForServerAsync(segmentName);
+
+        using var handler = new ShmControlHandler(segmentName, new ShmClientTransportOptions
+        {
+            EnableMultipleConnections = false,
+            ConnectTimeout = TimeSpan.FromSeconds(5)
+        });
+        using var invoker = new HttpMessageInvoker(handler, disposeHandler: false);
+        using var request = CreateGrpcRequest(
+            "/test.Cancellation/WaitForDeadline",
+            new StringValue { Value = "hello" });
+        request.Headers.TryAddWithoutValidation("grpc-timeout", "100m");
+
+        using var response = await invoker.SendAsync(request, CancellationToken.None);
+
+        var observedDeadline = await serverStartedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.That(observedDeadline, Is.LessThan(DateTime.UtcNow.AddSeconds(5)));
+
+        await serverCancellationTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await response.Content.ReadAsByteArrayAsync();
+
+        Assert.That(response.TrailingHeaders.TryGetValues("grpc-status", out var statusValues), Is.True);
+        Assert.That(statusValues!.Single(), Is.EqualTo(((int)StatusCode.DeadlineExceeded).ToString(CultureInfo.InvariantCulture)));
+
+        serverCts.Cancel();
+        await Task.WhenAny(serverTask, Task.Delay(TimeSpan.FromSeconds(5)));
+    }
+
     [Test]
     [Platform("Win")]
     [CancelAfter(5000)]
@@ -221,5 +327,41 @@ public class CancellationTests
         await foreach (var m in ss3!.ReceiveMessagesAsync())
             recv3 = m;
         Assert.That(Encoding.UTF8.GetString(recv3!), Is.EqualTo("also works"));
+    }
+
+    private static HttpRequestMessage CreateGrpcRequest(string method, IMessage message)
+    {
+        var payload = message.ToByteArray();
+        var grpcFrame = new byte[5 + payload.Length];
+        grpcFrame[0] = 0;
+        BinaryPrimitives.WriteUInt32BigEndian(grpcFrame.AsSpan(1), (uint)payload.Length);
+        payload.CopyTo(grpcFrame.AsSpan(5));
+
+        var request = new HttpRequestMessage(HttpMethod.Post, "http://localhost" + method)
+        {
+            Version = new Version(2, 0),
+            Content = new ByteArrayContent(grpcFrame)
+        };
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
+        return request;
+    }
+
+    private static async Task WaitForServerAsync(string segmentName)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var _ = Segment.OpenControlSegment(segmentName);
+                return;
+            }
+            catch (FileNotFoundException)
+            {
+                await Task.Delay(10);
+            }
+        }
+
+        Assert.Fail($"Server did not create control segment for '{segmentName}'.");
     }
 }

@@ -141,6 +141,8 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownCts.Token);
         var ct = linkedCts.Token;
 
+        await Task.Yield();
+
         _listener = new ShmControlListener(_segmentName, _ringCapacity, _maxStreams);
 
         Console.WriteLine($"SHM gRPC server listening on segment: {_segmentName}");
@@ -227,6 +229,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
     private async Task HandleStreamAsync(ShmGrpcStream stream, CancellationToken ct)
     {
+        ShmServerCallContext? context = null;
         try
         {
             var headers = stream.RequestHeaders;
@@ -243,7 +246,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 return;
             }
 
-            var context = new ShmServerCallContext(stream, headers, ct);
+            context = new ShmServerCallContext(stream, headers, ct);
 
             try
             {
@@ -271,6 +274,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         }
         finally
         {
+            context?.Dispose();
             stream.Dispose();
         }
     }
@@ -395,6 +399,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                             writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default);
                         else
                             writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default);
+                        context.ApplyCancellationStatus();
                         stream.SendTrailersInline(writer, context.Status.StatusCode,
                             context.Status.Detail, context.ResponseTrailers);
                     }
@@ -440,6 +445,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     }
                     writer.WriteInline(stream.StreamId,
                         serializedBuffer.AsSpan(0, serializedSize), 0, default);
+                    context.ApplyCancellationStatus();
                     stream.SendTrailersInline(writer, context.Status.StatusCode,
                         context.Status.Detail, context.ResponseTrailers);
                 });
@@ -449,6 +455,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // Fallback path: ensure headers sent, then use WriterLoop queue.
             await context.EnsureResponseHeadersSentAsync();
             await SendProtobufMessageAsync(stream, response, ct);
+            context.ApplyCancellationStatus();
             await stream.SendTrailersAsync(context.Status.StatusCode, context.Status.Detail, context.ResponseTrailers);
         }
     }
@@ -490,6 +497,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 {
                     try
                     {
+                        context.ApplyCancellationStatus();
                         stream.SendTrailersInline(fw, context.Status.StatusCode,
                             context.Status.Detail, context.ResponseTrailers);
                     }
@@ -502,6 +510,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             }
 
             // Send trailers
+            context.ApplyCancellationStatus();
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,
@@ -546,6 +555,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                             writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default);
                         else
                             writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default);
+                        context.ApplyCancellationStatus();
                         stream.SendTrailersInline(writer, context.Status.StatusCode,
                             context.Status.Detail, context.ResponseTrailers);
                     }
@@ -590,6 +600,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         context.MarkHeadersSent();
                     }
                     writer.WriteInline(stream.StreamId, serializedBuffer.AsSpan(0, serializedSize), 0, default);
+                    context.ApplyCancellationStatus();
                     stream.SendTrailersInline(writer, context.Status.StatusCode,
                         context.Status.Detail, context.ResponseTrailers);
                 });
@@ -597,6 +608,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             }
 
             await SendProtobufMessageAsync(stream, response, ct);
+            context.ApplyCancellationStatus();
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,
@@ -640,6 +652,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 {
                     try
                     {
+                        context.ApplyCancellationStatus();
                         stream.SendTrailersInline(fw, context.Status.StatusCode,
                             context.Status.Detail, context.ResponseTrailers);
                     }
@@ -651,6 +664,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 }
             }
 
+            context.ApplyCancellationStatus();
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,

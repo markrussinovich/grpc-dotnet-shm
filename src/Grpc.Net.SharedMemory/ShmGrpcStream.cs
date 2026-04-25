@@ -69,6 +69,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private readonly ShmConnection _connection;
     private readonly Channel<InboundFrame> _inboundFrames;
     private readonly CancellationTokenSource _disposeCts;
+    private readonly CancellationTokenSource _cancellationCts;
     private readonly SemaphoreSlim _sendLock;
 
     private HeadersV1? _requestHeaders;
@@ -141,6 +142,8 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public bool IsServerStream { get; }
 
+    internal CancellationToken CancellationToken => _cancellationCts.Token;
+
     internal ShmGrpcStream(uint streamId, ShmConnection connection, bool isServerStream = false)
     {
         StreamId = streamId;
@@ -152,6 +155,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             SingleWriter = true
         });
         _disposeCts = new CancellationTokenSource();
+        _cancellationCts = new CancellationTokenSource();
         _sendLock = new SemaphoreSlim(1, 1);
         // Per-stream flow control is disabled: the ring's WaitForSpace
         // provides back-pressure via the SPSC ring buffer. A separate
@@ -534,6 +538,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         ThrowIfDisposed();
         if (_cancelled) return;
         _cancelled = true;
+        CancelCancellationToken();
 
         try
         {
@@ -999,6 +1004,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             case FrameType.Cancel:
                 _cancelled = true;
+                CancelCancellationToken();
                 frame.ReturnToPool();
                 _inboundFrames.Writer.TryComplete();
                 _connection.RemoveStream(StreamId);
@@ -1224,6 +1230,17 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
     }
 
+    private void CancelCancellationToken()
+    {
+        try
+        {
+            _cancellationCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
@@ -1233,6 +1250,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
 
         _disposeCts.Cancel();
+        CancelCancellationToken();
         _inboundFrames.Writer.TryComplete();
 
         // Drain any remaining queued frames to return pooled buffers.
@@ -1243,6 +1261,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         _connection.RemoveStream(StreamId);
         _sendLock.Dispose();
+        _cancellationCts.Dispose();
         _disposeCts.Dispose();
     }
 

@@ -25,25 +25,45 @@ namespace Grpc.Net.SharedMemory;
 /// A <see cref="ServerCallContext"/> implementation for the shared memory transport.
 /// Wraps an <see cref="ShmGrpcStream"/> and provides gRPC call context to service methods.
 /// </summary>
-internal sealed class ShmServerCallContext : ServerCallContext
+internal sealed class ShmServerCallContext : ServerCallContext, IDisposable
 {
     private readonly ShmGrpcStream _stream;
     private readonly HeadersV1 _requestHeaders;
-    private readonly CancellationToken _cancellationToken;
+    private readonly CancellationTokenSource _callCts;
+    private readonly Timer? _deadlineTimer;
     private readonly Metadata _requestMetadata;
     private readonly Metadata _responseTrailers;
     private Status _status;
     private WriteOptions? _writeOptions;
     private bool _headersSent;
+    private int _deadlineExceeded;
+    private int _disposed;
 
     public ShmServerCallContext(ShmGrpcStream stream, HeadersV1 requestHeaders, CancellationToken cancellationToken)
     {
         _stream = stream;
         _requestHeaders = requestHeaders;
-        _cancellationToken = cancellationToken;
+        _callCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, stream.CancellationToken);
         _requestMetadata = ConvertFromShmMetadata(requestHeaders.Metadata);
         _responseTrailers = new Metadata();
         _status = Status.DefaultSuccess;
+
+        if (requestHeaders.DeadlineUnixNano != 0)
+        {
+            var deadline = DeadlineCore;
+            var dueTime = deadline - DateTime.UtcNow;
+            if (dueTime <= TimeSpan.Zero)
+            {
+                MarkDeadlineExceeded();
+            }
+            else
+            {
+                _deadlineTimer = new Timer(static state =>
+                {
+                    ((ShmServerCallContext)state!).MarkDeadlineExceeded();
+                }, this, dueTime, Timeout.InfiniteTimeSpan);
+            }
+        }
     }
 
     /// <summary>
@@ -83,7 +103,7 @@ internal sealed class ShmServerCallContext : ServerCallContext
     }
 
     protected override Metadata RequestHeadersCore => _requestMetadata;
-    protected override CancellationToken CancellationTokenCore => _cancellationToken;
+    protected override CancellationToken CancellationTokenCore => _callCts.Token;
     protected override Metadata ResponseTrailersCore => _responseTrailers;
     protected override Status StatusCore { get => _status; set => _status = value; }
     protected override WriteOptions? WriteOptionsCore { get => _writeOptions; set => _writeOptions = value; }
@@ -102,6 +122,50 @@ internal sealed class ShmServerCallContext : ServerCallContext
             throw new InvalidOperationException("Response headers already sent");
         _headersSent = true;
         await _stream.SendResponseHeadersAsync(responseHeaders);
+    }
+
+    internal bool IsDeadlineExceeded => Volatile.Read(ref _deadlineExceeded) != 0 || DeadlineCore <= DateTime.UtcNow;
+
+    internal void ApplyCancellationStatus()
+    {
+        if (_status.StatusCode != StatusCode.OK)
+        {
+            return;
+        }
+
+        if (IsDeadlineExceeded)
+        {
+            _status = new Status(StatusCode.DeadlineExceeded, "Deadline Exceeded");
+        }
+        else if (_stream.IsCancelled)
+        {
+            _status = new Status(StatusCode.Cancelled, "Call canceled by the client.");
+        }
+    }
+
+    private void MarkDeadlineExceeded()
+    {
+        if (Interlocked.Exchange(ref _deadlineExceeded, 1) == 0)
+        {
+            try
+            {
+                _callCts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        _deadlineTimer?.Dispose();
+        _callCts.Dispose();
     }
 
     /// <summary>
