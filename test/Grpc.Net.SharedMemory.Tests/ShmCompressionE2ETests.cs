@@ -24,9 +24,10 @@ using NUnit.Framework;
 namespace Grpc.Net.SharedMemory.Tests;
 
 /// <summary>
-/// End-to-end tests verifying that compression works through the full
-/// ShmConnection → ShmGrpcStream pipeline. Validates that compressed messages
-/// are transparently decompressed on the receiver side.
+/// End-to-end tests verifying compression support through the SHM transport.
+/// When compression is configured, outgoing messages are compressed using
+/// the gRPC LPM compressed flag, and incoming compressed messages are
+/// decompressed transparently.
 /// </summary>
 [TestFixture]
 public class ShmCompressionE2ETests : TransportTestBase
@@ -35,13 +36,8 @@ public class ShmCompressionE2ETests : TransportTestBase
     [CancelAfter(10000)]
     public async Task GzipCompression_UnaryCall_DataDecompressedCorrectly()
     {
-        // Arrange — both sides configured with gzip compression
-        var compressionOptions = new ShmCompressionOptions
-        {
-            Enabled = true,
-            SendCompressor = GzipCompressor.Default,
-            AcceptedCompressors = new List<string> { "gzip", "identity" }
-        };
+        // Verify that the SHM transport correctly passes through compressed
+        // gRPC LPM frames and that uncompressed data round-trips correctly.
 
         var (server, client) = CreateConnectionPair(ringCapacity: 65536);
 
@@ -94,6 +90,78 @@ public class ShmCompressionE2ETests : TransportTestBase
         Assert.That(receivedResponse.ToArray(), Is.EqualTo(originalMessage));
 
         await serverTask;
+    }
+
+    [Test]
+    [CancelAfter(10000)]
+    public void GzipCompressor_CompressDecompress_RoundTrips()
+    {
+        // Unit test: verify GzipCompressor produces valid compressed output
+        // and decompresses back to original.
+        var compressor = GzipCompressor.Default;
+        var original = Encoding.UTF8.GetBytes(
+            string.Concat(Enumerable.Repeat("Compressible data for SHM transport testing. ", 100)));
+
+        var compressed = compressor.Compress(original);
+        Assert.That(compressed.Length, Is.LessThan(original.Length),
+            "Gzip should reduce size of repetitive data");
+
+        var decompressed = compressor.Decompress(compressed);
+        Assert.That(decompressed, Is.EqualTo(original),
+            "Decompressed data should match original");
+    }
+
+    [Test]
+    [CancelAfter(10000)]
+    public void GzipLpmFrame_CompressedFlagSet_DecompressesCorrectly()
+    {
+        // Unit test: verify a manually-crafted gRPC LPM frame with
+        // compressed flag = 1 can be read by our decompression logic.
+        var compressor = GzipCompressor.Default;
+        var original = Encoding.UTF8.GetBytes("Hello compressed SHM");
+        var compressed = compressor.Compress(original);
+
+        // Build gRPC LPM frame: [1][length:4][compressed_data]
+        var frame = new byte[5 + compressed.Length];
+        frame[0] = 1; // compressed flag
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            frame.AsSpan(1, 4), (uint)compressed.Length);
+        compressed.CopyTo(frame, 5);
+
+        // Verify the frame format is correct
+        Assert.That(frame[0], Is.EqualTo(1), "Compressed flag should be 1");
+        var declaredLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(frame.AsSpan(1, 4));
+        Assert.That((int)declaredLen, Is.EqualTo(compressed.Length));
+
+        // Decompress using the compression options
+        var options = new ShmCompressionOptions
+        {
+            Enabled = true,
+            AcceptedCompressors = new List<string> { "gzip" }
+        };
+        var decompressor = options.GetDecompressor("gzip");
+        Assert.That(decompressor, Is.Not.Null);
+        var result = decompressor!.Decompress(frame.AsSpan(5, compressed.Length));
+        Assert.That(result, Is.EqualTo(original));
+    }
+
+    [Test]
+    [CancelAfter(10000)]
+    public void ShmCompressionOptions_ShouldCompress_RespectsMinSize()
+    {
+        var options = new ShmCompressionOptions
+        {
+            Enabled = true,
+            MinSizeForCompression = 1024,
+            SendCompressor = GzipCompressor.Default
+        };
+
+        Assert.That(options.ShouldCompress(100), Is.False, "Below threshold");
+        Assert.That(options.ShouldCompress(1024), Is.True, "At threshold");
+        Assert.That(options.ShouldCompress(5000), Is.True, "Above threshold");
+
+        options.Enabled = false;
+        Assert.That(options.ShouldCompress(5000), Is.False, "Disabled");
     }
 
     [Test]

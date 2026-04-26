@@ -476,17 +476,17 @@ public class ShmGrpcRequestStreamTests
     {
         // Speculative path: CommitRead immediately, return ring memory.
         var name = $"grpc_zc_{Guid.NewGuid():N}";
-        using var seg = Segment.Create(name, ringCapacity: 64 * 1024, maxStreams: 10);
+        using var seg = Segment.Create(name, ringCapacity: 2 * 1024 * 1024, maxStreams: 10);
         var ring = seg.RingA;
 
-        var payload = new byte[1024];
+        var payload = new byte[128 * 1024]; // Must be >= 64KB for ZC threshold
         new Random(42).NextBytes(payload);
         FrameProtocol.WriteMessage(ring, streamId: 1, payload, isLast: true);
 
         var (header, fp) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
 
         Assert.That(header.Type, Is.EqualTo(FrameType.Message));
-        Assert.That(fp.Length, Is.EqualTo(1024));
+        Assert.That(fp.Length, Is.EqualTo(128 * 1024));
         Assert.That(fp.Memory.Span.SequenceEqual(payload), Is.True);
 
         // Speculative: reserved bytes should be non-zero while held
@@ -501,12 +501,12 @@ public class ShmGrpcRequestStreamTests
     {
         // When too many speculative bytes are reserved, use deferred.
         var name = $"grpc_zc_{Guid.NewGuid():N}";
-        using var seg = Segment.Create(name, ringCapacity: 64 * 1024, maxStreams: 10);
+        using var seg = Segment.Create(name, ringCapacity: 2 * 1024 * 1024, maxStreams: 10);
         var ring = seg.RingA;
 
-        var payload1 = new byte[512];
-        var payload2 = new byte[512];
-        var payload3 = new byte[512];
+        var payload1 = new byte[128 * 1024]; // Must be >= 64KB for ZC threshold
+        var payload2 = new byte[128 * 1024];
+        var payload3 = new byte[128 * 1024];
         new Random(1).NextBytes(payload1);
         new Random(2).NextBytes(payload2);
         new Random(3).NextBytes(payload3);
@@ -515,18 +515,22 @@ public class ShmGrpcRequestStreamTests
         FrameProtocol.WriteMessage(ring, 1, payload2, true);
         FrameProtocol.WriteMessage(ring, 1, payload3, true);
 
-        // Frames 1-2: speculative (inFlight < max=2)
+        // Frame 1: speculative (SpeculativeReservedBytes == 0 at read time)
         var (_, fp1) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
         Assert.That(ring.SpeculativeReservedBytes, Is.GreaterThan(0));
+
+        // Frame 2: NOT speculative — SpeculativeReservedBytes > 0 from fp1,
+        // so it falls through to copy mode (FIFO safety: at most one ZC
+        // buffer in flight at a time).
         var reserved1 = ring.SpeculativeReservedBytes;
         var (_, fp2) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
-        Assert.That(ring.SpeculativeReservedBytes, Is.GreaterThan(reserved1));
+        // Reserved bytes unchanged (fp2 went to copy, not speculative)
+        Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(reserved1));
+        Assert.That(fp2.Memory.Span.SequenceEqual(payload2), Is.True);
 
-        // Frame 3: may be deferred depending on threshold
-        var reserved2 = ring.SpeculativeReservedBytes;
+        // Frame 3: also copy mode (fp1 still held)
         var (_, fp3) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
-        // Reserved bytes should not decrease (deferred frames don't reduce it)
-        Assert.That(ring.SpeculativeReservedBytes, Is.GreaterThanOrEqualTo(reserved2));
+        Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(reserved1));
         Assert.That(fp3.Memory.Span.SequenceEqual(payload3), Is.True);
 
         fp3.Release();
@@ -540,12 +544,12 @@ public class ShmGrpcRequestStreamTests
         // Core safety test: if a deferred frame exists, subsequent frames
         // must NOT do speculative commit (would skip deferred bytes).
         var name = $"grpc_zc_{Guid.NewGuid():N}";
-        using var seg = Segment.Create(name, ringCapacity: 64 * 1024, maxStreams: 10);
+        using var seg = Segment.Create(name, ringCapacity: 2 * 1024 * 1024, maxStreams: 10);
         var ring = seg.RingA;
 
-        var p1 = new byte[256];
-        var p2 = new byte[256];
-        var p3 = new byte[256];
+        var p1 = new byte[128 * 1024]; // Must be >= 64KB for ZC threshold
+        var p2 = new byte[128 * 1024];
+        var p3 = new byte[128 * 1024];
         new Random(10).NextBytes(p1);
         new Random(20).NextBytes(p2);
         new Random(30).NextBytes(p3);

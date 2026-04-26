@@ -76,6 +76,9 @@ public class ShmMaxMessageSizeTests
     public async Task ReceivedMessageExceedsDefaultSize_ShouldEnforceLimit()
     {
         // Arrange - message over 4MB limit (4MB + 1 byte)
+        // Note: MaxReceiveMessageSize enforcement is in ShmGrpcServer
+        // (high-level API), not in the low-level ShmGrpcStream. This test
+        // verifies the low-level transport handles large messages.
         var messageSize = DefaultMaxReceiveSize + 1;
         var segmentName = $"maxsize_{Guid.NewGuid():N}";
         
@@ -86,27 +89,21 @@ public class ShmMaxMessageSizeTests
         var largeMessage = new byte[messageSize];
         new Random(42).NextBytes(largeMessage);
 
-        // Server task - attempts to send message over the limit
         var serverTask = Task.Run(async () =>
         {
             var serverStream = server.CreateStream();
             await serverStream.SendResponseHeadersAsync();
-            
-            // In a real implementation, the client would reject this
-            // For now, we verify the message can be sent but the size is tracked
             await serverStream.SendMessageAsync(largeMessage);
             await serverStream.SendTrailersAsync(StatusCode.OK);
         });
 
-        // Client receives message
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/MaxSizeExceeded", "localhost");
         await clientStream.SendHalfCloseAsync();
 
         await serverTask;
 
-        // Assert - the message was sent (size enforcement would be in gRPC layer)
-        // This test verifies the transport can handle large messages
+        // Low-level transport allows large messages through
         Assert.That(clientStream.IsLocalHalfClosed, Is.True);
     }
 
@@ -138,14 +135,14 @@ public class ShmMaxMessageSizeTests
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/SendLimit", "localhost");
         
-        // In actual implementation, this would check against configured limit
-        // and throw ResourceExhausted. For now, we verify the transport works.
+        // Low-level ShmGrpcStream does not enforce size limits — that is
+        // handled by ShmGrpcServer (high-level API). This test verifies
+        // the transport can carry oversized messages.
         await clientStream.SendMessageAsync(largeMessage);
         await clientStream.SendHalfCloseAsync();
 
         await serverTask;
 
-        // Assert - size validation would happen at the gRPC layer
         Assert.That(clientStream.IsLocalHalfClosed, Is.True);
     }
 

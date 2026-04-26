@@ -115,7 +115,17 @@ public static class FrameProtocol
             var totalBytes = ShmConstants.FrameHeaderSize + payloadLength;
 
             // Speculative zero-copy: CommitRead + reserve bytes for safety.
-            if (zeroCopy && !isMore && payloadReservation.Second.IsEmpty)
+            // Conditions:
+            //  1. single-frame final (not More)
+            //  2. contiguous (no wrap)
+            //  3. no other speculative buffer in flight (FIFO safety)
+            //  4. payload large enough to justify holding ring space
+            //     (small payloads: copy is <5µs and frees ring immediately;
+            //      large payloads: copy is >100µs, ZC avoids that cost)
+            const int MinZeroCopyPayload = 64 * 1024; // 64KB threshold
+            if (zeroCopy && !isMore && payloadReservation.Second.IsEmpty
+                && payloadLength >= MinZeroCopyPayload
+                && Volatile.Read(ref ring.SpeculativeReservedBytes) == 0)
             {
                 // Reserve ring space before CommitRead so writer can't
                 // reach this memory even after ReadIdx advances.
