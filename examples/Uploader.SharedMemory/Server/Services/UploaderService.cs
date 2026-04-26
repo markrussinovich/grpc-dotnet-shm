@@ -16,82 +16,42 @@
 
 #endregion
 
-using Google.Protobuf;
-using Grpc.Net.SharedMemory;
+using Grpc.Core;
 using Upload;
 
-namespace Server.Services;
+namespace Server;
 
-/// <summary>
-/// Uploader service that receives streamed file content over shared memory.
-/// </summary>
-public class UploaderService
+public class UploaderService : Uploader.UploaderBase
 {
-    private readonly string _uploadsPath;
+    private readonly ILogger _logger;
+    private readonly IConfiguration _config;
 
-    public UploaderService(string uploadsPath)
+    public UploaderService(ILoggerFactory loggerFactory, IConfiguration config)
     {
-        _uploadsPath = uploadsPath;
+        _logger = loggerFactory.CreateLogger<UploaderService>();
+        _config = config;
     }
 
-    /// <summary>
-    /// Receives a file upload from the client via streaming.
-    /// </summary>
-    public async Task<string> UploadFileAsync(ShmGrpcStream stream, CancellationToken cancellationToken)
+    public override async Task<UploadFileResponse> UploadFile(IAsyncStreamReader<UploadFileRequest> requestStream, ServerCallContext context)
     {
         var uploadId = Path.GetRandomFileName();
-        var uploadPath = Path.Combine(_uploadsPath, uploadId);
+        var uploadPath = Path.Combine(_config["StoredFilesPath"]!, uploadId);
         Directory.CreateDirectory(uploadPath);
 
-        Console.WriteLine($"Starting upload: {uploadId}");
-
         await using var writeStream = File.Create(Path.Combine(uploadPath, "data.bin"));
-        long totalBytesReceived = 0;
 
-        // Read messages from the client stream using ReceiveFrameAsync
-        while (!cancellationToken.IsCancellationRequested)
+        await foreach (var message in requestStream.ReadAllAsync())
         {
-            var frame = await stream.ReceiveFrameAsync(cancellationToken);
-            if (frame == null)
-            {
-                break; // End of stream
-            }
-
-            var (frameType, payload) = frame.Value;
-            
-            // Only process MESSAGE frames (DATA frames in HTTP/2 terminology)
-            if (frameType != FrameType.Message || payload.Length == 0)
-            {
-                // HALF_CLOSE or other frame types indicate end of client stream
-                if (frameType == FrameType.HalfClose)
-                {
-                    break;
-                }
-                continue;
-            }
-
-            var message = UploadFileRequest.Parser.ParseFrom(payload);
-
             if (message.Metadata != null)
             {
-                Console.WriteLine($"Received metadata: {message.Metadata.FileName}");
-                await File.WriteAllTextAsync(
-                    Path.Combine(uploadPath, "metadata.json"), 
-                    message.Metadata.ToString(),
-                    cancellationToken);
+                await File.WriteAllTextAsync(Path.Combine(uploadPath, "metadata.json"), message.Metadata.ToString());
             }
-
-            if (message.Data != null && !message.Data.IsEmpty)
+            if (message.Data != null)
             {
-                Console.WriteLine($"Received data chunk of {message.Data.Length} bytes");
-                await writeStream.WriteAsync(message.Data.Memory, cancellationToken);
-                totalBytesReceived += message.Data.Length;
+                await writeStream.WriteAsync(message.Data.Memory);
             }
         }
 
-        Console.WriteLine($"Upload complete: {uploadId}, total bytes: {totalBytesReceived}");
-        Console.WriteLine($"Files saved to: {uploadPath}");
-
-        return uploadId;
+        return new UploadFileResponse { Id = uploadId };
     }
 }

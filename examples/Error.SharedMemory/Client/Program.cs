@@ -22,66 +22,42 @@ using Grpc.Core;
 using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
 
-Console.WriteLine("Error Handling - Shared Memory Transport");
-Console.WriteLine("=========================================");
-Console.WriteLine();
-
-// The segment name must match what the server creates
 const string SegmentName = "error_shm_example";
 
-Console.WriteLine($"Connecting to shared memory segment: {SegmentName}");
-Console.WriteLine("(Make sure the server is running first!)");
-Console.WriteLine();
-
-try
+using var handler = new ShmControlHandler(SegmentName);
+using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
 {
-    // Create a channel using the shared memory handler
-    using var handler = new ShmControlHandler(SegmentName);
-    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
+    HttpHandler = handler
+});
+var client = new Greeter.GreeterClient(channel);
+
+Console.WriteLine("Hello world app");
+Console.WriteLine("===============");
+
+while (true)
+{
+    Console.WriteLine();
+
+    Console.Write("Enter name: ");
+    var name = Console.ReadLine();
+
+    try
     {
-        HttpHandler = handler
-    });
-
-    var client = new Greeter.GreeterClient(channel);
-
-    while (true)
+        var reply = await client.SayHelloAsync(new HelloRequest { Name = name });
+        Console.WriteLine("Greeting: " + reply.Message);
+    }
+    catch (RpcException ex)
     {
-        Console.WriteLine();
-        Console.Write("Enter name (empty to test validation error): ");
-        var name = Console.ReadLine();
+        Console.WriteLine($"Server error: {ex.Status.Detail}");
 
-        try
+        var badRequest = ex.GetRpcStatus()?.GetDetail<BadRequest>();
+        if (badRequest != null)
         {
-            var reply = await client.SayHelloAsync(new HelloRequest { Name = name });
-            Console.WriteLine("Greeting: " + reply.Message);
-        }
-        catch (RpcException ex)
-        {
-            Console.WriteLine($"Server error: {ex.Status.Detail}");
-
-            // Extract rich error details using Grpc.StatusProto
-            var badRequest = ex.GetRpcStatus()?.GetDetail<BadRequest>();
-            if (badRequest != null)
+            foreach (var fieldViolation in badRequest.FieldViolations)
             {
-                Console.WriteLine("Field violations:");
-                foreach (var fieldViolation in badRequest.FieldViolations)
-                {
-                    Console.WriteLine($"  Field: {fieldViolation.Field}");
-                    Console.WriteLine($"  Description: {fieldViolation.Description}");
-                }
+                Console.WriteLine($"Field: {fieldViolation.Field}");
+                Console.WriteLine($"Description: {fieldViolation.Description}");
             }
         }
     }
 }
-catch (Exception ex)
-{
-    Console.WriteLine($"Error: {ex.Message}");
-    Console.WriteLine();
-    Console.WriteLine("Make sure the server is running first:");
-    Console.WriteLine("  cd examples/Error.SharedMemory/Server");
-    Console.WriteLine("  dotnet run");
-}
-
-Console.WriteLine();
-Console.WriteLine("Press any key to exit...");
-Console.ReadKey();

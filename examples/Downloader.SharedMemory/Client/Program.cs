@@ -21,71 +21,46 @@ using Grpc.Core;
 using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
 
-Console.WriteLine("File Downloader - Shared Memory Transport");
-Console.WriteLine("==========================================");
-Console.WriteLine();
-
 const string SegmentName = "downloader_shm_example";
 
-Console.WriteLine($"Connecting to shared memory segment: {SegmentName}");
-Console.WriteLine("(Make sure the server is running first!)");
-Console.WriteLine();
-
-try
+using var handler = new ShmControlHandler(SegmentName);
+using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
 {
-    using var handler = new ShmControlHandler(SegmentName);
-    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
+    HttpHandler = handler
+});
+
+var client = new Downloader.DownloaderClient(channel);
+
+var downloadsPath = Path.Combine(Environment.CurrentDirectory, "downloads");
+var downloadId = Path.GetRandomFileName();
+var downloadIdPath = Path.Combine(downloadsPath, downloadId);
+Directory.CreateDirectory(downloadIdPath);
+
+Console.WriteLine("Starting call");
+
+using var call = client.DownloadFile(new DownloadFileRequest
+{
+    Id = downloadId
+});
+
+await using var writeStream = File.Create(Path.Combine(downloadIdPath, "data.bin"));
+
+await foreach (var message in call.ResponseStream.ReadAllAsync())
+{
+    if (message.Metadata != null)
     {
-        HttpHandler = handler
-    });
-
-    var client = new Downloader.DownloaderClient(channel);
-
-    var downloadsPath = Path.Combine(Environment.CurrentDirectory, "downloads");
-    var downloadId = Path.GetRandomFileName();
-    var downloadIdPath = Path.Combine(downloadsPath, downloadId);
-    Directory.CreateDirectory(downloadIdPath);
-
-    Console.WriteLine("Starting download call");
-
-    using var call = client.DownloadFile(new DownloadFileRequest
-    {
-        Id = downloadId
-    });
-
-    await using var writeStream = File.Create(Path.Combine(downloadIdPath, "data.bin"));
-    long totalBytes = 0;
-
-    await foreach (var message in call.ResponseStream.ReadAllAsync())
-    {
-        if (message.Metadata != null)
-        {
-            Console.WriteLine("Saving metadata to file");
-            var metadata = message.Metadata.ToString();
-            await File.WriteAllTextAsync(Path.Combine(downloadIdPath, "metadata.json"), metadata);
-        }
-        if (message.Data != null)
-        {
-            var bytes = message.Data.Memory;
-            Console.WriteLine($"Received {bytes.Length} bytes");
-            await writeStream.WriteAsync(bytes);
-            totalBytes += bytes.Length;
-        }
+        Console.WriteLine("Saving metadata to file");
+        var metadata = message.Metadata.ToString();
+        await File.WriteAllTextAsync(Path.Combine(downloadIdPath, "metadata.json"), metadata);
     }
-
-    Console.WriteLine();
-    Console.WriteLine($"Downloaded {totalBytes} bytes total");
-    Console.WriteLine("Files were saved in: " + downloadIdPath);
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"Error: {ex.Message}");
-    Console.WriteLine();
-    Console.WriteLine("Make sure the server is running first:");
-    Console.WriteLine("  cd examples/Downloader.SharedMemory/Server");
-    Console.WriteLine("  dotnet run");
+    if (message.Data != null)
+    {
+        var bytes = message.Data.Memory;
+        Console.WriteLine($"Saving {bytes.Length} bytes to file");
+        await writeStream.WriteAsync(bytes);
+    }
 }
 
 Console.WriteLine();
-Console.WriteLine("Press any key to exit...");
+Console.WriteLine("Files were saved in: " + downloadIdPath);
 Console.ReadKey();

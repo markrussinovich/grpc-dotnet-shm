@@ -21,17 +21,10 @@ using Google.Protobuf.WellKnownTypes;
 using Google.Rpc;
 using Grpc.Core;
 
-namespace Server.Services;
+namespace Server;
 
-/// <summary>
-/// Validation helper that throws RpcException with rich error details.
-/// </summary>
 public static class GrpcValidation
 {
-    /// <summary>
-    /// Validates that a string argument is not null or empty.
-    /// Throws RpcException with BadRequest details if validation fails.
-    /// </summary>
     public static void ArgumentNotNullOrEmpty(string value, [CallerArgumentExpression(nameof(value))] string? paramName = null)
     {
         if (string.IsNullOrEmpty(value))
@@ -48,7 +41,7 @@ public static class GrpcValidation
                         {
                             new BadRequest.Types.FieldViolation
                             {
-                                Field = paramName ?? "unknown",
+                                Field = paramName,
                                 Description = "Value is null or empty"
                             }
                         }

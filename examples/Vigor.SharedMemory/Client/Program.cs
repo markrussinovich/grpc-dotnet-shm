@@ -21,58 +21,37 @@ using Grpc.Health.V1;
 using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
 
-Console.WriteLine("Health Check - Shared Memory Transport");
-Console.WriteLine("======================================");
-Console.WriteLine();
-
 const string SegmentName = "vigor_shm_example";
 
-Console.WriteLine($"Connecting to shared memory segment: {SegmentName}");
-Console.WriteLine("(Make sure the server is running first!)");
-Console.WriteLine();
-
-try
+using var handler = new ShmControlHandler(SegmentName);
+using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
 {
-    using var handler = new ShmControlHandler(SegmentName);
-    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
-    {
-        HttpHandler = handler
-    });
+    HttpHandler = handler
+});
+var client = new Health.HealthClient(channel);
 
-    var client = new Health.HealthClient(channel);
+Console.WriteLine("Watching health status");
+Console.WriteLine("Press any key to exit...");
 
-    Console.WriteLine("Watching health status");
-    Console.WriteLine("Press any key to exit...");
-
-    var cts = new CancellationTokenSource();
-    using var call = client.Watch(new HealthCheckRequest { Service = "" }, cancellationToken: cts.Token);
-    
-    var watchTask = Task.Run(async () =>
-    {
-        try
-        {
-            await foreach (var message in call.ResponseStream.ReadAllAsync())
-            {
-                Console.WriteLine($"{DateTime.Now}: Service is {message.Status}");
-            }
-        }
-        catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
-        {
-            // Handle cancellation exception.
-        }
-    });
-
-    Console.ReadKey();
-    Console.WriteLine("Finished");
-
-    cts.Cancel();
-    await watchTask;
-}
-catch (Exception ex)
+var cts = new CancellationTokenSource();
+using var call = client.Watch(new HealthCheckRequest { Service = "" }, cancellationToken: cts.Token);
+var watchTask = Task.Run(async () =>
 {
-    Console.WriteLine($"Error: {ex.Message}");
-    Console.WriteLine();
-    Console.WriteLine("Make sure the server is running first:");
-    Console.WriteLine("  cd examples/Vigor.SharedMemory/Server");
-    Console.WriteLine("  dotnet run");
-}
+    try
+    {
+        await foreach (var message in call.ResponseStream.ReadAllAsync())
+        {
+            Console.WriteLine($"{DateTime.Now}: Service is {message.Status}");
+        }
+    }
+    catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
+    {
+        // Handle cancellation exception.
+    }
+});
+
+Console.ReadKey();
+Console.WriteLine("Finished");
+
+cts.Cancel();
+await watchTask;

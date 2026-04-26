@@ -23,49 +23,28 @@ using Grpc.Net.SharedMemory;
 using Grpc.Reflection.V1Alpha;
 using ServerReflectionClient = Grpc.Reflection.V1Alpha.ServerReflection.ServerReflectionClient;
 
-Console.WriteLine("gRPC Reflection - Shared Memory Transport");
-Console.WriteLine("==========================================");
-Console.WriteLine();
-
 const string SegmentName = "reflector_shm_example";
 
-Console.WriteLine($"Connecting to shared memory segment: {SegmentName}");
-Console.WriteLine("(Make sure the server is running first!)");
-Console.WriteLine();
-
-try
+using var handler = new ShmControlHandler(SegmentName);
+using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
 {
-    using var handler = new ShmControlHandler(SegmentName);
-    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
-    {
-        HttpHandler = handler
-    });
+    HttpHandler = handler
+});
+var client = new ServerReflectionClient(channel);
 
-    var client = new ServerReflectionClient(channel);
-
-    Console.WriteLine("Calling reflection service to list all services...");
-    var response = await SingleRequestAsync(client, new ServerReflectionRequest
-    {
-        ListServices = "" // Get all services
-    });
-
-    Console.WriteLine();
-    Console.WriteLine("Available Services:");
-    foreach (var item in response.ListServicesResponse.Service)
-    {
-        Console.WriteLine($"  - {item.Name}");
-    }
-}
-catch (Exception ex)
+Console.WriteLine("Calling reflection service:");
+var response = await SingleRequestAsync(client, new ServerReflectionRequest
 {
-    Console.WriteLine($"Error: {ex.Message}");
-    Console.WriteLine();
-    Console.WriteLine("Make sure the server is running first:");
-    Console.WriteLine("  cd examples/Reflector.SharedMemory/Server");
-    Console.WriteLine("  dotnet run");
+    ListServices = "" // Get all services
+});
+
+Console.WriteLine("Services:");
+foreach (var item in response.ListServicesResponse.Service)
+{
+    Console.WriteLine("- " + item.Name);
 }
 
-Console.WriteLine();
+Console.WriteLine("Shutting down");
 Console.WriteLine("Press any key to exit...");
 Console.ReadKey();
 

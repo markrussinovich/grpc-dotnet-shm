@@ -16,99 +16,22 @@
 
 #endregion
 
-using Google.Protobuf;
-using Grpc.Core;
-using Grpc.Net.SharedMemory;
-using Grpc.Reflection.V1Alpha;
-using Server.Services;
+using Grpc.AspNetCore.Server.SharedMemory;
+using Server;
 
 const string SegmentName = "reflector_shm_example";
 
-Console.WriteLine("gRPC Reflection - Shared Memory Server");
-Console.WriteLine("=======================================");
-Console.WriteLine($"Segment name: {SegmentName}");
-
-// Create services
-var greeterService = new GreeterService();
-var reflectionService = new ReflectionService();
-
-// Create the shared memory listener using ShmControlListener for grpc-go-shmem compatibility
-using var listener = new ShmControlListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
-Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
-Console.WriteLine("Press Ctrl+C to stop the server.");
-
-var cts = new CancellationTokenSource();
-Console.CancelKeyPress += (_, e) =>
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddGrpc();
+builder.Services.AddGrpcReflection();
+builder.WebHost.UseSharedMemory(SegmentName, options =>
 {
-    e.Cancel = true;
-    cts.Cancel();
-};
+    options.RingCapacity = 1024 * 1024;
+    options.MaxStreams = 100;
+});
 
-try
-{
-    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
-    {
-        Console.WriteLine($"New connection accepted: {connection.Name}");
+var app = builder.Build();
+app.MapGrpcService<GreeterService>();
+app.MapGrpcReflectionService();
 
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
-                {
-                    try
-                    {
-                        var headers = stream.RequestHeaders;
-                        if (headers?.Method is { } method)
-                        {
-                            Console.WriteLine($"Received request for method: {method}");
-
-                            if (method == "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo")
-                            {
-                                await stream.SendResponseHeadersAsync();
-                                await reflectionService.HandleReflectionAsync(stream, cts.Token);
-                                await stream.SendTrailersAsync(StatusCode.OK);
-                            }
-                            else if (method == "/greet.Greeter/SayHello")
-                            {
-                                // Read the request message
-                                ReadOnlyMemory<byte> requestBytes = default;
-                                await foreach (var msg in stream.ReceiveMessagesAsync(cts.Token))
-                                {
-                                    requestBytes = msg;
-                                    break;
-                                }
-
-                                await stream.SendResponseHeadersAsync();
-                                var response = await greeterService.SayHelloAsync(stream, requestBytes);
-                                await stream.SendMessageAsync(response);
-                                await stream.SendTrailersAsync(StatusCode.OK);
-                            }
-                            else
-                            {
-                                throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
-                            }
-                        }
-                    }
-                    catch (RpcException ex)
-                    {
-                        Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
-                        await stream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error: {ex.Message}");
-                        await stream.SendTrailersAsync(StatusCode.Internal, ex.Message);
-                    }
-                }
-            }
-            catch (OperationCanceledException) { }
-        });
-    }
-}
-catch (OperationCanceledException)
-{
-    Console.WriteLine("Server shutting down...");
-}
-
-Console.WriteLine("Server stopped.");
+app.Run();

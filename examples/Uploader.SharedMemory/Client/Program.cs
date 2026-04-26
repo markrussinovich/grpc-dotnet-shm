@@ -21,78 +21,52 @@ using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
 using Upload;
 
-Console.WriteLine("File Uploader - Shared Memory Transport");
-Console.WriteLine("========================================");
-Console.WriteLine();
-
 const string SegmentName = "uploader_shm_example";
-const int ChunkSize = 32 * 1024; // 32 KB
+const int ChunkSize = 1024 * 32; // 32 KB
 
-Console.WriteLine($"Connecting to shared memory segment: {SegmentName}");
-Console.WriteLine("(Make sure the server is running first!)");
-Console.WriteLine();
-
-try
+using var handler = new ShmControlHandler(SegmentName);
+using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
 {
-    using var handler = new ShmControlHandler(SegmentName);
-    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
+    HttpHandler = handler
+});
+var client = new Uploader.UploaderClient(channel);
+
+Console.WriteLine("Starting call");
+var call = client.UploadFile();
+
+Console.WriteLine("Sending file metadata");
+await call.RequestStream.WriteAsync(new UploadFileRequest
+{
+    Metadata = new FileMetadata
     {
-        HttpHandler = handler
-    });
+        FileName = "pancakes.jpg"
+    }
+});
 
-    var client = new Uploader.UploaderClient(channel);
+var buffer = new byte[ChunkSize];
+await using var readStream = File.OpenRead("pancakes.jpg");
 
-    Console.WriteLine("Starting upload call");
-    var call = client.UploadFile();
-
-    // Send file metadata first
-    Console.WriteLine("Sending file metadata");
-    await call.RequestStream.WriteAsync(new UploadFileRequest
+while (true)
+{
+    var count = await readStream.ReadAsync(buffer);
+    if (count == 0)
     {
-        Metadata = new FileMetadata
-        {
-            FileName = "sample.txt"
-        }
-    });
-
-    // Stream file content
-    var buffer = new byte[ChunkSize];
-    await using var readStream = File.OpenRead("sample.txt");
-    long totalBytesSent = 0;
-
-    while (true)
-    {
-        var count = await readStream.ReadAsync(buffer);
-        if (count == 0)
-        {
-            break;
-        }
-
-        Console.WriteLine($"Sending file data chunk of length {count}");
-        await call.RequestStream.WriteAsync(new UploadFileRequest
-        {
-            Data = UnsafeByteOperations.UnsafeWrap(buffer.AsMemory(0, count))
-        });
-        totalBytesSent += count;
+        break;
     }
 
-    Console.WriteLine("Completing request stream");
-    await call.RequestStream.CompleteAsync();
-
-    var response = await call;
-    Console.WriteLine();
-    Console.WriteLine($"Upload complete. Total bytes sent: {totalBytesSent}");
-    Console.WriteLine($"Upload ID: {response.Id}");
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"Error: {ex.Message}");
-    Console.WriteLine();
-    Console.WriteLine("Make sure the server is running first:");
-    Console.WriteLine("  cd examples/Uploader.SharedMemory/Server");
-    Console.WriteLine("  dotnet run");
+    Console.WriteLine("Sending file data chunk of length " + count);
+    await call.RequestStream.WriteAsync(new UploadFileRequest
+    {
+        Data = UnsafeByteOperations.UnsafeWrap(buffer.AsMemory(0, count))
+    });
 }
 
-Console.WriteLine();
+Console.WriteLine("Complete request");
+await call.RequestStream.CompleteAsync();
+
+var response = await call;
+Console.WriteLine("Upload id: " + response.Id);
+
+Console.WriteLine("Shutting down");
 Console.WriteLine("Press any key to exit...");
 Console.ReadKey();

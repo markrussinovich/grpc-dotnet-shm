@@ -18,7 +18,6 @@
 
 using Greet;
 using Grpc.Core;
-using Microsoft.Extensions.Logging;
 
 namespace Server;
 
@@ -49,6 +48,28 @@ public class GreeterService : Greeter.GreeterBase
 
             // Gotta look busy
             await Task.Delay(1000);
+        }
+    }
+
+    public override async Task<HelloReply> SayHelloToLotsOfBuddies(IAsyncStreamReader<HelloRequest> requestStream, ServerCallContext context)
+    {
+        var names = new List<string>();
+        await foreach (var request in requestStream.ReadAllAsync())
+        {
+            names.Add(request.Name);
+        }
+
+        var message = $"Hello {string.Join(", ", names)}";
+
+        _logger.LogInformation($"Sending greeting {message}.");
+        return new HelloReply { Message = message };
+    }
+
+    public override async Task SayHellosToLotsOfBuddies(IAsyncStreamReader<HelloRequest> requestStream, IServerStreamWriter<HelloReply> responseStream, ServerCallContext context)
+    {
+        await foreach (var request in requestStream.ReadAllAsync())
+        {
+            await responseStream.WriteAsync(new HelloReply { Message = "Hello " + request.Name });
         }
     }
 }
