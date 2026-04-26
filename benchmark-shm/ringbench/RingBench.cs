@@ -532,7 +532,8 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
     Segment.TryRemoveSegment(segmentName);
     Segment.TryRemoveSegment(segmentName + "_ctl");
 
-    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, singleStreamMode: ShmBenchConfig.SingleStream, pooledDeserialization: true);
+    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, singleStreamMode: ShmBenchConfig.SingleStream, pooledDeserialization: true,
+        maxReceiveMessageSize: 0); // unlimited for benchmark
 
     server.MapUnary<SimpleRequest, SimpleResponse>(
         "/grpc.testing.BenchmarkService/UnaryCall",

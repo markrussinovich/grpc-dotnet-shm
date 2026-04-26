@@ -51,6 +51,9 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     private readonly uint _maxStreams;
     private readonly bool _singleStreamMode;
     private readonly bool _pooledDeserialization;
+    private readonly int _maxReceiveMessageSize;
+    private readonly int _maxSendMessageSize;
+    private readonly Compression.ShmCompressionOptions? _compressionOptions;
     private readonly Dictionary<string, IMethodHandler> _methods = new(StringComparer.Ordinal);
     private ShmControlListener? _listener;
     private readonly CancellationTokenSource _shutdownCts = new();
@@ -62,20 +65,24 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     /// <param name="segmentName">The shared memory segment name clients will connect to.</param>
     /// <param name="ringCapacity">Ring buffer capacity per connection (default: 64MB).</param>
     /// <param name="maxStreams">Maximum concurrent streams per connection (default: 100).</param>
-    /// <param name="singleStreamMode">When true, enables single-stream optimizations:
-    /// the server writes large response frames directly to the ring when the
-    /// WriterLoop is idle, saving ~80µs wakeup latency per message.</param>
-    /// <param name="pooledDeserialization">When true, uses ArrayPool for
-    /// protobuf <c>bytes</c> fields ≥ 85 KB during deserialization to avoid
-    /// LOH allocations and Gen2 GC pauses. Default: false.</param>
+    /// <param name="singleStreamMode">When true, enables single-stream optimizations.</param>
+    /// <param name="pooledDeserialization">When true, uses ArrayPool for protobuf bytes fields.</param>
+    /// <param name="maxReceiveMessageSize">Maximum receive message size in bytes (default: 4MB, 0 = unlimited).</param>
+    /// <param name="maxSendMessageSize">Maximum send message size in bytes (default: unlimited).</param>
+    /// <param name="compressionOptions">Optional compression options for send/receive.</param>
     public ShmGrpcServer(string segmentName, ulong ringCapacity = 64 * 1024 * 1024, uint maxStreams = 100,
-        bool singleStreamMode = false, bool pooledDeserialization = false)
+        bool singleStreamMode = false, bool pooledDeserialization = false,
+        int maxReceiveMessageSize = 4 * 1024 * 1024, int maxSendMessageSize = int.MaxValue,
+        Compression.ShmCompressionOptions? compressionOptions = null)
     {
         _segmentName = segmentName ?? throw new ArgumentNullException(nameof(segmentName));
         _ringCapacity = ringCapacity;
         _maxStreams = maxStreams;
         _singleStreamMode = singleStreamMode;
         _pooledDeserialization = pooledDeserialization;
+        _maxReceiveMessageSize = maxReceiveMessageSize;
+        _maxSendMessageSize = maxSendMessageSize;
+        _compressionOptions = compressionOptions;
     }
 
     /// <summary>
@@ -140,8 +147,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownCts.Token);
         var ct = linkedCts.Token;
-
-        await Task.Yield();
 
         _listener = new ShmControlListener(_segmentName, _ringCapacity, _maxStreams);
 
@@ -229,7 +234,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
     private async Task HandleStreamAsync(ShmGrpcStream stream, CancellationToken ct)
     {
-        ShmServerCallContext? context = null;
         try
         {
             var headers = stream.RequestHeaders;
@@ -246,11 +250,43 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 return;
             }
 
-            context = new ShmServerCallContext(stream, headers, ct);
+            var context = new ShmServerCallContext(stream, headers, ct);
+
+            // Extract grpc-encoding from request metadata for decompression
+            string? grpcEncoding = null;
+            if (headers.Metadata != null)
+            {
+                foreach (var kv in headers.Metadata)
+                {
+                    if (string.Equals(kv.Key, "grpc-encoding", StringComparison.OrdinalIgnoreCase)
+                        && kv.Values.Count > 0)
+                    {
+                        grpcEncoding = System.Text.Encoding.UTF8.GetString(kv.Values[0]);
+                        break;
+                    }
+                }
+            }
+
+            var cfg = new HandlerConfig(
+                _pooledDeserialization,
+                _maxReceiveMessageSize,
+                _maxSendMessageSize,
+                _compressionOptions,
+                grpcEncoding);
+
+            // If server will compress responses, set grpc-encoding on the stream
+            if (_compressionOptions != null && _compressionOptions.Enabled)
+            {
+                var sendCompressor = _compressionOptions.GetSendCompressor();
+                if (sendCompressor != null && !sendCompressor.IsIdentity)
+                {
+                    stream.SetResponseEncoding(sendCompressor.Name);
+                }
+            }
 
             try
             {
-                await handler.HandleAsync(stream, context, _pooledDeserialization, ct);
+                await handler.HandleAsync(stream, context, cfg, context.CancellationToken);
             }
             catch (RpcException ex)
             {
@@ -260,6 +296,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 await SendErrorTrailersAsync(stream, StatusCode.Cancelled, "Server shutting down",
+                    context.ResponseTrailers);
+            }
+            catch (OperationCanceledException)
+            {
+                // RPC-level cancellation (deadline exceeded or client cancel)
+                var code = context.IsDeadlineExceeded
+                    ? StatusCode.DeadlineExceeded
+                    : StatusCode.Cancelled;
+                await SendErrorTrailersAsync(stream, code,
+                    code == StatusCode.DeadlineExceeded ? "Deadline exceeded" : "Cancelled",
                     context.ResponseTrailers);
             }
             catch (Exception ex)
@@ -274,7 +320,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         }
         finally
         {
-            context?.Dispose();
             stream.Dispose();
         }
     }
@@ -304,30 +349,62 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     private static Task SendProtobufMessageAsync(
         ShmGrpcStream stream, IMessage message, CancellationToken ct)
     {
+        return SendProtobufMessageAsync(stream, message, null, int.MaxValue, ct);
+    }
+
+    private static Task SendProtobufMessageAsync(
+        ShmGrpcStream stream, IMessage message,
+        Compression.ShmCompressionOptions? compression,
+        int maxSendMessageSize, CancellationToken ct)
+    {
         var size = message.CalculateSize();
         if (size == 0)
         {
-            // Empty protobuf message — send cached 5-byte gRPC LPM header.
             return stream.SendMessageAsync(EmptyGrpcLpm, ct);
         }
 
-        var buffer = ArrayPool<byte>.Shared.Rent(5 + size);
+        if (maxSendMessageSize > 0 && maxSendMessageSize < int.MaxValue && size > maxSendMessageSize)
+        {
+            throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                $"Sending message exceeds the maximum configured message size ({size} vs {maxSendMessageSize})"));
+        }
+
+        // Serialize protobuf first
+        var protoBuffer = ArrayPool<byte>.Shared.Rent(size);
         try
         {
-            // Write 5-byte gRPC LPM header at offset 0.
-            buffer[0] = 0; // no compression
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
-                buffer.AsSpan(1, 4), (uint)size);
-            // Serialize protobuf at offset 5.
-            message.WriteTo(buffer.AsSpan(5, size));
+            message.WriteTo(protoBuffer.AsSpan(0, size));
         }
         catch
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            ArrayPool<byte>.Shared.Return(protoBuffer);
             throw;
         }
-        // Transfer buffer ownership to SendMessageZeroCopyAsync — it returns
-        // the buffer to ArrayPool after the ring write completes.
+
+        // Optionally compress if compression is configured and payload is large enough
+        var compressor = compression?.GetSendCompressor();
+        if (compressor != null && !compressor.IsIdentity && compression!.ShouldCompress(size))
+        {
+            var compressed = compressor.Compress(protoBuffer.AsSpan(0, size));
+            ArrayPool<byte>.Shared.Return(protoBuffer);
+
+            var framedBuf = ArrayPool<byte>.Shared.Rent(5 + compressed.Length);
+            framedBuf[0] = 1; // compressed
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                framedBuf.AsSpan(1, 4), (uint)compressed.Length);
+            compressed.AsSpan().CopyTo(framedBuf.AsSpan(5));
+            return stream.SendMessageZeroCopyAsync(
+                framedBuf.AsMemory(0, 5 + compressed.Length), framedBuf, ct);
+        }
+
+        // No compression — write LPM header + protobuf
+        var buffer = ArrayPool<byte>.Shared.Rent(5 + size);
+        buffer[0] = 0; // no compression
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            buffer.AsSpan(1, 4), (uint)size);
+        protoBuffer.AsSpan(0, size).CopyTo(buffer.AsSpan(5));
+        ArrayPool<byte>.Shared.Return(protoBuffer);
+
         return stream.SendMessageZeroCopyAsync(buffer.AsMemory(0, 5 + size), buffer, ct);
     }
 
@@ -351,9 +428,17 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
     #region Method Handlers
 
+    /// <summary>Per-RPC configuration passed from the server to handlers.</summary>
+    private readonly record struct HandlerConfig(
+        bool PooledDeserialization,
+        int MaxReceiveMessageSize,
+        int MaxSendMessageSize,
+        Compression.ShmCompressionOptions? Compression,
+        string? GrpcEncoding);
+
     private interface IMethodHandler
     {
-        Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, bool pooledDeserialization, CancellationToken ct);
+        Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, HandlerConfig cfg, CancellationToken ct);
     }
 
     private sealed class UnaryHandler<TReq, TResp> : IMethodHandler
@@ -368,9 +453,9 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             _handler = handler;
         }
 
-        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, bool pooledDeserialization, CancellationToken ct)
+        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, HandlerConfig cfg, CancellationToken ct)
         {
-            var request = await ReadSingleMessageAsync(stream, _parser, pooledDeserialization, ct);
+            var request = await ReadSingleMessageAsync(stream, _parser, cfg.PooledDeserialization, cfg.MaxReceiveMessageSize, cfg.Compression, cfg.GrpcEncoding, ct);
 
             var response = await _handler(request, context);
 
@@ -380,9 +465,18 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // WriteInlineDirectMultiFrame handles single-frame (zero-copy
             // contiguous) and multi-frame (RingFrameStream) transparently.
             // Fallback: ExecuteInline when TryPause fails.
-            if (stream.Connection.SingleStreamMode && stream.Connection.ActiveStreamCount <= 1)
+            // Skip inline path when compression is enabled — inline writes
+            // are uncompressed (zero-copy to ring), but compressed responses
+            // need the SendProtobufMessageAsync path which handles compress.
+            var _responseSize = ((IMessage)response).CalculateSize();
+            var _sc = cfg.Compression?.ShouldCompress(_responseSize) == true
+                && cfg.Compression.GetSendCompressor()?.IsIdentity == false;
+            if (!_sc && stream.Connection.SingleStreamMode && stream.Connection.ActiveStreamCount <= 1)
             {
-                var size = ((IMessage)response).CalculateSize();
+                var size = _responseSize;
+                if (cfg.MaxSendMessageSize > 0 && cfg.MaxSendMessageSize < int.MaxValue && size > cfg.MaxSendMessageSize)
+                    throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                        $"Sending message exceeds limit ({size} vs {cfg.MaxSendMessageSize})"));
                 var writer = stream.Connection.FrameWriter!;
                 var msg = (IMessage)response;
 
@@ -399,7 +493,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                             writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default);
                         else
                             writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default);
-                        context.ApplyCancellationStatus();
                         stream.SendTrailersInline(writer, context.Status.StatusCode,
                             context.Status.Detail, context.ResponseTrailers);
                     }
@@ -445,7 +538,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     }
                     writer.WriteInline(stream.StreamId,
                         serializedBuffer.AsSpan(0, serializedSize), 0, default);
-                    context.ApplyCancellationStatus();
                     stream.SendTrailersInline(writer, context.Status.StatusCode,
                         context.Status.Detail, context.ResponseTrailers);
                 });
@@ -454,8 +546,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
             // Fallback path: ensure headers sent, then use WriterLoop queue.
             await context.EnsureResponseHeadersSentAsync();
-            await SendProtobufMessageAsync(stream, response, ct);
-            context.ApplyCancellationStatus();
+            await SendProtobufMessageAsync(stream, response, cfg.Compression, cfg.MaxSendMessageSize, ct);
             await stream.SendTrailersAsync(context.Status.StatusCode, context.Status.Detail, context.ResponseTrailers);
         }
     }
@@ -470,16 +561,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         public ServerStreamingHandler(Func<TReq, IServerStreamWriter<TResp>, ServerCallContext, Task> handler)
             => _handler = handler;
 
-        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, bool pooledDeserialization, CancellationToken ct)
+        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, HandlerConfig cfg, CancellationToken ct)
         {
-            var request = await ReadSingleMessageAsync(stream, _parser, pooledDeserialization, ct);
+            var request = await ReadSingleMessageAsync(stream, _parser, cfg.PooledDeserialization, cfg.MaxReceiveMessageSize, cfg.Compression, cfg.GrpcEncoding, ct);
 
             var singleStream = stream.Connection.SingleStreamMode;
 
             if (!singleStream || stream.Connection.ActiveStreamCount > 1)
                 await context.EnsureResponseHeadersSentAsync();
 
-            var writer = new ShmServerStreamWriter<TResp>(stream, context, singleStream);
+            var writer = new ShmServerStreamWriter<TResp>(stream, context, singleStream, cfg.Compression, cfg.MaxSendMessageSize);
             try
             {
                 await _handler(request, writer, context);
@@ -497,7 +588,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 {
                     try
                     {
-                        context.ApplyCancellationStatus();
                         stream.SendTrailersInline(fw, context.Status.StatusCode,
                             context.Status.Detail, context.ResponseTrailers);
                     }
@@ -510,7 +600,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             }
 
             // Send trailers
-            context.ApplyCancellationStatus();
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,
@@ -527,18 +616,24 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         public ClientStreamingHandler(Func<IAsyncStreamReader<TReq>, ServerCallContext, Task<TResp>> handler)
             => _handler = handler;
 
-        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, bool pooledDeserialization, CancellationToken ct)
+        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, HandlerConfig cfg, CancellationToken ct)
         {
             var singleStream = stream.Connection.SingleStreamMode;
             if (!singleStream || stream.Connection.ActiveStreamCount > 1)
                 await context.EnsureResponseHeadersSentAsync();
 
-            using var reader = new ShmAsyncStreamReader<TReq>(stream, pooledDeserialization);
+            using var reader = new ShmAsyncStreamReader<TReq>(stream, cfg);
             var response = await _handler(reader, context);
 
-            if (singleStream && stream.Connection.ActiveStreamCount <= 1)
+            var _responseSize2 = ((IMessage)response).CalculateSize();
+            var _sc2 = cfg.Compression?.ShouldCompress(_responseSize2) == true
+                && cfg.Compression.GetSendCompressor()?.IsIdentity == false;
+            if (!_sc2 && singleStream && stream.Connection.ActiveStreamCount <= 1)
             {
-                var size = ((IMessage)response).CalculateSize();
+                var size = _responseSize2;
+                if (cfg.MaxSendMessageSize > 0 && cfg.MaxSendMessageSize < int.MaxValue && size > cfg.MaxSendMessageSize)
+                    throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                        $"Sending message exceeds limit ({size} vs {cfg.MaxSendMessageSize})"));
                 var writer = stream.Connection.FrameWriter!;
                 var msg = (IMessage)response;
 
@@ -555,7 +650,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                             writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default);
                         else
                             writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default);
-                        context.ApplyCancellationStatus();
                         stream.SendTrailersInline(writer, context.Status.StatusCode,
                             context.Status.Detail, context.ResponseTrailers);
                     }
@@ -600,15 +694,13 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         context.MarkHeadersSent();
                     }
                     writer.WriteInline(stream.StreamId, serializedBuffer.AsSpan(0, serializedSize), 0, default);
-                    context.ApplyCancellationStatus();
                     stream.SendTrailersInline(writer, context.Status.StatusCode,
                         context.Status.Detail, context.ResponseTrailers);
                 });
                 return;
             }
 
-            await SendProtobufMessageAsync(stream, response, ct);
-            context.ApplyCancellationStatus();
+            await SendProtobufMessageAsync(stream, response, cfg.Compression, cfg.MaxSendMessageSize, ct);
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,
@@ -625,7 +717,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         public DuplexStreamingHandler(Func<IAsyncStreamReader<TReq>, IServerStreamWriter<TResp>, ServerCallContext, Task> handler)
             => _handler = handler;
 
-        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, bool pooledDeserialization, CancellationToken ct)
+        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, HandlerConfig cfg, CancellationToken ct)
         {
             var singleStream = stream.Connection.SingleStreamMode;
             // Headers: if truly single stream (1 active), WriteAsync sends
@@ -633,8 +725,8 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             if (!singleStream || stream.Connection.ActiveStreamCount > 1)
                 await context.EnsureResponseHeadersSentAsync();
 
-            using var reader = new ShmAsyncStreamReader<TReq>(stream, pooledDeserialization);
-            var writer = new ShmServerStreamWriter<TResp>(stream, context, singleStream);
+            using var reader = new ShmAsyncStreamReader<TReq>(stream, cfg);
+            var writer = new ShmServerStreamWriter<TResp>(stream, context, singleStream, cfg.Compression, cfg.MaxSendMessageSize);
             try
             {
                 await _handler(reader, writer, context);
@@ -652,7 +744,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 {
                     try
                     {
-                        context.ApplyCancellationStatus();
                         stream.SendTrailersInline(fw, context.Status.StatusCode,
                             context.Status.Detail, context.ResponseTrailers);
                     }
@@ -664,7 +755,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 }
             }
 
-            context.ApplyCancellationStatus();
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,
@@ -676,8 +766,58 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
     #region Stream Adapters
 
+    /// <summary>
+    /// Decompresses gRPC LPM payload if the compressed flag is set.
+    /// Returns the protobuf bytes (without the 5-byte header).
+    /// </summary>
+    private static ReadOnlySpan<byte> DecompressLpm(
+        ReadOnlySpan<byte> lpmPayload,
+        Compression.ShmCompressionOptions? compression,
+        string? grpcEncoding = null)
+    {
+        if (lpmPayload.Length < 5)
+            throw new RpcException(new Status(StatusCode.Internal,
+                $"Malformed gRPC LPM frame: expected at least 5 bytes, got {lpmPayload.Length}"));
+
+        var compressedFlag = lpmPayload[0];
+        var bodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(lpmPayload.Slice(1, 4));
+
+        if (5 + bodyLen > lpmPayload.Length)
+            throw new RpcException(new Status(StatusCode.Internal,
+                $"Malformed gRPC LPM frame: declared length {bodyLen} exceeds payload ({lpmPayload.Length - 5} bytes available)"));
+
+        var body = lpmPayload.Slice(5, bodyLen);
+
+        if (compressedFlag == 0)
+            return body;
+
+        // Decompress using the encoding declared in request/response headers
+        if (compression == null)
+            throw new RpcException(new Status(StatusCode.Unimplemented,
+                "Received compressed message but no compression options configured"));
+
+        var encoding = grpcEncoding ?? "gzip";
+        var decompressor = compression.GetDecompressor(encoding);
+        if (decompressor == null)
+            throw new RpcException(new Status(StatusCode.Unimplemented,
+                $"Received compressed message with encoding '{encoding}' but no matching decompressor found"));
+
+        return decompressor.Decompress(body);
+    }
+
     private static async Task<TReq> ReadSingleMessageAsync<TReq>(
-        ShmGrpcStream stream, MessageParser<TReq> parser, bool pooledDeserialization, CancellationToken ct)
+        ShmGrpcStream stream, MessageParser<TReq> parser, bool pooledDeserialization,
+        int maxReceiveMessageSize, CancellationToken ct)
+        where TReq : class, IMessage<TReq>, new()
+    {
+        return await ReadSingleMessageAsync(stream, parser, pooledDeserialization,
+            maxReceiveMessageSize, null, null, ct);
+    }
+
+    private static async Task<TReq> ReadSingleMessageAsync<TReq>(
+        ShmGrpcStream stream, MessageParser<TReq> parser, bool pooledDeserialization,
+        int maxReceiveMessageSize, Compression.ShmCompressionOptions? compression,
+        string? grpcEncoding, CancellationToken ct)
         where TReq : class, IMessage<TReq>, new()
     {
         // Use connection-level cached read buffer to avoid LOH churn.
@@ -738,14 +878,25 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         assembledPos += f.Length;
                         f.ReturnToPool();
 
-                        return (pooledDeserialization
-                            ? PooledProtoParser.ParseFrom<TReq>(assembled.AsSpan(5, assembledPos - 5))
-                            : parser.ParseFrom(new ReadOnlySequence<byte>(assembled.AsMemory(5, assembledPos - 5))));
+                        var protoData = DecompressLpm(assembled.AsSpan(0, assembledPos), compression, grpcEncoding);
+                        // Check decompressed size (not wire size) against limit
+                        if (maxReceiveMessageSize > 0 && protoData.Length > maxReceiveMessageSize)
+                            throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                                $"Received message exceeds the maximum configured message size ({protoData.Length} vs {maxReceiveMessageSize})"));
+                        if (pooledDeserialization)
+                            return PooledProtoParser.ParseFrom<TReq>(protoData);
+                        return parser.ParseFrom(protoData);
                     }
                     else
                     {
-                        // Single frame — skip 5-byte gRPC LPM header per G3 spec.
-                        var protoSpan = f.Memory.Span.Slice(5);
+                        // Single frame — decompress then check size
+                        var protoSpan = DecompressLpm(f.Memory.Span, compression, grpcEncoding);
+                        if (maxReceiveMessageSize > 0 && protoSpan.Length > maxReceiveMessageSize)
+                        {
+                            f.ReturnToPool();
+                            throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                                $"Received message exceeds the maximum configured message size ({protoSpan.Length} vs {maxReceiveMessageSize})"));
+                        }
                         var result = pooledDeserialization
                             ? PooledProtoParser.ParseFrom<TReq>(protoSpan)
                             : parser.ParseFrom(protoSpan);
@@ -783,6 +934,9 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     {
         private readonly ShmGrpcStream _stream;
         private readonly bool _pooledDeserialization;
+        private readonly int _maxReceiveMessageSize;
+        private readonly Compression.ShmCompressionOptions? _compression;
+        private readonly string? _grpcEncoding;
         private readonly MessageParser<T> _parser = new(() => new T());
         private InboundFrame _previousFrame;
         private T? _current;
@@ -791,11 +945,13 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         private byte[]? _assembled;
         private int _assembledPos;
 
-        public ShmAsyncStreamReader(ShmGrpcStream stream, bool pooledDeserialization)
+        public ShmAsyncStreamReader(ShmGrpcStream stream, HandlerConfig cfg)
         {
             _stream = stream;
-            _pooledDeserialization = pooledDeserialization;
-            // Borrow cached read buffer from connection (may be null).
+            _pooledDeserialization = cfg.PooledDeserialization;
+            _maxReceiveMessageSize = cfg.MaxReceiveMessageSize;
+            _compression = cfg.Compression;
+            _grpcEncoding = cfg.GrpcEncoding;
             _assembled = stream.Connection.BorrowReadBuffer();
         }
 
@@ -894,14 +1050,24 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         _assembledPos += frame.Length;
                         frame.ReturnToPool();
 
+                        var protoData = DecompressLpm(_assembled.AsSpan(0, _assembledPos), _compression, _grpcEncoding);
+                        if (_maxReceiveMessageSize > 0 && protoData.Length > _maxReceiveMessageSize)
+                            throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                                $"Received message exceeds the maximum configured message size ({protoData.Length} vs {_maxReceiveMessageSize})"));
                         _current = _pooledDeserialization
-                            ? PooledProtoParser.ParseFrom<T>(_assembled.AsSpan(5, _assembledPos - 5))
-                            : _parser.ParseFrom(new ReadOnlySequence<byte>(_assembled.AsMemory(5, _assembledPos - 5)));
+                            ? PooledProtoParser.ParseFrom<T>(protoData)
+                            : _parser.ParseFrom(protoData);
                     }
                     else
                     {
                         // Single frame — skip 5-byte gRPC LPM header per G3 spec.
-                        var protoSpan = frame.Memory.Span.Slice(5);
+                        var protoSpan = DecompressLpm(frame.Memory.Span, _compression, _grpcEncoding);
+                        if (_maxReceiveMessageSize > 0 && protoSpan.Length > _maxReceiveMessageSize)
+                        {
+                            frame.ReturnToPool();
+                            throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                                $"Received message exceeds the maximum configured message size ({protoSpan.Length} vs {_maxReceiveMessageSize})"));
+                        }
                         _current = _pooledDeserialization
                             ? PooledProtoParser.ParseFrom<T>(protoSpan)
                             : _parser.ParseFrom(protoSpan);
@@ -971,14 +1137,20 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         private readonly ShmGrpcStream _stream;
         private readonly ShmServerCallContext _context;
         private readonly bool _directRingWrite;
+        private readonly Compression.ShmCompressionOptions? _compression;
+        private readonly int _maxSendMessageSize;
         // Reusable write buffer for the ExecuteInline fallback path.
         private byte[]? _writeBuf;
 
-        public ShmServerStreamWriter(ShmGrpcStream stream, ShmServerCallContext context, bool directRingWrite = false)
+        public ShmServerStreamWriter(ShmGrpcStream stream, ShmServerCallContext context,
+            bool directRingWrite = false, Compression.ShmCompressionOptions? compression = null,
+            int maxSendMessageSize = int.MaxValue)
         {
             _stream = stream;
             _context = context;
             _directRingWrite = directRingWrite;
+            _compression = compression;
+            _maxSendMessageSize = maxSendMessageSize;
         }
 
         public WriteOptions? WriteOptions { get; set; }
@@ -997,9 +1169,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         {
             // In singleStreamMode with one active stream, serialize directly
             // into the ring buffer — no intermediate byte[] for any size.
-            if (_directRingWrite && _stream.Connection.ActiveStreamCount <= 1)
+            // Skip inline when compression is enabled (inline writes are uncompressed).
+            var _msgSize = message.CalculateSize();
+            var _sc3 = _compression?.ShouldCompress(_msgSize) == true
+                && _compression.GetSendCompressor()?.IsIdentity == false;
+            if (!_sc3 && _directRingWrite && _stream.Connection.ActiveStreamCount <= 1)
             {
-                var size = message.CalculateSize();
+                var size = _msgSize;
+                if (_maxSendMessageSize > 0 && _maxSendMessageSize < int.MaxValue && size > _maxSendMessageSize)
+                    throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                        $"Sending message exceeds limit ({size} vs {_maxSendMessageSize})"));
                 var writer = _stream.Connection.FrameWriter!;
                 IMessage msg = message;
 
@@ -1073,13 +1252,13 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             if (!headersTask.IsCompletedSuccessfully)
                 return WriteAsyncSlow(headersTask, message);
 
-            return SendProtobufMessageAsync(_stream, message, default);
+            return SendProtobufMessageAsync(_stream, message, _compression, _maxSendMessageSize, default);
         }
 
         private async Task WriteAsyncSlow(Task headersTask, T message)
         {
             await headersTask.ConfigureAwait(false);
-            await SendProtobufMessageAsync(_stream, message, default).ConfigureAwait(false);
+            await SendProtobufMessageAsync(_stream, message, _compression, _maxSendMessageSize, default).ConfigureAwait(false);
         }
     }
 
