@@ -45,7 +45,7 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
     private readonly ShmServicePolicy _policy;
     private readonly ILogger _logger;
 
-    private ShmHandler? _shmHandler;
+    private ShmControlHandler? _shmControlHandler;
     private HttpMessageHandler? _tcpHandler;
 
     private volatile bool _shmFailed;
@@ -135,8 +135,8 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
         Interlocked.Increment(ref _shmAttempts);
         try
         {
-            var shmHandler = EnsureShmHandler();
-            var invoker = new HttpMessageInvoker(shmHandler, disposeHandler: false);
+            var shmControlHandler = EnsureShmControlHandler();
+            var invoker = new HttpMessageInvoker(shmControlHandler, disposeHandler: false);
             var response = await invoker.SendAsync(request, cancellationToken).ConfigureAwait(false);
             Interlocked.Increment(ref _shmSuccesses);
             ShmTelemetry.RecordTransportSelected("shm", _segmentName);
@@ -164,9 +164,9 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
         }
     }
 
-    private ShmHandler EnsureShmHandler()
+    private ShmControlHandler EnsureShmControlHandler()
     {
-        var existing = Volatile.Read(ref _shmHandler);
+        var existing = Volatile.Read(ref _shmControlHandler);
         if (existing != null)
         {
             return existing;
@@ -174,8 +174,8 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
 
         ObjectDisposedException.ThrowIf(_disposed != 0, this);
 
-        var newHandler = new ShmHandler(_segmentName);
-        var prev = Interlocked.CompareExchange(ref _shmHandler, newHandler, null);
+        var newHandler = new ShmControlHandler(_segmentName);
+        var prev = Interlocked.CompareExchange(ref _shmControlHandler, newHandler, null);
         if (prev != null)
         {
             newHandler.Dispose();
@@ -186,7 +186,7 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
         // the new handler was published into an already-disposed parent.
         if (_disposed != 0)
         {
-            Interlocked.CompareExchange(ref _shmHandler, null, newHandler);
+            Interlocked.CompareExchange(ref _shmControlHandler, null, newHandler);
             newHandler.Dispose();
             throw new ObjectDisposedException(nameof(ShmFallbackHandler));
         }
@@ -280,7 +280,10 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
         }
 
         // InvalidOperation if SHM is not supported on this platform
-        if (ex is InvalidOperationException && ex.Message.Contains("shared memory", StringComparison.OrdinalIgnoreCase))
+        if (ex is InvalidOperationException &&
+            (ex.Message.Contains("shared memory", StringComparison.OrdinalIgnoreCase) ||
+             ex.Message.Contains("Server not listening on segment", StringComparison.OrdinalIgnoreCase) ||
+             ex.Message.Contains("Control segment", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
@@ -296,7 +299,7 @@ public sealed class ShmFallbackHandler : HttpMessageHandler
 
         if (disposing)
         {
-            _shmHandler?.Dispose();
+            _shmControlHandler?.Dispose();
             _tcpHandler?.Dispose();
         }
 

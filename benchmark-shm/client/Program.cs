@@ -135,13 +135,13 @@ public class BenchmarkRunner
 
         // Create channel based on transport
         GrpcChannel channel;
-        HttpMessageHandler? shmHandler = null;
+        HttpMessageHandler? shmControlHandler = null;
         if (transport == "shm")
         {
-            shmHandler = new ShmControlHandler(_config.ShmSegmentName);
+            shmControlHandler = new ShmControlHandler(_config.ShmSegmentName);
             channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
             {
-                HttpHandler = shmHandler,
+                HttpHandler = shmControlHandler,
                 DisposeHttpClient = true
             });
         }
@@ -205,9 +205,9 @@ public class BenchmarkRunner
         channel.Dispose();
         
         // Ensure SHM handler is fully cleaned up
-        if (shmHandler != null)
+        if (shmControlHandler != null)
         {
-            shmHandler.Dispose();
+            shmControlHandler.Dispose();
             await Task.Delay(50); // Give time for cleanup
         }
 

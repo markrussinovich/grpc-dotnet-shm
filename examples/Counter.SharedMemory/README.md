@@ -60,7 +60,7 @@ The example demonstrates all three streaming patterns:
 ### Shared Memory Transport
 
 ```csharp
-using var handler = new ShmHandler(segmentName);
+using var handler = new ShmControlHandler(segmentName);
 using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
 {
     HttpHandler = handler

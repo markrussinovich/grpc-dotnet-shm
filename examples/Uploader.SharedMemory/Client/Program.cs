@@ -34,7 +34,7 @@ Console.WriteLine();
 
 try
 {
-    using var handler = new ShmHandler(SegmentName);
+    using var handler = new ShmControlHandler(SegmentName);
     using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
     {
         HttpHandler = handler

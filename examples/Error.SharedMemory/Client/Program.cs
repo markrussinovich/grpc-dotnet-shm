@@ -36,7 +36,7 @@ Console.WriteLine();
 try
 {
     // Create a channel using the shared memory handler
-    using var handler = new ShmHandler(SegmentName);
+    using var handler = new ShmControlHandler(SegmentName);
     using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
     {
         HttpHandler = handler
