@@ -6,6 +6,7 @@ This example demonstrates unary, client streaming, and server streaming over sha
 
 This is the shared memory transport equivalent of the `Counter` example.
 It demonstrates:
+
 - Unary RPC (IncrementCount)
 - Client streaming RPC (AccumulateCount)
 - Server streaming RPC (Countdown)
@@ -36,11 +37,13 @@ dotnet run
 The example demonstrates all three streaming patterns:
 
 1. **Unary RPC**: Simple request/response
+
    ```csharp
    var reply = await client.IncrementCountAsync(new Empty());
    ```
 
 2. **Client Streaming**: Client sends multiple messages
+
    ```csharp
    using var call = client.AccumulateCount();
    await call.RequestStream.WriteAsync(new CounterRequest { Count = 5 });
@@ -49,6 +52,7 @@ The example demonstrates all three streaming patterns:
    ```
 
 3. **Server Streaming**: Server sends multiple messages
+
    ```csharp
    using var call = client.Countdown(new Empty());
    await foreach (var message in call.ResponseStream.ReadAllAsync())
@@ -70,7 +74,7 @@ using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOpt
 ## Comparison with TCP Counter
 
 | Aspect | TCP Counter | SHM Counter |
-|--------|-------------|-------------|
+| ------ | ----------- | ----------- |
 | Transport | HTTP/2 over TCP | Shared Memory |
 | Latency | Network round-trip | Zero-copy IPC |
 | Streaming | Full duplex | Full duplex |

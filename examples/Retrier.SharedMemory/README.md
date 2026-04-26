@@ -6,6 +6,7 @@ This example demonstrates retry policies over shared memory transport.
 
 This is the shared memory transport equivalent of the `Retrier` example.
 It demonstrates:
+
 - Automatic retry with configurable policies
 - Exponential backoff
 - Retryable status codes
@@ -61,7 +62,7 @@ using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOpt
 ## Comparison with TCP Retrier
 
 | Aspect | TCP Retrier | SHM Retrier |
-|--------|-------------|-------------|
+| ------ | ----------- | ----------- |
 | Transport | HTTP/2 over TCP | Shared Memory |
 | Retry Config | `ServiceConfig` | `ShmRetryPolicy` |
 | Latency | Network round-trip | Zero-copy IPC |

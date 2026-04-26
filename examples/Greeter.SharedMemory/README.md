@@ -5,6 +5,7 @@ This example demonstrates gRPC communication using shared memory transport inste
 ## Overview
 
 The shared memory transport uses:
+
 - **SPSC Ring Buffers**: Lock-free single-producer single-consumer ring buffers for data transfer
 - **Frame Protocol**: 16-byte frame headers with length, stream ID, type, and flags
 - **Blocking I/O**: Uses Windows events (or Linux futex) for synchronization with zero polling
@@ -18,16 +19,19 @@ The shared memory transport uses:
 ## Running the Example
 
 ### Prerequisites
+
 - .NET 9.0 SDK
 - Windows (Linux support for futex is in development)
 
 ### Start the Server
+
 ```bash
 cd Server
 dotnet run
 ```
 
 ### Run the Client (in a separate terminal)
+
 ```bash
 cd Client
 dotnet run
