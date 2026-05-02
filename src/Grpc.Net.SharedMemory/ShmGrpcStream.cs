@@ -46,6 +46,9 @@ public readonly struct InboundFrame
 
     public int Length => _payload.Length;
 
+    /// <summary>True if this frame's payload is a ring-backed ZC view.</summary>
+    public bool IsSpeculativeZeroCopy => _payload.IsSpeculativeZeroCopy;
+
     /// <summary>Returns the buffer to the pool or commits the ring read.</summary>
     public void ReturnToPool()
     {

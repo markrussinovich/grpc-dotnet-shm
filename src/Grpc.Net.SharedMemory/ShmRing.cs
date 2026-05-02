@@ -146,6 +146,22 @@ public sealed class ShmRing : IDisposable
     /// </summary>
     public ulong Capacity => _capacity;
 
+    /// <summary>
+    /// Gets or sets the wire-level frame encoding used on this ring.
+    /// Set once during connection establishment (after control-plane
+    /// negotiation) and read on every frame I/O via <see cref="FrameProtocol"/>.
+    /// Default is <see cref="Grpc.Net.SharedMemory.Wire.WireFormat.Custom16"/>.
+    /// </summary>
+    /// <remarks>
+    /// The setter is <c>internal</c> on purpose: the wire format is part of
+    /// the ring's contract for its lifetime. Changing it after frames have
+    /// flowed would corrupt both the writer's and reader's view of the
+    /// on-wire layout. Only the connection-establishment code in
+    /// <see cref="ShmConnection"/>, <see cref="ShmControlListener"/> and
+    /// <see cref="ShmControlHandler"/> may set it.
+    /// </remarks>
+    public Grpc.Net.SharedMemory.Wire.WireFormat Wire { get; internal set; } = Grpc.Net.SharedMemory.Wire.WireFormat.Custom16;
+
     // Speculative zero-copy: track bytes committed but not yet consumed.
     // Writer deducts this from available space in ReserveWrite, ensuring
     // it can never reach ring memory still referenced by handler code.
@@ -158,6 +174,269 @@ public sealed class ShmRing : IDisposable
     // Volatile.Read — stale reads only cause a conservative wait, never
     // a safety violation.
     internal long SpeculativeReservedBytes;
+
+    /// <summary>
+    /// Computes the number of bytes the writer can safely reserve right now.
+    /// </summary>
+    /// <remarks>
+    /// Single source of truth for the writer's "available space" formula.
+    /// Cross-process zero-copy safety is achieved on the READER side by
+    /// deferring <c>header.ReadIdx</c> advancement while a ZC frame is in
+    /// flight (see <see cref="BeginZcReservation"/> and
+    /// <see cref="EndZcReservation"/>). This means the writer's plain
+    /// <c>used = writeIdx - readIdx</c> formula is automatically correct —
+    /// no shared-memory ZC field, no protocol change.
+    /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private ulong ComputeAvailableForWrite(ulong writeIdx, ulong readIdx)
+    {
+        var used = writeIdx - readIdx;
+        return used >= _capacity ? 0UL : _capacity - used;
+    }
+
+    // ===== Position-aware speculative ZC protection (no protocol change) =====
+    //
+    // Problem: SpeculativeReservedBytes is a count, not a position; it cannot
+    // tell the writer WHERE the held bytes are. If a non-ZC frame commits AFTER
+    // a ZC frame, header.ReadIdx advances past the ZC region's tail, and the
+    // writer's available-space formula allows wrapping onto still-held bytes.
+    //
+    // Worse: SpeculativeReservedBytes is a per-process managed field, so the
+    // cross-process writer never even saw it.
+    //
+    // Solution: don't advance the SHARED header.ReadIdx while a ZC frame is in
+    // flight. Reader keeps its progress in a local _deferredReadIdx; on ZC
+    // release the deferred value is published to header.ReadIdx in one shot.
+    // Cross-process writer reads header.ReadIdx normally and is correct without
+    // knowing anything about ZC.
+    //
+    // Invariants enforced by callers:
+    //   - At most ONE ZC in flight per ring (gated by Volatile.Read(spec)==0).
+    //   - BeginZcReservation/EndZcReservation are paired exactly once per ZC.
+    //   - The reader-side FrameReaderLoop is single-threaded; CommitReadRaw is
+    //     only called from that thread or from EndZcReservation (consumer side).
+
+    // Note: NOT marked `volatile` because we access this field via
+    // Volatile.Read/Write everywhere — taking a `ref` to a `volatile`
+    // field would silently strip the volatile semantics (CS0420) and
+    // mixing `volatile` keyword with explicit Volatile.Read/Write is
+    // confusing. Volatile.Read provides acquire semantics, Volatile.Write
+    // provides release semantics, which is exactly what we need.
+    private bool _zcActive;
+    private ulong _deferredReadIdxTarget; // furthest absolute idx wanting commit
+
+    // ===== Multi-frame chain ZC state =====
+    //
+    // Chain modes for a multi-frame logical message:
+    //
+    //   * Full chain ZC: every frame ZC. The chain anchor is opened on the
+    //     first frame; readIdx is frozen for the duration. Eligibility
+    //     decided ONCE on the first frame: <c>totalMsg ≤ ChainZcBudget</c>.
+    //
+    //   * Pure copy: every frame copies; no anchor opens. Used when chain
+    //     start eligibility fails (totalMsg too big, wrap, ZC disabled, or
+    //     sub-MinZc).
+    //
+    // Why no tail-ZC? The savings would be at most ChainZcBudget (~cap)
+    // worth of memcpy on the codec→pool boundary, but the upper-layer
+    // protobuf parser already needs a contiguous buffer for messages that
+    // span multiple segments. The deserializer copies the multi-segment
+    // ROS into one Rented buffer, paying back the memcpy we saved. Net
+    // gain on big messages is small (one fewer Rent, but same byte
+    // movement). Keeping the codec simple — single mode decision per
+    // message — is worth more than the marginal gain.
+    //
+    // <c>_chainOpen</c>: codec marks <c>true</c> when the anchor opens
+    // (start of full ZC); marks <c>false</c> when emitting the chain's
+    // final (More=0) frame. <see cref="FramePayload.Release"/> reads it:
+    // <see cref="EndZcReservation"/> may fire only when the chain is closed
+    // (<c>!_chainOpen</c>) AND no more ZC frames are held
+    // (<c>SpeculativeReservedBytes == 0</c>).
+    //
+    // <c>_chainCopyMode</c>: set when chain ZC was rejected. Cleared on
+    // the message's final frame.
+
+    private bool _chainOpen;
+    private bool _chainCopyMode;
+
+    /// <summary>True while a speculative-ZC anchor is held (deferred-publish active).</summary>
+    internal bool IsZcChainActive => Volatile.Read(ref _zcActive);
+
+    /// <summary>True between codec's chain-start and chain-end (codec view).</summary>
+    internal bool IsChainOpen => Volatile.Read(ref _chainOpen);
+
+    /// <summary>Codec entered a multi-frame chain. Pairs with <see cref="CloseZcChain"/>.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal void OpenZcChain() => Volatile.Write(ref _chainOpen, true);
+
+    /// <summary>Codec emitted a chain's final frame; consumer's last Release will fire <see cref="EndZcReservation"/>.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal void CloseZcChain() => Volatile.Write(ref _chainOpen, false);
+
+    /// <summary>
+    /// Codec-local: marks the in-flight multi-frame message as committed to
+    /// the copy path. Reset on the message's final frame so the next
+    /// message's first frame is re-evaluated.
+    /// </summary>
+    internal bool ChainCopyMode
+    {
+        get => Volatile.Read(ref _chainCopyMode);
+        set => Volatile.Write(ref _chainCopyMode, value);
+    }
+
+    /// <summary>
+    /// Maximum bytes a chain ZC anchor may hold. Set to <c>cap/2</c> so
+    /// that even under sustained back-to-back streaming, the writer
+    /// always has at least <c>cap/2</c> of headroom to begin emitting
+    /// the next message while the consumer is still parsing the current
+    /// one. A larger budget (e.g., <c>cap - 64 KiB</c>) works for unary
+    /// (client finishes writing before server starts reading) but
+    /// deadlocks streaming: holding nearly the whole ring leaves no
+    /// room for the writer to progress on the next message, and the
+    /// next message's frames are what would eventually trigger the
+    /// release of the current anchor — circular wait.
+    /// </summary>
+    internal long ChainZcBudget => (long)(_capacity / 2);
+
+    /// <summary>
+    /// Begins a speculative-zero-copy reservation. Subsequent
+    /// <see cref="CommitReadRaw"/> calls are deferred (do not touch shared
+    /// <c>header.ReadIdx</c>) until <see cref="EndZcReservation"/> is called.
+    /// </summary>
+    /// <remarks>
+    /// Caller must guarantee no other ZC is in flight on this ring (the
+    /// consumer is single-threaded; the existing
+    /// <c>Volatile.Read(SpeculativeReservedBytes) == 0</c> gate enforces this).
+    /// Pair every call with <see cref="EndZcReservation"/> via
+    /// <see cref="FramePayload.Release"/>.
+    /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal void BeginZcReservation(ulong baseIdx)
+    {
+        // Initialise the deferred target to the ZC frame's start so that
+        // even if no frames follow, EndZc has something coherent to publish.
+        // The ZC's own CommitReadRaw call (made right after BeginZc) will
+        // bump it to baseIdx + totalBytes.
+        //
+        // Ordering: write the target FIRST, then set _zcActive. Volatile.Write
+        // on _zcActive provides a release barrier so any reader-thread
+        // CommitReadRaw that observes _zcActive=true (volatile-read, acquire)
+        // will see the initialised target value, never a leftover stale value
+        // from the previous ZC cycle.
+        Volatile.Write(ref _deferredReadIdxTarget, baseIdx);
+        Volatile.Write(ref _zcActive, true);
+    }
+
+    /// <summary>
+    /// Single-frame speculative-ZC fast path: fuses
+    /// <see cref="BeginZcReservation"/> + the frame's own
+    /// <see cref="CommitReadRaw"/>-deferred bump into one atomic
+    /// sequence. The reader thread is single-threaded so no other
+    /// <see cref="CommitReadRaw"/> can race between Begin and the
+    /// frame's own deferred bump; we therefore set
+    /// <c>_deferredReadIdxTarget</c> directly to its post-frame value
+    /// instead of doing the standard
+    /// <c>(write base) → (read base) → (write base+totalBytes)</c>
+    /// triple-step. Saves 1 Volatile.Read and 1 Volatile.Write per
+    /// single-frame ZC compared to the two-call sequence.
+    /// </summary>
+    /// <remarks>
+    /// Only safe when:
+    ///   - This is a SINGLE-frame ZC anchor (no chain follows). Multi-
+    ///     frame chains must use the separate
+    ///     <see cref="BeginZcReservation"/> + per-frame
+    ///     <see cref="CommitReadRaw"/> sequence so that intervening
+    ///     non-chain frames committed during the chain hold are also
+    ///     captured into <c>_deferredReadIdxTarget</c>.
+    ///   - At-most-one-ZC FIFO invariant holds (caller already verified
+    ///     <see cref="SpeculativeReservedBytes"/> == 0).
+    /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal void BeginSingleFrameZcCommit(ulong baseIdx, int totalBytes)
+    {
+        // Set the deferred target to its FINAL value right away. Same
+        // ordering invariant as BeginZcReservation: target FIRST, then
+        // _zcActive. The Volatile.Write on _zcActive provides the release
+        // barrier so any subsequent reader observing _zcActive=true sees
+        // the post-frame target value, not stale.
+        Volatile.Write(ref _deferredReadIdxTarget, baseIdx + (ulong)totalBytes);
+        Volatile.Write(ref _zcActive, true);
+    }
+
+    /// <summary>
+    /// Ends the in-flight ZC reservation: publishes the deferred read index
+    /// to the shared <c>header.ReadIdx</c>, releasing all bytes consumed
+    /// during the ZC hold (the ZC frame itself plus any non-ZC frames that
+    /// were committed-deferred while ZC was active).
+    /// </summary>
+    /// <remarks>
+    /// CRITICAL ordering: PUBLISH header.ReadIdx FIRST, then clear
+    /// <see cref="_zcActive"/>. The reverse order has a window where a
+    /// concurrent reader-thread <see cref="CommitReadRaw"/> observes
+    /// <c>_zcActive=false</c> but <c>header.ReadIdx</c> is still at the ZC
+    /// start (we haven't CAS'd yet); the reader then takes the
+    /// immediate-publish branch with a STALE
+    /// <c>baseCommitReadIdx</c> (= ZC start) and CASes <c>header.ReadIdx</c>
+    /// to a value INSIDE the still-held ZC region. Cross-process writer
+    /// then sees those bytes as free, wraps onto them, and corrupts the
+    /// in-flight payload — observed in stress as
+    /// <c>SHM_LPM_ASSERT declared=0, payload all-zero</c>.
+    /// <para>
+    /// After clearing <c>_zcActive</c>, a small race window remains where
+    /// the reader bumped <c>_deferredReadIdxTarget</c> with
+    /// <c>_zcActive=true</c> still observed but our publish happened with
+    /// the older snapshot. We catch that by re-reading and re-publishing
+    /// in a loop until <c>_deferredReadIdxTarget</c> is fully reflected
+    /// in <c>header.ReadIdx</c>. Once <c>_zcActive</c> is false, no further
+    /// bumps can occur (reader's <see cref="CommitReadRaw"/> goes to the
+    /// CAS path), so the loop terminates after at most one extra iteration.
+    /// </para>
+    /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal void EndZcReservation()
+    {
+        ref var header = ref GetHeader();
+        var target = Volatile.Read(ref _deferredReadIdxTarget);
+
+        // Phase 1: publish target while _zcActive is still true. Any concurrent
+        // reader-thread CommitReadRaw still sees _zcActive=true and stays on
+        // the deferred path, which only bumps _deferredReadIdxTarget — never
+        // touches header.ReadIdx. So our CAS here is uncontended on the
+        // reader-thread side; only cross-process EndZcReservation-on-the-other-
+        // side could compete (impossible: ZC is per-direction).
+        PublishTarget(ref header, target);
+
+        // Phase 2: drop the active flag. From this point the reader thread
+        // will route future CommitReadRaw calls through the CAS path. A frame
+        // whose baseCommitReadIdx was captured before our publish has
+        // newReadIdx <= target and is a no-op (CAS sees current >= newReadIdx).
+        Volatile.Write(ref _zcActive, false);
+
+        // Phase 3: catch the small window where the reader bumped
+        // _deferredReadIdxTarget after our Volatile.Read(target) above but
+        // before Volatile.Write(_zcActive=false). Such a bump would have been
+        // routed to the deferred path (reader saw _zcActive=true) and is
+        // therefore NOT reflected in header.ReadIdx yet. Publish it now.
+        var refreshed = Volatile.Read(ref _deferredReadIdxTarget);
+        if (refreshed > target)
+        {
+            PublishTarget(ref header, refreshed);
+        }
+
+        SignalSpaceAvailability(ref header);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void PublishTarget(ref RingHeader header, ulong target)
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref header.ReadIdx);
+            if (target <= current) return;
+            if (Interlocked.CompareExchange(ref header.ReadIdx, target, current) == current)
+                return;
+        }
+    }
 
     /// <summary>Reads the current WriteIdx (for speculative safety checks).</summary>
     internal ulong PeekWriteIdx()
@@ -172,6 +451,87 @@ public sealed class ShmRing : IDisposable
     /// including any deferred frames that precede the speculative frame.
     /// </summary>
     internal ulong PeekPendingReadIdx() => Volatile.Read(ref _pendingReadIdx);
+
+    /// <summary>
+    /// Approximate "ring used bytes from the writer's perspective" —
+    /// <c>writeIdx - readIdx</c>. Used by the ZC fast path as a back-pressure
+    /// hint: if the ring is already heavily occupied, deferring more reads
+    /// (which is what ZC effectively does until the consumer releases) would
+    /// risk stalling the writer. In that case it is better to take the copy
+    /// path so the reader can publish ReadIdx promptly.
+    /// </summary>
+    /// <remarks>
+    /// Approximate because we read writeIdx and readIdx without a fence
+    /// between them; the value can momentarily underestimate or overestimate.
+    /// That is acceptable: this is just a heuristic, not a correctness gate.
+    /// </remarks>
+    internal ulong UsedBytesApprox()
+    {
+        ref var header = ref GetHeader();
+        var writeIdx = Volatile.Read(ref header.WriteIdx);
+        var readIdx = Volatile.Read(ref header.ReadIdx);
+        return writeIdx - readIdx;
+    }
+
+    /// <summary>
+    /// Centralised speculative-ZC eligibility check, applied identically by
+    /// every wire-format reader (Custom16 + HTTP/2). Single source of truth
+    /// for the heuristic so the two code paths cannot drift.
+    /// </summary>
+    /// <param name="payloadLength">Byte length of the candidate frame payload (excluding wire headers).</param>
+    /// <param name="contiguous"><c>true</c> if the payload reservation is contiguous (no ring wrap).</param>
+    /// <returns><c>true</c> if speculative-ZC is allowed; <c>false</c> if the caller should take the copy path.</returns>
+    /// <remarks>
+    /// <para><b>Adaptive minimum payload threshold</b>: 64 KiB on rings ≥ 1 MiB
+    /// (large enough that a 64 KiB ZC hold leaves >> 90% of the ring free for
+    /// the writer); progressively smaller on smaller rings so ZC stays useful
+    /// for the dominant message size in those scenarios. Below 4 KiB ZC never
+    /// pays off (memcpy of <4 KiB is ~250 ns; speculative-ZC bookkeeping
+    /// alone costs ~50 ns plus a CAS for cross-process publish on Release).
+    /// </para>
+    /// <para><b>Why the ring-size gate matters</b>: the ZC's deferred-publish
+    /// window holds <c>header.ReadIdx</c> at the ZC frame's start until the
+    /// consumer releases. On a 256 KiB ring even a single 64 KiB ZC frame
+    /// freezes 25% of capacity for the consumer's parse duration; pipelined
+    /// writes then stall the writer. We disable ZC entirely below 1 MiB so
+    /// the heuristic only kicks in where ring headroom is plentiful.</para>
+    /// <para><b>Back-pressure self-disable</b>: if the ring is already
+    /// &gt; 75% full (used×4 &gt; cap×3), taking ZC would risk stalling the
+    /// writer. Fall through to copy so <c>header.ReadIdx</c> keeps advancing
+    /// per-frame. This makes ZC effectively a low-to-medium-concurrency
+    /// optimisation that self-disables under sustained pressure.</para>
+    /// <para><b>At-most-one-ZC</b>: <see cref="SpeculativeReservedBytes"/> ==
+    /// 0 enforces a single ZC payload in flight per ring. The deferred-publish
+    /// protocol assumes a single producer of bumps to
+    /// <see cref="_deferredReadIdxTarget"/>; multiple concurrent ZC frames
+    /// would require multi-producer ordering not yet implemented.</para>
+    /// </remarks>
+    internal bool IsSpeculativeZcEligible(int payloadLength, bool contiguous)
+    {
+        if (!contiguous) return false;
+
+        // Disable ZC entirely on rings below 1 MiB — see remarks.
+        const ulong MinRingForZeroCopy = 1024UL * 1024UL;
+        if (_capacity < MinRingForZeroCopy) return false;
+
+        // Adaptive minimum payload: scales down on smaller rings so ZC
+        // stays useful, but never below 4 KiB where memcpy is faster than
+        // ZC bookkeeping. cap/16 means a single ZC frame never holds more
+        // than ~6.25% of the ring (very conservative; lots of headroom for
+        // the writer to keep producing while the consumer parses).
+        var adaptiveMin = (int)Math.Min(64UL * 1024UL, _capacity / 16);
+        if (adaptiveMin < 4 * 1024) adaptiveMin = 4 * 1024;
+        if (payloadLength < adaptiveMin) return false;
+
+        // At-most-one-ZC.
+        if (Volatile.Read(ref SpeculativeReservedBytes) != 0) return false;
+
+        // Back-pressure auto-degrade — see remarks.
+        if (UsedBytesApprox() * 4 > _capacity * 3) return false;
+
+        return true;
+    }
+
 
     /// <summary>
     /// Checks whether a contiguous write of <paramref name="size"/> bytes is
@@ -269,9 +629,7 @@ public sealed class ShmRing : IDisposable
 
             var writeIdx = Volatile.Read(ref header.WriteIdx);
             var readIdx = Volatile.Read(ref header.ReadIdx);
-            var used = writeIdx - readIdx;
-            var specReserved = (ulong)System.Math.Max(0L, Volatile.Read(ref SpeculativeReservedBytes));
-            var available = _capacity - used - System.Math.Min(specReserved, _capacity - used);
+            var available = ComputeAvailableForWrite(writeIdx, readIdx);
 
             if ((ulong)data.Length <= available)
             {
@@ -427,9 +785,7 @@ public sealed class ShmRing : IDisposable
 
             var writeIdx = Volatile.Read(ref header.WriteIdx);
             var readIdx = Volatile.Read(ref header.ReadIdx);
-            var used = writeIdx - readIdx;
-            var specReserved = (ulong)System.Math.Max(0L, Volatile.Read(ref SpeculativeReservedBytes));
-            var available = _capacity - used - System.Math.Min(specReserved, _capacity - used);
+            var available = ComputeAvailableForWrite(writeIdx, readIdx);
 
             if ((ulong)size <= available)
             {
@@ -636,13 +992,62 @@ public sealed class ShmRing : IDisposable
     /// and payload reads in a single shared-memory write, halving the per-frame
     /// write traffic on the read path.
     /// </summary>
+    /// <remarks>
+    /// While a speculative ZC frame is in flight (<see cref="_zcActive"/>),
+    /// this DEFERS the actual <c>header.ReadIdx</c> advance: it just bumps
+    /// the local <see cref="_deferredReadIdxTarget"/>. The cross-process
+    /// writer keeps seeing the OLD <c>header.ReadIdx</c> (= the start of
+    /// the held ZC region), so its <c>used = writeIdx - readIdx</c> formula
+    /// correctly accounts for the held bytes without any shared-memory ZC
+    /// field. <see cref="EndZcReservation"/> publishes the deferred target
+    /// in one shot when the ZC payload is released.
+    /// </remarks>
     internal void CommitReadRaw(ulong baseCommitReadIdx, int totalBytesConsumed)
     {
         if (_localClosed || totalBytesConsumed == 0)
             return;
 
-        ref var header = ref GetHeader();
         var newReadIdx = baseCommitReadIdx + (ulong)totalBytesConsumed;
+
+        // ZC-active path: defer the shared-memory write; advance
+        // _deferredReadIdxTarget by the bytes the caller is committing.
+        //
+        // CRITICAL: we use ADDITIVE accumulation here (target += bytes), not
+        // the absolute (baseCommitReadIdx + bytes) formula used in the
+        // non-deferred branch. Reason: while ZC is active, header.ReadIdx is
+        // FROZEN at the ZC frame's start (= baseZc). Every subsequent
+        // ReserveRead call captures the STALE header.ReadIdx as its
+        // baseCommitReadIdx (= baseZc). A naive (staleBase + perFrameBytes)
+        // formula yields a value at most ~one frame past baseZc — far behind
+        // the actual cumulative consumed position once several frames have
+        // been parsed. The previous max-tracking workaround
+        // (`if (newReadIdx > target)`) silently dropped these updates,
+        // causing two problems:
+        //   (1) RACE: EndZcReservation publishes a target that omits all
+        //       deferred frames after the ZC frame; if a CommitReadRaw on
+        //       the reader thread then sees _zcActive=false and races on the
+        //       CAS path with a stale base, header.ReadIdx can be set to a
+        //       value INSIDE the still-held ZC region (writer wraps onto
+        //       it → SHM_LPM_ASSERT declared=0, payload all-zero observed
+        //       under H2+SingleStream stress).
+        //   (2) LEAK: even without the race, ring space for deferred-and-
+        //       not-published frames is permanently lost from the writer's
+        //       view, accumulating with each ZC episode.
+        // Reader is single-threaded, so additive accumulation is race-free
+        // on the local field. The Volatile.Write/Read pair with EndZc's
+        // _zcActive flag transition guarantees EndZc sees the up-to-date
+        // value. After EndZc publishes and clears _zcActive, the next
+        // CommitReadRaw observes _zcActive=false, captures a fresh
+        // baseCommitReadIdx (= published target) on its NEXT ReserveRead,
+        // and resumes correct absolute-formula commits.
+        if (Volatile.Read(ref _zcActive))
+        {
+            var bumped = Volatile.Read(ref _deferredReadIdxTarget) + (ulong)totalBytesConsumed;
+            Volatile.Write(ref _deferredReadIdxTarget, bumped);
+            return;
+        }
+
+        ref var header = ref GetHeader();
 
         // When ZeroCopyRead is active, multiple frames may share the same
         // baseCommitReadIdx (the shared ReadIdx at reservation time) but
@@ -964,9 +1369,7 @@ public sealed class ShmRing : IDisposable
         ref var header = ref GetHeader();
         var writeIdx = Volatile.Read(ref header.WriteIdx);
         var readIdx = Volatile.Read(ref header.ReadIdx);
-        var used = writeIdx - readIdx;
-        var specReserved = (ulong)System.Math.Max(0L, Volatile.Read(ref SpeculativeReservedBytes));
-            var available = _capacity - used - System.Math.Min(specReserved, _capacity - used);
+        var available = ComputeAvailableForWrite(writeIdx, readIdx);
         return (ulong)size <= available;
     }
 
@@ -1057,9 +1460,7 @@ public sealed class ShmRing : IDisposable
 
         var writeIdx = Volatile.Read(ref header.WriteIdx);
         var readIdx = Volatile.Read(ref header.ReadIdx);
-        var used = writeIdx - readIdx;
-        var specReserved = (ulong)System.Math.Max(0L, Volatile.Read(ref SpeculativeReservedBytes));
-            var available = _capacity - used - System.Math.Min(specReserved, _capacity - used);
+        var available = ComputeAvailableForWrite(writeIdx, readIdx);
 
         if ((ulong)data.Length > available)
         {

@@ -98,7 +98,7 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             }
 
             // Decode and validate CONNECT request
-            (ulong clientRingA, ulong clientRingB, bool clientSingleStream) connectParams;
+            (ulong clientRingA, ulong clientRingB, bool clientSingleStream, Wire.WireFormat[] supportedWireFormats) connectParams;
             try
             {
                 connectParams = ControlWire.DecodeConnectRequest(payload.Span);
@@ -143,7 +143,9 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             }
 
             // Send ACCEPT with the data segment name
-            await SendAcceptAsync(segmentName, ct).ConfigureAwait(false);
+            // Negotiate the wire format: pick the first client preference also supported by us.
+            var selectedWireFormat = NegotiateWireFormat(connectParams.supportedWireFormats);
+            await SendAcceptAsync(segmentName, selectedWireFormat, ct).ConfigureAwait(false);
 
             // Wait for client to map the segment
             try
@@ -163,6 +165,10 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             ShmConnection connection;
             try
             {
+                // Apply negotiated wire format to data rings BEFORE the frame
+                // reader loop starts (the ShmConnection ctor starts it eagerly).
+                dataSegment.RingA.Wire = selectedWireFormat;
+                dataSegment.RingB.Wire = selectedWireFormat;
                 connection = new ShmConnection(segmentName, dataSegment);
                 // Propagate client's singleStreamMode request.
                 // Server decides in HandleConnectionAsync whether to honor it.
@@ -286,10 +292,36 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         }
     }
 
-    private Task SendAcceptAsync(string segmentName, CancellationToken ct)
+    private Task SendAcceptAsync(string segmentName, Wire.WireFormat wireFormat, CancellationToken ct)
     {
-        var payload = ControlWire.EncodeConnectResponse(segmentName);
+        // Only emit the wire-format extension when we picked a non-default
+        // value, so we stay bit-identical to legacy ACCEPT for Custom16 peers.
+        var payload = wireFormat == Wire.WireFormat.Custom16
+            ? ControlWire.EncodeConnectResponse(segmentName)
+            : ControlWire.EncodeConnectResponse(segmentName, wireFormat);
         return WriteControlFrameAsync(FrameType.Accept, payload, ct);
+    }
+
+    /// <summary>
+    /// Selects a wire format from the client's preference list. Picks the first
+    /// client-advertised format that the server also supports. Defaults to
+    /// <see cref="Wire.WireFormat.Custom16"/> for legacy clients (no advertisement).
+    /// </summary>
+    private static Wire.WireFormat NegotiateWireFormat(Wire.WireFormat[] clientFormats)
+    {
+        if (clientFormats.Length == 0)
+        {
+            return Wire.WireFormat.Custom16;
+        }
+        for (var i = 0; i < clientFormats.Length; i++)
+        {
+            var f = clientFormats[i];
+            if (f == Wire.WireFormat.Custom16 || f == Wire.WireFormat.Http2)
+            {
+                return f;
+            }
+        }
+        return Wire.WireFormat.Custom16;
     }
 
     private Task SendRejectAsync(string message, CancellationToken ct)

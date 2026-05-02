@@ -820,13 +820,21 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         string? grpcEncoding, CancellationToken ct)
         where TReq : class, IMessage<TReq>, new()
     {
-        // Use connection-level cached read buffer to avoid LOH churn.
-        // For multi-frame messages (>16MB), this eliminates per-call
-        // ArrayPool.Rent/Return of 64MB+ buffers.
+        // Use connection-level cached read buffer to avoid LOH churn for the
+        // compressed-message path. For uncompressed multi-frame messages we
+        // hold the chain as a list of InboundFrames (no codec→pool memcpy)
+        // and feed a multi-segment ReadOnlySequence to MergeFrom(ROS).
         var conn = stream.Connection;
         byte[]? assembled = conn.BorrowReadBuffer();
         int assembledPos = 0;
         bool usedAssembled = false;
+
+        // Multi-frame uncompressed chain (when compFlag == 0 on first frame).
+        // Each segment Memory points into a per-frame pool buffer; frames
+        // are released after MergeFrom(ROS) completes.
+        List<InboundFrame>? chainFrames = null;
+        ChainSegment? chainHead = null;
+        ChainSegment? chainTail = null;
 
         try
         {
@@ -841,32 +849,120 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 {
                     if ((f.Flags & MessageFlags.More) != 0)
                     {
-                        usedAssembled = true;
-                        // Multi-frame: copy directly into assembled buffer.
-                        if (assembled == null)
+                        // Multi-frame continuation. Decide chain vs
+                        // _assembled on the FIRST frame by sniffing the
+                        // gRPC LPM compression flag (byte 0).
+                        bool firstChunk = !usedAssembled && chainHead == null;
+                        bool useChain;
+                        if (firstChunk)
                         {
-                            var initialSize = f.Length * 4;
-                            assembled = ArrayPool<byte>.Shared.Rent(initialSize);
+                            // f.Memory has at least 5 bytes (writer
+                            // always emits the LPM header in the first
+                            // frame).
+                            useChain = f.Length >= 5 && f.Memory.Span[0] == 0;
                         }
-                        else if (assembledPos + f.Length > assembled!.Length)
+                        else
                         {
-                            var newBuf = ArrayPool<byte>.Shared.Rent(Math.Max(assembled.Length * 2, assembledPos + f.Length));
-                            if (assembledPos > 0)
-                                assembled.AsSpan(0, assembledPos).CopyTo(newBuf);
-                            ArrayPool<byte>.Shared.Return(assembled);
-                            assembled = newBuf;
+                            useChain = chainHead != null;
                         }
 
-                        f.Memory.Span.CopyTo(assembled.AsSpan(assembledPos));
-                        assembledPos += f.Length;
-                        f.ReturnToPool();
+                        if (useChain)
+                        {
+                            // Append frame to chain. Whole payload (incl.
+                            // LPM header for first frame) becomes a
+                            // segment; we slice off the 5-byte header
+                            // when building the final ROS.
+                            chainFrames ??= new List<InboundFrame>(8);
+                            chainFrames.Add(f);
+                            var seg = new ChainSegment(f.Memory);
+                            if (chainHead == null)
+                            {
+                                chainHead = seg;
+                                chainTail = seg;
+                            }
+                            else
+                            {
+                                seg.SetRunningIndex(chainTail!.RunningIndex + chainTail.Memory.Length);
+                                chainTail.SetNext(seg);
+                                chainTail = seg;
+                            }
+                        }
+                        else
+                        {
+                            usedAssembled = true;
+                            // Compressed multi-frame: copy directly into
+                            // assembled buffer (decompressor needs
+                            // contiguous storage).
+                            if (assembled == null)
+                            {
+                                var initialSize = f.Length * 4;
+                                assembled = ArrayPool<byte>.Shared.Rent(initialSize);
+                            }
+                            else if (assembledPos + f.Length > assembled!.Length)
+                            {
+                                var newBuf = ArrayPool<byte>.Shared.Rent(Math.Max(assembled.Length * 2, assembledPos + f.Length));
+                                if (assembledPos > 0)
+                                    assembled.AsSpan(0, assembledPos).CopyTo(newBuf);
+                                ArrayPool<byte>.Shared.Return(assembled);
+                                assembled = newBuf;
+                            }
+
+                            f.Memory.Span.CopyTo(assembled.AsSpan(assembledPos));
+                            assembledPos += f.Length;
+                            f.ReturnToPool();
+                        }
                         continue;
                     }
 
                     // Final frame or single-frame message.
+                    if (chainHead != null)
+                    {
+                        // Multi-frame uncompressed final: append last
+                        // segment, build ROS over the chain (with the
+                        // 5-byte LPM header sliced off the head), and
+                        // hand the ROS to MergeFrom which walks segment
+                        // boundaries natively. Single memcpy in the
+                        // parser (for the protobuf bytes field's
+                        // ByteString backing array) — versus two memcpys
+                        // in the legacy assembled path (one to combine
+                        // frames, one for the ByteString).
+                        chainFrames!.Add(f);
+                        var lastSeg = new ChainSegment(f.Memory);
+                        lastSeg.SetRunningIndex(chainTail!.RunningIndex + chainTail.Memory.Length);
+                        chainTail.SetNext(lastSeg);
+                        chainTail = lastSeg;
+
+                        long totalLen = chainTail.RunningIndex + chainTail.Memory.Length;
+                        var bodyLen = (int)(totalLen - 5);
+                        if (maxReceiveMessageSize > 0 && bodyLen > maxReceiveMessageSize)
+                        {
+                            ReleaseChain(chainFrames);
+                            throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                                $"Received message exceeds the maximum configured message size ({bodyLen} vs {maxReceiveMessageSize})"));
+                        }
+
+                        // Build ROS slicing off the 5-byte LPM header.
+                        var ros = new ReadOnlySequence<byte>(
+                            startSegment: chainHead!, startIndex: 5,
+                            endSegment: chainTail, endIndex: chainTail.Memory.Length);
+
+                        try
+                        {
+                            var msg = new TReq();
+                            Google.Protobuf.MessageExtensions.MergeFrom(msg, ros);
+                            return msg;
+                        }
+                        finally
+                        {
+                            ReleaseChain(chainFrames);
+                            chainFrames = null;
+                            chainHead = chainTail = null;
+                        }
+                    }
                     if (usedAssembled)
                     {
-                        // Multi-frame final: copy last frame into assembled.
+                        // Multi-frame compressed final: copy last frame
+                        // into assembled.
                         if (assembledPos + f.Length > assembled!.Length)
                         {
                             var newBuf = ArrayPool<byte>.Shared.Rent(assembledPos + f.Length);
@@ -920,7 +1016,30 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // Return assembled buffer to connection cache (not ArrayPool).
             if (assembled != null)
                 conn.ReturnReadBuffer(assembled);
+            // Defensive: release chain frames if an exception bypassed the
+            // normal release path.
+            if (chainFrames != null)
+                ReleaseChain(chainFrames);
         }
+    }
+
+    /// <summary>Releases all chain frames and clears the list.</summary>
+    private static void ReleaseChain(List<InboundFrame> frames)
+    {
+        for (int i = 0; i < frames.Count; i++)
+            frames[i].ReturnToPool();
+        frames.Clear();
+    }
+
+    /// <summary>Multi-segment chain node for the inbound frame chain.</summary>
+    private sealed class ChainSegment : System.Buffers.ReadOnlySequenceSegment<byte>
+    {
+        public ChainSegment(ReadOnlyMemory<byte> memory)
+        {
+            Memory = memory;
+        }
+        public void SetRunningIndex(long runningIndex) => RunningIndex = runningIndex;
+        public void SetNext(ChainSegment next) => Next = next;
     }
 
     /// <summary>
@@ -941,9 +1060,18 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         private InboundFrame _previousFrame;
         private T? _current;
         private bool _endOfStream;
-        // Multi-frame accumulation: single pre-allocated buffer.
+        // Multi-frame accumulation: contiguous buffer (compressed-message
+        // path needs that — decompressor needs contiguous storage).
         private byte[]? _assembled;
         private int _assembledPos;
+        // Multi-frame uncompressed chain: list of frames + segment chain.
+        // Built per-message; cleared on message completion. Hands a
+        // multi-segment ReadOnlySequence to MergeFrom(ROS) so the parser
+        // walks segment boundaries natively without flattening into one
+        // big rented buffer.
+        private List<InboundFrame>? _chainFrames;
+        private ChainSegment? _chainHead;
+        private ChainSegment? _chainTail;
 
         public ShmAsyncStreamReader(ShmGrpcStream stream, HandlerConfig cfg)
         {
@@ -977,7 +1105,10 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             {
                 if (ProcessFrame(frame))
                     return true;
-                if (_endOfStream || _assembledPos == 0)
+                // Break out only if no multi-frame is in flight (neither
+                // _assembled nor chain has accumulated any state) — otherwise
+                // keep reading for the chain's continuation.
+                if (_endOfStream || (_assembledPos == 0 && _chainHead == null))
                     return false;
             }
 
@@ -994,7 +1125,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     {
                         if (ProcessFrame(frame))
                             return true;
-                        if (_endOfStream || _assembledPos == 0)
+                        if (_endOfStream || (_assembledPos == 0 && _chainHead == null))
                             return false;
                     }
                 }
@@ -1014,31 +1145,114 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             switch (frame.Type)
             {
                 case FrameType.Message:
-                    // Multi-frame: copy into single assembled buffer.
                     if ((frame.Flags & MessageFlags.More) != 0)
                     {
-                        if (_assembled == null)
+                        // Multi-frame continuation. Decide chain vs
+                        // _assembled on the FIRST frame by sniffing the
+                        // gRPC LPM compression flag (byte 0).
+                        bool firstChunk = _chainHead == null && _assembledPos == 0;
+                        bool useChain;
+                        if (firstChunk)
                         {
-                            _assembled = ArrayPool<byte>.Shared.Rent(frame.Length * 4);
-                            _assembledPos = 0;
+                            useChain = frame.Length >= 5 && frame.Memory.Span[0] == 0;
                         }
-                        else if (_assembledPos + frame.Length > _assembled.Length)
+                        else
                         {
-                            var newBuf = ArrayPool<byte>.Shared.Rent(Math.Max(_assembled.Length * 2, _assembledPos + frame.Length));
-                            _assembled.AsSpan(0, _assembledPos).CopyTo(newBuf);
-                            ArrayPool<byte>.Shared.Return(_assembled);
-                            _assembled = newBuf;
+                            useChain = _chainHead != null;
                         }
-                        frame.Memory.Span.CopyTo(_assembled.AsSpan(_assembledPos));
-                        _assembledPos += frame.Length;
-                        frame.ReturnToPool();
+
+                        if (useChain)
+                        {
+                            // Append to chain. ROS will be built on the
+                            // final frame; LPM 5-byte header sliced off
+                            // the head segment at that point.
+                            _chainFrames ??= new List<InboundFrame>(8);
+                            _chainFrames.Add(frame);
+                            var seg = new ChainSegment(frame.Memory);
+                            if (_chainHead == null)
+                            {
+                                _chainHead = seg;
+                                _chainTail = seg;
+                            }
+                            else
+                            {
+                                seg.SetRunningIndex(_chainTail!.RunningIndex + _chainTail.Memory.Length);
+                                _chainTail.SetNext(seg);
+                                _chainTail = seg;
+                            }
+                        }
+                        else
+                        {
+                            // Compressed multi-frame: copy directly into
+                            // assembled buffer.
+                            if (_assembled == null)
+                            {
+                                _assembled = ArrayPool<byte>.Shared.Rent(frame.Length * 4);
+                                _assembledPos = 0;
+                            }
+                            else if (_assembledPos + frame.Length > _assembled.Length)
+                            {
+                                var newBuf = ArrayPool<byte>.Shared.Rent(Math.Max(_assembled.Length * 2, _assembledPos + frame.Length));
+                                _assembled.AsSpan(0, _assembledPos).CopyTo(newBuf);
+                                ArrayPool<byte>.Shared.Return(_assembled);
+                                _assembled = newBuf;
+                            }
+                            frame.Memory.Span.CopyTo(_assembled.AsSpan(_assembledPos));
+                            _assembledPos += frame.Length;
+                            frame.ReturnToPool();
+                        }
                         return false; // keep reading
                     }
 
                     // Final frame or single-frame message.
+                    if (_chainHead != null)
+                    {
+                        // Multi-frame uncompressed final: append last
+                        // segment, build ROS, MergeFrom(ROS). Saves one
+                        // full-message memcpy vs the legacy _assembled
+                        // path.
+                        _chainFrames!.Add(frame);
+                        var lastSeg = new ChainSegment(frame.Memory);
+                        lastSeg.SetRunningIndex(_chainTail!.RunningIndex + _chainTail.Memory.Length);
+                        _chainTail.SetNext(lastSeg);
+                        _chainTail = lastSeg;
+
+                        long totalLen = _chainTail.RunningIndex + _chainTail.Memory.Length;
+                        var bodyLen = (int)(totalLen - 5);
+                        if (_maxReceiveMessageSize > 0 && bodyLen > _maxReceiveMessageSize)
+                        {
+                            ReleaseChain(_chainFrames);
+                            _chainFrames = null;
+                            _chainHead = _chainTail = null;
+                            throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                                $"Received message exceeds the maximum configured message size ({bodyLen} vs {_maxReceiveMessageSize})"));
+                        }
+
+                        var ros = new ReadOnlySequence<byte>(
+                            startSegment: _chainHead!, startIndex: 5,
+                            endSegment: _chainTail, endIndex: _chainTail.Memory.Length);
+
+                        var msg = new T();
+                        Google.Protobuf.MessageExtensions.MergeFrom(msg, ros);
+                        _current = msg;
+
+                        ReleaseChain(_chainFrames);
+                        _chainFrames = null;
+                        _chainHead = _chainTail = null;
+                        _previousFrame = default;
+
+                        var eosChain = (frame.Flags & MessageFlags.EndStream) != 0;
+                        if (eosChain)
+                        {
+                            _stream.MarkHalfCloseReceived();
+                            _endOfStream = true;
+                        }
+                        return true;
+                    }
                     if (_assembledPos > 0)
                     {
-                        // Multi-frame final: copy last frame into assembled.
+                        // Multi-frame compressed final: copy last frame
+                        // into assembled, decompress, parse.
                         if (_assembledPos + frame.Length > _assembled!.Length)
                         {
                             var newBuf = ArrayPool<byte>.Shared.Rent(_assembledPos + frame.Length);
@@ -1117,6 +1331,12 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         {
             _previousFrame.ReturnToPool();
             _previousFrame = default;
+            if (_chainFrames != null)
+            {
+                ReleaseChain(_chainFrames);
+                _chainFrames = null;
+                _chainHead = _chainTail = null;
+            }
             if (_assembled != null)
             {
                 // Return to connection cache instead of ArrayPool

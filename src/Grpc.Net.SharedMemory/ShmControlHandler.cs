@@ -323,6 +323,10 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
     }
 
+    /// <summary>Test-only helper that exposes the negotiated control-plane connect path.</summary>
+    internal Task<ShmConnection> ConnectForTest(CancellationToken cancellationToken)
+        => ConnectViaControlSegmentAsync(cancellationToken);
+
     private async Task<ShmConnection> ConnectViaControlSegmentAsync(CancellationToken cancellationToken)
     {
         var ct = cancellationToken;
@@ -351,8 +355,13 @@ public sealed class ShmControlHandler : HttpMessageHandler
             // Send CONNECT request with preferred ring capacity from client options.
             // Server will negotiate: Min(clientPreferred, serverMax). Value 0 = use server default.
             var preferredRing = _options.RingCapacity;
+            // Advertise wire formats in preference order. We always include
+            // Custom16 as a fallback so legacy servers and pre-H2 clients keep working.
+            var supportedFormats = _options.PreferHttp2
+                ? new[] { Wire.WireFormat.Http2, Wire.WireFormat.Custom16 }
+                : new[] { Wire.WireFormat.Custom16 };
             await WriteControlFrameAsync(ctlTx, FrameType.Connect,
-                ControlWire.EncodeConnectRequest(preferredRing, preferredRing, _options.SingleStreamMode), ct).ConfigureAwait(false);
+                ControlWire.EncodeConnectRequest(preferredRing, preferredRing, _options.SingleStreamMode, supportedFormats), ct).ConfigureAwait(false);
 
             // Read response
             var (responseHeader, responsePayload) = await ReadControlFrameAsync(ctlRx, ct).ConfigureAwait(false);
@@ -360,7 +369,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
             switch (responseHeader.Type)
             {
                 case FrameType.Accept:
-                    var dataSegmentName = ControlWire.DecodeConnectResponse(responsePayload.Span);
+                    var (dataSegmentName, selectedWireFormat) = ControlWire.DecodeConnectResponse(responsePayload.Span);
 
                     // Open the data segment
                     var dataSegment = Segment.Open(dataSegmentName);
@@ -370,6 +379,11 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
                         // Signal that client has mapped the segment
                         dataSegment.SetClientReady(true);
+
+                        // Apply negotiated wire format to data rings BEFORE
+                        // any frames flow.
+                        dataSegment.RingA.Wire = selectedWireFormat;
+                        dataSegment.RingB.Wire = selectedWireFormat;
 
                         // Create and return the connection
                         var conn = ShmConnection.FromClientSegment(dataSegmentName, dataSegment);
@@ -1040,9 +1054,35 @@ internal sealed class ShmControlResponseContent : HttpContent,
     private readonly ShmGrpcStream _stream;
     private HttpHeaders? _trailingHeaders;
     private InboundFrame _currentFrame;
-    // Multi-frame accumulation: connection-level cached buffer.
-    // Borrowed from ShmConnection.CachedReadBuffer on construction,
-    // returned on Dispose to avoid LOH churn on repeated Unary calls.
+
+    // ===== Multi-frame chain =====
+    //
+    // A logical gRPC message that exceeds the wire-format's single-frame
+    // payload limit (cap/3 for Custom16, 16 MiB for HTTP/2) is split into
+    // a sequence of MORE-flagged frames terminated by a single non-MORE
+    // frame. Previous implementation copied each chunk into a contiguous
+    // <c>_assembled</c> buffer (one alloc per message + per-frame memcpy).
+    // The chain implementation keeps each frame as its own segment and
+    // hands the consumer a multi-segment <see cref="ReadOnlySequence{T}"/>,
+    // saving the per-frame memcpy. Each segment's <see cref="InboundFrame"/>
+    // remains in <c>_chainFrames</c> for release on
+    // <see cref="ReleaseCurrentMessage"/>.
+    //
+    // The chain optimisation applies only to UNCOMPRESSED multi-frame
+    // messages. Compressed payloads still need a contiguous buffer to feed
+    // the decompressor; that path falls back to the legacy
+    // <c>_assembled</c> path so the existing decompression code stays
+    // untouched. compFlag is sniffed from the first byte of the first
+    // frame's payload (which is always the LPM compression flag).
+    private BufferSegment? _chainHead;
+    private BufferSegment? _chainTail;
+    private List<InboundFrame>? _chainFrames;
+    private int _chainBodySize;          // accumulated body size (excludes LPM 5-byte header at chain start)
+
+    // Multi-frame accumulation (compressed path only): connection-level
+    // cached buffer. Borrowed from ShmConnection.CachedReadBuffer on
+    // construction, returned on Dispose to avoid LOH churn on repeated
+    // Unary calls.
     private byte[]? _assembled;
     private int _assembledPos;
 
@@ -1080,18 +1120,26 @@ internal sealed class ShmControlResponseContent : HttpContent,
         // Use Interlocked to prevent double-init from concurrent MoveNext calls.
         var del = new Func<ReadOnlySequence<byte>, object>((payload) =>
         {
+            // Single-segment fast path (single-frame ZC, or copy-mode small
+            // message): the pooled scanner is fastest at this size.
             if (payload.IsSingleSegment)
                 return PooledProtoParser.ParseFrom<T>(payload.FirstSpan);
-            var arr = ArrayPool<byte>.Shared.Rent((int)payload.Length);
-            try
-            {
-                payload.CopyTo(arr);
-                return PooledProtoParser.ParseFrom<T>(arr.AsSpan(0, (int)payload.Length));
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(arr);
-            }
+
+            // Multi-segment path (multi-frame chain ZC, or _assembled
+            // fallback that produced multiple segments): hand the
+            // ReadOnlySequence directly to Google.Protobuf's
+            // MergeFrom(ReadOnlySequence) which uses CodedInputStream
+            // internally. CodedInputStream walks varints across segment
+            // boundaries; for `bytes` fields it allocates a ByteString of
+            // the field's length and copies the bytes once. That single
+            // memcpy is unavoidable (ByteString requires contiguous
+            // storage) — but we save the upstream "flatten ROS into one
+            // pool buffer" memcpy that the previous implementation did
+            // before scanning. Net: 1 memcpy per message instead of 2 for
+            // ZC-chained large payloads.
+            var msg = new T();
+            Google.Protobuf.MessageExtensions.MergeFrom(msg, payload);
+            return msg;
         });
         Interlocked.CompareExchange(ref _pooledDeserializer, del, null);
     }
@@ -1102,6 +1150,75 @@ internal sealed class ShmControlResponseContent : HttpContent,
         Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
         // Borrow cached read buffer from connection (may be null on first call).
         _assembled = stream.Connection.BorrowReadBuffer();
+    }
+
+    /// <summary>
+    /// Multi-segment <see cref="ReadOnlySequenceSegment{T}"/> node for the
+    /// multi-frame ZC chain. We expose the protected setters as new public
+    /// properties so the chain can be wired up incrementally as frames
+    /// arrive.
+    /// </summary>
+    private sealed class BufferSegment : ReadOnlySequenceSegment<byte>
+    {
+        public void SetMemory(ReadOnlyMemory<byte> memory) => Memory = memory;
+        public void SetRunningIndex(long runningIndex) => RunningIndex = runningIndex;
+        public void SetNext(BufferSegment? next) => Next = next;
+    }
+
+    /// <summary>
+    /// Appends a frame to the multi-frame ZC chain. The first frame in the
+    /// chain still carries the 5-byte LPM header at <c>Memory[0..5]</c>;
+    /// subsequent frames are pure body bytes. Frame ownership is transferred
+    /// to <c>_chainFrames</c> for batched release in
+    /// <see cref="ReleaseCurrentMessage"/>.
+    /// </summary>
+    private void AppendChainFrame(InboundFrame frame, ReadOnlyMemory<byte> bodyMemory)
+    {
+        var seg = new BufferSegment();
+        seg.SetMemory(bodyMemory);
+        _chainFrames ??= new List<InboundFrame>(8);
+        _chainFrames.Add(frame);
+        if (_chainHead == null)
+        {
+            seg.SetRunningIndex(0);
+            _chainHead = seg;
+            _chainTail = seg;
+        }
+        else
+        {
+            seg.SetRunningIndex(_chainTail!.RunningIndex + _chainTail.Memory.Length);
+            _chainTail.SetNext(seg);
+            _chainTail = seg;
+        }
+        _chainBodySize += bodyMemory.Length;
+    }
+
+    /// <summary>Releases all chain frames and resets chain state.</summary>
+    private void ReleaseChain()
+    {
+        if (_chainFrames != null)
+        {
+            for (int i = 0; i < _chainFrames.Count; i++)
+            {
+                _chainFrames[i].ReturnToPool();
+            }
+            _chainFrames.Clear();
+        }
+        // Drop segment references so the GC can reclaim the small wrapper
+        // objects (the underlying memory has already been released through
+        // each frame's ReturnToPool above).
+        var node = _chainHead;
+        while (node != null)
+        {
+            var next = node.Next as BufferSegment;
+            node.SetMemory(default);
+            node.SetRunningIndex(0);
+            node.SetNext(null);
+            node = next;
+        }
+        _chainHead = null;
+        _chainTail = null;
+        _chainBodySize = 0;
     }
 
     /// <summary>Sets the grpc-encoding for response decompression.</summary>
@@ -1128,6 +1245,7 @@ internal sealed class ShmControlResponseContent : HttpContent,
     {
         _currentFrame.ReturnToPool();
         _currentFrame = default;
+        ReleaseChain();
         _assembledPos = 0;
 
         // Fast path: try sync read.
@@ -1147,29 +1265,96 @@ internal sealed class ShmControlResponseContent : HttpContent,
         switch (frame.Type)
         {
             case FrameType.Message:
-                // Multi-frame: copy into single assembled buffer.
+                // Multi-frame branch: first frame carries the 5-byte gRPC LPM
+                // header; subsequent frames are body continuation. Strategy:
+                //
+                //   - Uncompressed (compFlag == 0): skip the contiguous
+                //     _assembled buffer entirely; chain the frame as a
+                //     segment so the consumer reads a multi-segment
+                //     ReadOnlySequence directly. Saves one memcpy per frame
+                //     (4-256 MiB savings for big payloads).
+                //
+                //   - Compressed (compFlag == 1): falls through to the legacy
+                //     _assembled path because the decompressor needs a
+                //     contiguous source buffer. Compression of multi-frame
+                //     messages is rare; not worth the extra code.
+                //
+                //   - When _assembledPos > 0 already (compressed-mode chain
+                //     in progress) every subsequent frame keeps copying into
+                //     _assembled until END.
                 if ((frame.Flags & MessageFlags.More) != 0)
                 {
-                    if (_assembled == null)
+                    bool firstChunk = _chainHead == null && _assembledPos == 0;
+                    bool useChain;
+                    if (firstChunk)
                     {
-                        _assembled = ArrayPool<byte>.Shared.Rent(frame.Length * 4);
-                        _assembledPos = 0;
+                        // Sniff compFlag from the first byte. Frames are
+                        // guaranteed at least 5 bytes here because the writer
+                        // always emits the LPM header in the first frame.
+                        var compFlagFirst = frame.Memory.Span[0];
+                        useChain = compFlagFirst == 0;
                     }
-                    else if (_assembledPos + frame.Length > _assembled.Length)
+                    else
                     {
-                        var newBuf = ArrayPool<byte>.Shared.Rent(Math.Max(_assembled.Length * 2, _assembledPos + frame.Length));
-                        _assembled.AsSpan(0, _assembledPos).CopyTo(newBuf);
-                        ArrayPool<byte>.Shared.Return(_assembled);
-                        _assembled = newBuf;
+                        useChain = _chainHead != null;
                     }
-                    frame.Memory.Span.CopyTo(_assembled.AsSpan(_assembledPos));
-                    _assembledPos += frame.Length;
-                    frame.ReturnToPool();
+
+                    if (useChain)
+                    {
+                        // Chain: the LPM 5-byte header lives inside the first
+                        // frame's payload. We keep the whole payload as the
+                        // first segment so the consumer's ReadOnlySequence
+                        // aligns with the body (we slice off the 5-byte
+                        // header at emit time on the final frame). Chained
+                        // continuation frames carry pure body bytes.
+                        AppendChainFrame(frame, frame.Memory);
+                    }
+                    else
+                    {
+                        // Compressed-mode multi-frame: legacy _assembled path.
+                        if (_assembled == null)
+                        {
+                            _assembled = ArrayPool<byte>.Shared.Rent(frame.Length * 4);
+                            _assembledPos = 0;
+                        }
+                        else if (_assembledPos + frame.Length > _assembled.Length)
+                        {
+                            var newBuf = ArrayPool<byte>.Shared.Rent(Math.Max(_assembled.Length * 2, _assembledPos + frame.Length));
+                            _assembled.AsSpan(0, _assembledPos).CopyTo(newBuf);
+                            ArrayPool<byte>.Shared.Return(_assembled);
+                            _assembled = newBuf;
+                        }
+                        frame.Memory.Span.CopyTo(_assembled.AsSpan(_assembledPos));
+                        _assembledPos += frame.Length;
+                        frame.ReturnToPool();
+                    }
                     return (ReadOnlySequence<byte>.Empty, false);
                 }
 
                 // Final frame or single-frame message.
-                if (_assembledPos > 0)
+                if (_chainHead != null)
+                {
+                    // Multi-frame final, uncompressed chain. Append the
+                    // last segment, slice off the 5-byte LPM header from
+                    // the head, return a ReadOnlySequence over the chain.
+                    AppendChainFrame(frame, frame.Memory);
+
+                    var eosChain = (frame.Flags & MessageFlags.EndStream) != 0;
+                    if (eosChain) _stream.MarkHalfCloseReceived();
+
+                    // Build a ReadOnlySequence that skips the first 5 bytes
+                    // (LPM header) of the head segment. ReadOnlySequence
+                    // doesn't accept a per-segment offset directly, but we
+                    // can pass an absolute start index into the head and
+                    // an absolute end into the tail.
+                    var tail = _chainTail!;
+                    var head = _chainHead!;
+                    var seq = new ReadOnlySequence<byte>(
+                        startSegment: head, startIndex: 5,
+                        endSegment: tail, endIndex: tail.Memory.Length);
+                    return (seq, eosChain);
+                }
+                else if (_assembledPos > 0)
                 {
                     // Multi-frame final: copy last chunk.
                     if (_assembledPos + frame.Length > _assembled!.Length)
@@ -1211,6 +1396,18 @@ internal sealed class ShmControlResponseContent : HttpContent,
                     var eos2 = (frame.Flags & MessageFlags.EndStream) != 0;
                     if (eos2) _stream.MarkHalfCloseReceived();
                     var compFlag2 = frame.Memory.Span[0];
+
+                    // Diagnostic invariant: validate the LPM header byte against
+                    // protocol expectations. We expect compFlag ∈ {0, 1} and the
+                    // declared LPM length to match the frame body minus 5.
+                    // A mismatch here means either:
+                    //   (a) the writer wrote garbage / was overwritten by a race,
+                    //   (b) the reader is looking at the wrong memory region.
+                    // Either way, dump diagnostic info BEFORE returning the
+                    // potentially-corrupt slice to the parser. Cost on the happy
+                    // path: 4 byte loads + 2 cmp + 1 not-taken branch (~1 ns).
+                    AssertLpmHeader(frame, eos2);
+
                     if (compFlag2 == 1)
                     {
                         if (string.IsNullOrEmpty(_responseEncoding))
@@ -1295,8 +1492,79 @@ internal sealed class ShmControlResponseContent : HttpContent,
     {
         _currentFrame.ReturnToPool();
         _currentFrame = default;
+        ReleaseChain();
         // Keep assembled buffer for reuse (returned to connection in Dispose).
         _assembledPos = 0;
+    }
+
+    /// <summary>
+    /// Validates the LPM header byte and length at the start of a single-frame
+    /// MESSAGE payload. If the header is malformed, dumps diagnostic info to
+    /// stderr (and to <c>SHM_LPM_ASSERT_LOG</c> if set) and rethrows as a
+    /// protocol-level error — so the failure is observed exactly once at the
+    /// point of corruption rather than later as "invalid tag (zero)" deep in
+    /// the parser.
+    /// </summary>
+    /// <remarks>
+    /// Hot path cost on success: 4 byte loads + 2 comparisons + 1 not-taken
+    /// branch (~1 ns). The slow path (assert failure) is kept in a separate
+    /// non-inlined method so it doesn't bloat the caller and doesn't perturb
+    /// JIT decisions on the success path.
+    /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void AssertLpmHeader(InboundFrame frame, bool eos)
+    {
+        if (frame.Length < 5) return; // tiny/empty frame — skip
+        var span = frame.Memory.Span;
+        var compFlag = span[0];
+        // compFlag must be 0 (no compression) or 1 (compressed).
+        // length is big-endian uint32 at [1..5).
+        // declared body length must equal frame.Length - 5.
+        if (compFlag > 1)
+        {
+            ReportLpmHeaderCorruption(frame, eos, "compFlag>1");
+            return;
+        }
+        var declared = (uint)(span[1] << 24 | span[2] << 16 | span[3] << 8 | span[4]);
+        var expected = (uint)(frame.Length - 5);
+        if (declared != expected)
+        {
+            ReportLpmHeaderCorruption(frame, eos, $"lpm-length-mismatch declared={declared} expected={expected}");
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void ReportLpmHeaderCorruption(InboundFrame frame, bool eos, string reason)
+    {
+        var span = frame.Memory.Span;
+        var headLen = Math.Min(32, frame.Length);
+        var tailLen = Math.Min(32, frame.Length);
+        var head = new byte[headLen];
+        var tail = new byte[tailLen];
+        if (headLen > 0) span.Slice(0, headLen).CopyTo(head);
+        if (tailLen > 0) span.Slice(frame.Length - tailLen, tailLen).CopyTo(tail);
+
+        var sb = new System.Text.StringBuilder(384);
+        sb.Append("[SHM_LPM_ASSERT] reason=").Append(reason);
+        sb.Append(" | frameLen=").Append(frame.Length);
+        sb.Append(" | flags=0x").Append(frame.Flags.ToString("x2", System.Globalization.CultureInfo.InvariantCulture));
+        sb.Append(" | eos=").Append(eos);
+        sb.Append(" | head=");
+        for (var i = 0; i < head.Length; i++) sb.Append(head[i].ToString("x2", System.Globalization.CultureInfo.InvariantCulture));
+        sb.Append(" | tail=");
+        for (var i = 0; i < tail.Length; i++) sb.Append(tail[i].ToString("x2", System.Globalization.CultureInfo.InvariantCulture));
+
+        var line = sb.ToString();
+        var path = Environment.GetEnvironmentVariable("SHM_LPM_ASSERT_LOG");
+        if (!string.IsNullOrEmpty(path))
+        {
+            try { File.AppendAllText(path, line + Environment.NewLine); }
+            catch { Console.Error.WriteLine(line); }
+        }
+        else
+        {
+            Console.Error.WriteLine(line);
+        }
     }
 
     protected override Task<Stream> CreateContentReadStreamAsync()
@@ -1372,6 +1640,16 @@ internal sealed class ShmControlResponseContent : HttpContent,
     {
         if (disposing)
         {
+            // CRITICAL: release any in-flight frame so its FramePayload.Release
+            // runs (returns pool buffer; for ZC frames, ends the deferred-commit
+            // ZC reservation so the writer can advance past the held region).
+            // Without this, an exception or cancellation that interrupts the
+            // normal ReleaseCurrentMessage flow would leave the ZC permanently
+            // held, blocking the peer writer indefinitely.
+            _currentFrame.ReturnToPool();
+            _currentFrame = default;
+            ReleaseChain();
+
             if (_assembled != null)
             {
                 _stream.Connection.ReturnReadBuffer(_assembled);

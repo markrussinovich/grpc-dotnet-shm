@@ -188,10 +188,21 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="keepaliveOptions">Optional keepalive options.</param>
     /// <returns>A new client connection.</returns>
     public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null)
+        => ConnectAsClient(name, Wire.WireFormat.Custom16, keepaliveOptions);
+
+    /// <summary>
+    /// Creates a new client-side connection with the specified wire format.
+    /// </summary>
+    public static ShmConnection ConnectAsClient(string name, Wire.WireFormat wireFormat,
+        ShmKeepaliveOptions? keepaliveOptions = null)
     {
         var segment = Segment.Open(name);
         try
         {
+            // Apply wire format BEFORE constructing the connection so the
+            // FrameReaderLoop (started in the ctor) reads using the right codec.
+            segment.RingA.Wire = wireFormat;
+            segment.RingB.Wire = wireFormat;
             return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
         }
         catch
@@ -216,10 +227,24 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         uint maxStreams = 100,
         ShmKeepaliveOptions? keepaliveOptions = null,
         ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
+        => CreateAsServer(name, ringCapacity, maxStreams, Wire.WireFormat.Custom16, keepaliveOptions, enforcementPolicy);
+
+    /// <summary>
+    /// Creates a new server-side connection with the specified wire format.
+    /// </summary>
+    public static ShmConnection CreateAsServer(
+        string name,
+        ulong ringCapacity,
+        uint maxStreams,
+        Wire.WireFormat wireFormat,
+        ShmKeepaliveOptions? keepaliveOptions = null,
+        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
     {
         var segment = Segment.Create(name, ringCapacity, maxStreams);
         try
         {
+            segment.RingA.Wire = wireFormat;
+            segment.RingB.Wire = wireFormat;
             return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy);
         }
         catch
@@ -399,11 +424,13 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// Gets the ring buffer for sending data (client→server for client, server→client for server).
     /// </summary>
     internal ShmRing TxRing => _isClient ? _segment.RingA : _segment.RingB;
-
     /// <summary>
     /// Gets the ring buffer for receiving data (server→client for client, client→server for server).
     /// </summary>
     internal ShmRing RxRing => _isClient ? _segment.RingB : _segment.RingA;
+
+    /// <summary>Test-only helper exposing the wire format negotiated for the TX ring.</summary>
+    internal Wire.WireFormat GetTxRingWireFormatForTest() => TxRing.Wire;
 
     /// <summary>
     /// Sends a GoAway frame to initiate graceful shutdown.
