@@ -193,11 +193,18 @@ public static class FrameProtocol
             //      Release (gated by SpeculativeReservedBytes==0 AND
             //      !IsChainOpen).
             //
-            //      Mid-chain fallback to copy is forbidden by design:
-            //      once the anchor is open, every subsequent frame
-            //      MUST also ZC (going to the copy path while
-            //      <c>_zcActive=true</c> would defer the readIdx
-            //      advance forever, deadlocking the writer).
+            //      The chain stays in ZC mode through every contiguous
+            //      continuation. If a continuation frame's payload
+            //      reservation happens to wrap the ring boundary
+            //      (contiguous=false), it falls to the copy path; the
+            //      copied frame's bytes are still routed through the
+            //      deferred-bump CommitReadRaw, so the chain anchor's
+            //      target accumulates correctly. The chain's final frame
+            //      MUST close the anchor (CloseZcChain) regardless of
+            //      whether it took the ZC or copy branch — otherwise
+            //      <c>IsChainOpen=true</c> persists and the held ZC
+            //      frames' Releases cannot fire EndZcReservation,
+            //      deadlocking the writer.
             //
             //      The budget is <c>cap/2</c> (see <see cref="ShmRing.ChainZcBudget"/>):
             //      under back-to-back streaming the writer must have
@@ -314,7 +321,9 @@ public static class FrameProtocol
             }
 
             // Copy path. CommitReadRaw advances readIdx normally (no
-            // anchor open in copy mode).
+            // anchor open in copy mode); when an anchor IS open it routes
+            // through the deferred-bump path (additive). Either way, the
+            // copied bytes are accounted for in <c>_deferredReadIdxTarget</c>.
             var payload = ArrayPool<byte>.Shared.Rent(payloadLength);
             if (contiguous)
             {
@@ -326,11 +335,28 @@ public static class FrameProtocol
             }
             ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
 
-            // Reset copy-mode on the message's final frame so the next
-            // logical message gets a fresh decision.
-            if (!isMore && copyMode)
+            // Reset chain bookkeeping on the message's final frame so the
+            // next logical message gets a fresh decision.
+            if (!isMore)
             {
-                ring.ChainCopyMode = false;
+                if (copyMode)
+                {
+                    ring.ChainCopyMode = false;
+                }
+                else if (chainActive)
+                {
+                    // Chain ZC was opened earlier (first frame ZC-eligible)
+                    // but this final frame fell to the copy path because
+                    // its payload reservation wraps the ring boundary
+                    // (contiguous == false). Without closing the chain
+                    // here, <see cref="ShmRing.IsChainOpen"/> stays true
+                    // forever; <see cref="FramePayload.Release"/> on the
+                    // earlier ZC frames gates <see cref="ShmRing.EndZcReservation"/>
+                    // on <c>!IsChainOpen</c>, so the deferred-publish
+                    // never fires and the writer eventually deadlocks
+                    // waiting for <c>header.ReadIdx</c> to advance.
+                    ring.CloseZcChain();
+                }
             }
             return (header, FramePayload.FromPooled(payload, payloadLength));
         }
