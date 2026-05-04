@@ -162,6 +162,24 @@ public sealed class ShmRing : IDisposable
     /// </remarks>
     public Grpc.Net.SharedMemory.Wire.WireFormat Wire { get; internal set; } = Grpc.Net.SharedMemory.Wire.WireFormat.Custom16;
 
+    /// <summary>
+    /// Whether the owning connection negotiated single-stream (ping-pong)
+    /// mode. Set once during connection establishment and read by
+    /// <see cref="ChainZcBudget"/> to decide how aggressively a multi-frame
+    /// chain ZC anchor may consume the ring.
+    /// </summary>
+    /// <remarks>
+    /// In single-stream / ping-pong mode the writer naturally pauses
+    /// after each request — the client only sends the next request
+    /// after receiving a response — so the chain anchor may safely hold
+    /// up to <c>cap - SmallReserve</c> bytes without risking a writer-side
+    /// stall. In multi-stream mode the writer can pipeline a follow-up
+    /// message before the consumer parses the current one, so the budget
+    /// stays at <c>cap/2</c> to leave headroom for the next message's
+    /// first frame.
+    /// </remarks>
+    public bool SingleStreamMode { get; internal set; }
+
     // Speculative zero-copy: track bytes committed but not yet consumed.
     // Writer deducts this from available space in ReserveWrite, ensuring
     // it can never reach ring memory still referenced by handler code.
@@ -285,18 +303,43 @@ public sealed class ShmRing : IDisposable
     }
 
     /// <summary>
-    /// Maximum bytes a chain ZC anchor may hold. Set to <c>cap/2</c> so
-    /// that even under sustained back-to-back streaming, the writer
-    /// always has at least <c>cap/2</c> of headroom to begin emitting
-    /// the next message while the consumer is still parsing the current
-    /// one. A larger budget (e.g., <c>cap - 64 KiB</c>) works for unary
-    /// (client finishes writing before server starts reading) but
-    /// deadlocks streaming: holding nearly the whole ring leaves no
-    /// room for the writer to progress on the next message, and the
-    /// next message's frames are what would eventually trigger the
-    /// release of the current anchor — circular wait.
+    /// Maximum bytes a chain ZC anchor may hold.
+    /// <para>
+    /// <b>Single-stream mode</b>: <c>cap - SmallReserve</c> (where
+    /// <c>SmallReserve</c> covers the worst-case wire-frame headers and
+    /// LPM prefix the writer needs in flight). The client only sends the
+    /// next request after receiving the previous response, so a single
+    /// in-flight message holding nearly the whole ring is safe — the
+    /// writer naturally pauses until the chain anchor releases.
+    /// </para>
+    /// <para>
+    /// <b>Multi-stream mode (default)</b>: <c>cap / 2</c>. Under multi-
+    /// stream pipelining the writer may want to start emitting another
+    /// message's first frame before the consumer has finished parsing
+    /// the current chain. Holding nearly the whole ring would deadlock:
+    /// the next message's first frame can't be reserved, and the chain
+    /// anchor only releases when the consumer parses the current message
+    /// — which can't happen if the next frame never arrives.
+    /// </para>
     /// </summary>
-    internal long ChainZcBudget => (long)(_capacity / 2);
+    internal long ChainZcBudget
+    {
+        get
+        {
+            if (!SingleStreamMode)
+            {
+                return (long)(_capacity / 2);
+            }
+            // Reserve enough for a worst-case 4-frame Custom16 chain
+            // (4 × 16 B header) + the 5-byte gRPC LPM prefix, rounded up
+            // to 1 KiB for breathing room and to keep the budget aligned
+            // when adding/removing wire formats.
+            const ulong SmallReserve = 1024UL;
+            return _capacity > SmallReserve
+                ? (long)(_capacity - SmallReserve)
+                : (long)_capacity;
+        }
+    }
 
     /// <summary>
     /// Begins a speculative-zero-copy reservation. Subsequent

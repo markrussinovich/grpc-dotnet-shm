@@ -414,4 +414,53 @@ public class RingBufferTests
         Assert.That(state.Available, Is.EqualTo((ulong)TestCapacity - 70));
         Assert.That(state.Closed, Is.False);
     }
-}
+
+    [Test]
+    public void ChainZcBudget_DefaultsToCapHalfWhenMultiStream()
+    {
+        const int Cap = 64 * 1024 * 1024;
+        var memory = new byte[ShmConstants.RingHeaderSize + Cap];
+        using var ring = new ShmRing(memory, 0, Cap);
+
+        // Default = multi-stream → conservative cap/2 budget so chain
+        // ZC anchors can never starve a pipelined writer.
+        Assert.That(ring.SingleStreamMode, Is.False);
+        Assert.That(ring.ChainZcBudget, Is.EqualTo(Cap / 2));
+    }
+
+    [Test]
+    public void ChainZcBudget_LiftsToNearCapWhenSingleStream()
+    {
+        const int Cap = 64 * 1024 * 1024;
+        var memory = new byte[ShmConstants.RingHeaderSize + Cap];
+        using var ring = new ShmRing(memory, 0, Cap);
+
+        ring.SingleStreamMode = true;
+
+        // Single-stream / ping-pong: chain ZC anchor may consume nearly
+        // the whole ring (writer is naturally idle until the consumer
+        // releases), so the budget jumps from cap/2 to cap-SmallReserve.
+        // We don't pin the exact reserve here so future tuning of the
+        // small-reserve constant doesn't break this test, but we assert
+        // (a) it is strictly larger than the multi-stream budget, and
+        // (b) it leaves at least a frame's worth of headroom (≥ 256 B)
+        //     so wire-frame headers always fit.
+        Assert.That(ring.ChainZcBudget, Is.GreaterThan(Cap / 2));
+        Assert.That(ring.ChainZcBudget, Is.LessThanOrEqualTo(Cap - 256));
+    }
+
+    [Test]
+    public void ChainZcBudget_DoesNotUnderflowOnTinyRing()
+    {
+        // Defensive: rings smaller than the small-reserve constant must
+        // still report a non-negative budget. The specific value is
+        // unimportant (chain ZC is gated off entirely on rings < 1 MiB
+        // by IsSpeculativeZcEligible), but the property should not
+        // crash or return a negative number.
+        const int Cap = 256; // power of two, far below the ZC enable threshold
+        var memory = new byte[ShmConstants.RingHeaderSize + Cap];
+        using var ring = new ShmRing(memory, 0, Cap);
+
+        ring.SingleStreamMode = true;
+        Assert.That(ring.ChainZcBudget, Is.GreaterThanOrEqualTo(0L));
+    }}

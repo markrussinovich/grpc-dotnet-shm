@@ -391,6 +391,22 @@ public sealed class ShmControlHandler : HttpMessageHandler
                         {
                             conn.ZeroCopyRead = true;
                             conn.FrameWriter?.EnableSingleStreamMode();
+                            // NOTE: deliberately not setting `conn.SingleStreamMode = true` here
+                            // even though the negotiation succeeded. The
+                            // `Connection.SingleStreamMode` flag gates several
+                            // client-side inline-write fast paths
+                            // (`WriteSerializedMessageAsync` line 866-style and
+                            // `SendResult` line 990-style) which were only
+                            // ever exercised on the server side until this
+                            // PR. Enabling them on the client surfaces a
+                            // frame-ordering issue (HEADERS/MESSAGE/HALFCLOSE
+                            // sequencing under TryPauseWriterLoop) that needs
+                            // a separate investigation. For now, leave the
+                            // flag off on the client so the client uses the
+                            // queued-write path it has always used; this
+                            // matches pre-PR behaviour and avoids the
+                            // "No request message received" regression
+                            // observed in benchmark runs at 1 B unary.
                         }
                         return conn;
                     }

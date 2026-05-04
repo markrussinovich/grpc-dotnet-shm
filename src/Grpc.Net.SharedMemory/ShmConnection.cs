@@ -73,9 +73,25 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// When true, this connection was negotiated for single-stream mode.
-    /// Server handlers use ExecuteInline for atomic ring writes.
+    /// Server handlers use ExecuteInline for atomic ring writes; the data
+    /// rings raise their chain-ZC budget to <c>cap - SmallReserve</c>
+    /// (see <see cref="ShmRing.ChainZcBudget"/>) so a single in-flight
+    /// message can occupy almost the whole ring under ping-pong.
     /// </summary>
-    internal bool SingleStreamMode { get; set; }
+    internal bool SingleStreamMode
+    {
+        get => _singleStreamMode;
+        set
+        {
+            _singleStreamMode = value;
+            // Propagate to the data rings so the codec's chain-ZC
+            // budget reflects the negotiated mode without taking a
+            // dependency on ShmConnection at the codec layer.
+            TxRing.SingleStreamMode = value;
+            RxRing.SingleStreamMode = value;
+        }
+    }
+    private bool _singleStreamMode;
 
     // Keepalive (A73 RFC)
     private readonly ShmKeepaliveOptions _keepaliveOptions;
