@@ -18,7 +18,6 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
-using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
 namespace Grpc.Net.SharedMemory.Wire;
@@ -34,22 +33,32 @@ internal static partial class Http2Codec
         = new();
 
     /// <summary>Per-ring decoder state used to distinguish HEADERS vs trailers.</summary>
+    /// <remarks>
+    /// All access goes through the per-ring frame-reader thread (see
+    /// <c>ShmConnection.FrameReaderLoopAsync</c>), so the maps are
+    /// plain <see cref="Dictionary{TKey,TValue}"/> rather than
+    /// <see cref="ConcurrentDictionary{TKey,TValue}"/>: the per-frame
+    /// CAS overhead inside ConcurrentDictionary's hashing is pure cost
+    /// in this single-producer single-consumer use.
+    /// <para>
+    /// <c>LastStreamId</c> / <c>LastAcc</c> form a one-element MRU
+    /// cache for single-stream-mode workloads (the dominant deployment
+    /// shape): every DATA frame in single-stream-mode targets the same
+    /// stream, so the cache hits 100% and the dictionary lookup is
+    /// skipped entirely.
+    /// </para>
+    /// </remarks>
     private sealed class Http2DecoderState
     {
-        public readonly ConcurrentDictionary<uint, byte> StreamsWithInitialHeaders = new();
+        public readonly Dictionary<uint, byte> StreamsWithInitialHeaders = new();
+        public readonly Dictionary<uint, LpmAccumulator> LpmAccumulators = new();
 
-        /// <summary>
-        /// Per-stream gRPC LPM (length-prefixed message) accumulator.
-        /// HTTP/2 DATA frames carry a byte stream of length-prefixed messages
-        /// (gRFC §"Length-Prefixed-Message"). One DATA frame may contain a
-        /// fragment of one message, multiple complete messages, or a mix.
-        /// We reassemble here so the upper layer sees the same
-        /// "1 internal MESSAGE = 1 complete app message" model used by
-        /// Custom16. The LPM header (5 bytes) is preserved at the start
-        /// of the emitted body for compatibility with downstream readers
-        /// that expect to strip it themselves.
-        /// </summary>
-        public readonly ConcurrentDictionary<uint, LpmAccumulator> LpmAccumulators = new();
+        // MRU hot cache for the LPM accumulator. SingleStreamMode pins
+        // streamId == 1 forever, so the dict lookup is bypassed for the
+        // entire stream lifetime. Multi-stream workloads still hit the
+        // dict but pay only per-stream-switch overhead.
+        public uint LastStreamId;
+        public LpmAccumulator? LastAcc;
     }
 
     /// <summary>Accumulates a single in-progress gRPC LPM message across multiple DATA frames.</summary>
@@ -79,6 +88,62 @@ internal static partial class Http2Codec
     private static Http2DecoderState GetState(ShmRing ring)
     {
         return s_decoderState.GetValue(ring, _ => new Http2DecoderState());
+    }
+
+    // ===== LPM accumulator dict access helpers (single-threaded reader) =====
+    //
+    // Wrap the per-stream LpmAccumulator dict with a one-element MRU
+    // cache: the dominant deployment shape (single-stream-mode) targets
+    // exactly one streamId, so the dict lookup is bypassed entirely after
+    // the first frame. Multi-stream workloads pay the dict lookup only
+    // on a stream switch, which is the boundary where any decoder needs
+    // some state load anyway.
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TryGetAcc(Http2DecoderState state, uint streamId, out LpmAccumulator? acc)
+    {
+        if (state.LastStreamId == streamId && state.LastAcc != null)
+        {
+            acc = state.LastAcc;
+            return true;
+        }
+        if (state.LpmAccumulators.TryGetValue(streamId, out var found))
+        {
+            acc = found;
+            state.LastStreamId = streamId;
+            state.LastAcc = found;
+            return true;
+        }
+        acc = null;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static LpmAccumulator GetOrAddAcc(Http2DecoderState state, uint streamId)
+    {
+        if (state.LastStreamId == streamId && state.LastAcc != null)
+        {
+            return state.LastAcc;
+        }
+        if (!state.LpmAccumulators.TryGetValue(streamId, out var acc))
+        {
+            acc = new LpmAccumulator();
+            state.LpmAccumulators[streamId] = acc;
+        }
+        state.LastStreamId = streamId;
+        state.LastAcc = acc;
+        return acc;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool RemoveAcc(Http2DecoderState state, uint streamId, out LpmAccumulator? acc)
+    {
+        if (state.LastStreamId == streamId)
+        {
+            state.LastStreamId = 0;
+            state.LastAcc = null;
+        }
+        return state.LpmAccumulators.Remove(streamId, out acc);
     }
 
     private static (FrameHeader Header, FramePayload Payload) ReadFramePayloadInternal(
@@ -194,10 +259,10 @@ internal static partial class Http2Codec
             // No body to feed to the LPM accumulator.
             if (endStream)
             {
-                state.StreamsWithInitialHeaders.TryRemove(streamId, out _);
-                if (state.LpmAccumulators.TryRemove(streamId, out var stale))
+                state.StreamsWithInitialHeaders.Remove(streamId);
+                if (RemoveAcc(state, streamId, out var stale))
                 {
-                    stale.Reset(); // free pooled buffer if any
+                    stale!.Reset(); // free pooled buffer if any
                 }
                 return (new FrameHeader(FrameType.HalfClose, streamId, 0, 0), FramePayload.Empty);
             }
@@ -229,8 +294,8 @@ internal static partial class Http2Codec
 
         // === Fast path: single complete LPM message in this DATA frame, ===
         // === no accumulator state, contiguous body. Eligible for zero-copy. ===
-        var hasAccumulator = state.LpmAccumulators.TryGetValue(streamId, out var existingAcc)
-            && existingAcc.Pos > 0;
+        var hasAccumulator = TryGetAcc(state, streamId, out var existingAcc)
+            && existingAcc!.Pos > 0;
         if (!hasAccumulator && bodyLength >= 5 && payloadReservation.Second.IsEmpty)
         {
             var bodySpan = payloadReservation.First.Span.Slice(bodyOffset, bodyLength);
@@ -246,7 +311,7 @@ internal static partial class Http2Codec
                 var hdr = new FrameHeader(FrameType.Message, streamId, (uint)bodyLength, msgFlags);
                 if (endStream)
                 {
-                    state.StreamsWithInitialHeaders.TryRemove(streamId, out _);
+                    state.StreamsWithInitialHeaders.Remove(streamId);
                 }
 
                 if (zeroCopy && bodyOffset == 0
@@ -292,7 +357,7 @@ internal static partial class Http2Codec
             // frames in one return; only the first completed message per call.
             // (Our writer never packs >1 message per DATA frame, so this is
             // safe in practice.)
-            var acc = state.LpmAccumulators.GetOrAdd(streamId, _ => new LpmAccumulator());
+            var acc = GetOrAddAcc(state, streamId);
             var feedResult = FeedAccumulator(acc, bodyBytes);
 
             // Commit the ring read regardless — we've materialised everything we need.
@@ -304,12 +369,12 @@ internal static partial class Http2Codec
                 var hdr = new FrameHeader(FrameType.Message, streamId, (uint)completedPayload.Length, msgFlags);
                 if (endStream)
                 {
-                    state.StreamsWithInitialHeaders.TryRemove(streamId, out _);
+                    state.StreamsWithInitialHeaders.Remove(streamId);
                     // FeedAccumulator already nulled out acc.Buffer on completion;
                     // Reset() here is defensive in case future changes leave state.
-                    if (state.LpmAccumulators.TryRemove(streamId, out var doneAcc))
+                    if (RemoveAcc(state, streamId, out var doneAcc))
                     {
-                        doneAcc.Reset();
+                        doneAcc!.Reset();
                     }
                 }
                 return (hdr, completedPayload);
@@ -319,11 +384,11 @@ internal static partial class Http2Codec
             // the LPM, that's a protocol error.
             if (endStream)
             {
-                if (state.LpmAccumulators.TryRemove(streamId, out var orphan))
+                if (RemoveAcc(state, streamId, out var orphan))
                 {
-                    orphan.Reset();
+                    orphan!.Reset();
                 }
-                state.StreamsWithInitialHeaders.TryRemove(streamId, out _);
+                state.StreamsWithInitialHeaders.Remove(streamId);
                 throw new InvalidDataException(
                     $"H2 stream {streamId} ended mid-LPM (accumulator pos={acc.Pos}, expected={acc.ExpectedTotal})");
             }
@@ -493,7 +558,7 @@ internal static partial class Http2Codec
             (payloadBytes, payloadLen) = v1.Encode();
             internalType = FrameType.Headers;
             internalFlags = (byte)HeadersFlags.Initial;
-            state.StreamsWithInitialHeaders.TryAdd(streamId, 1);
+            state.StreamsWithInitialHeaders[streamId] = 1;
 
             if (endStream)
             {
@@ -503,7 +568,7 @@ internal static partial class Http2Codec
                 // allow a synthetic Trailers to be emitted by upper-layer logic. For now,
                 // we simply remove initial state and let the next frame on this stream
                 // (likely none) be treated as fresh.
-                state.StreamsWithInitialHeaders.TryRemove(streamId, out _);
+                state.StreamsWithInitialHeaders.Remove(streamId);
             }
         }
         else
@@ -513,7 +578,7 @@ internal static partial class Http2Codec
             (payloadBytes, payloadLen) = v1.Encode();
             internalType = FrameType.Trailers;
             internalFlags = endStream ? TrailersFlags.EndStream : (byte)0;
-            state.StreamsWithInitialHeaders.TryRemove(streamId, out _);
+            state.StreamsWithInitialHeaders.Remove(streamId);
         }
 
         var hdr = new FrameHeader(internalType, streamId, (uint)payloadLen, internalFlags);
@@ -534,10 +599,10 @@ internal static partial class Http2Codec
         // hold a pooled buffer; calling Reset() returns it to ArrayPool to
         // prevent a buffer leak when the peer cancels mid-message.
         var state = GetState(ring);
-        state.StreamsWithInitialHeaders.TryRemove(streamId, out _);
-        if (state.LpmAccumulators.TryRemove(streamId, out var pendingAcc))
+        state.StreamsWithInitialHeaders.Remove(streamId);
+        if (RemoveAcc(state, streamId, out var pendingAcc))
         {
-            pendingAcc.Reset();
+            pendingAcc!.Reset();
         }
 
         var hdr = new FrameHeader(FrameType.Cancel, streamId, 0, 0);

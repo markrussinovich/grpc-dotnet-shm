@@ -43,48 +43,28 @@ public static class FrameProtocol
         CancellationToken cancellationToken = default,
         bool zeroCopy = false)
     {
-        if (ring.Wire == Wire.WireFormat.Http2)
-        {
-            // Lazy flag flip — the first frame on each codec marks the
-            // flag. Subsequent frames see the flag already set and the
-            // branch predictor learns to skip the write. Cost after
-            // warmup: one Volatile.Read + one always-not-taken branch.
-            if (!s_h2ReadUsed) s_h2ReadUsed = true;
-            return Wire.Http2Codec.ReadFramePayload(ring, cancellationToken, zeroCopy);
-        }
-        if (!s_c16ReadUsed) s_c16ReadUsed = true;
-        return ReadFramePayloadCustom16(ring, cancellationToken, zeroCopy);
+        // Wire is set once at connection establishment and never changes.
+        // The branch predictor learns the per-ring direction after one
+        // frame; the JIT inlines this wrapper and the impl into
+        // FrameReaderLoop. Cost is one field load + a 100%-predictable
+        // branch.
+        return ring.Wire == Wire.WireFormat.Http2
+            ? Wire.Http2Codec.ReadFramePayload(ring, cancellationToken, zeroCopy)
+            : ReadFramePayloadCustom16(ring, cancellationToken, zeroCopy);
     }
-
-    // Codec-usage flags. Replaced per-frame Interlocked counters with
-    // per-process lazy bools. true is the absorbing state, so a race
-    // between two writers both setting true is benign.
-    //
-    // <c>internal</c> so that the inline-direct writer in
-    // <see cref="ShmFrameWriter"/> can flip them without a method call.
-    internal static bool s_h2ReadUsed;
-    internal static bool s_c16ReadUsed;
-    internal static bool s_h2WriteUsed;
-    internal static bool s_c16WriteUsed;
 
     /// <summary>
-    /// Test/diagnostic helper: returns 1 for each codec that has been used
-    /// since the last <see cref="ResetCodecCounters"/>, 0 otherwise.
-    /// (Per-frame counts were dropped in favour of a per-process flag
-    /// flip to keep the dispatch hot-path branch-predictable.)
+    /// Test/diagnostic helper retained for back-compat with
+    /// <c>RingBench</c>. Returns zeros: per-frame counters were dropped
+    /// in favour of branch-predictor-friendly dispatch. To check which
+    /// codec a connection negotiated, inspect <see cref="ShmRing.Wire"/>
+    /// on the ring directly.
     /// </summary>
     public static (long Custom16Read, long Http2Read, long Custom16Write, long Http2Write) GetCodecCounters()
-        => (s_c16ReadUsed ? 1L : 0L, s_h2ReadUsed ? 1L : 0L,
-            s_c16WriteUsed ? 1L : 0L, s_h2WriteUsed ? 1L : 0L);
+        => (0L, 0L, 0L, 0L);
 
-    /// <summary>Resets the codec-usage flags.</summary>
-    public static void ResetCodecCounters()
-    {
-        s_h2ReadUsed = false;
-        s_c16ReadUsed = false;
-        s_h2WriteUsed = false;
-        s_c16WriteUsed = false;
-    }
+    /// <summary>No-op retained for <c>RingBench</c> back-compat.</summary>
+    public static void ResetCodecCounters() { }
 
     /// <summary>
     /// Reads a Custom16-encoded frame and returns a pooled-buffer payload.
@@ -397,11 +377,9 @@ public static class FrameProtocol
     {
         if (ring.Wire == Wire.WireFormat.Http2)
         {
-            if (!s_h2WriteUsed) s_h2WriteUsed = true;
             Wire.Http2Codec.WriteFrame(ring, header, payload1, payload2, cancellationToken);
             return;
         }
-        if (!s_c16WriteUsed) s_c16WriteUsed = true;
         WriteFrameCore(ring, header, payload1, payload2, cancellationToken);
     }
 
