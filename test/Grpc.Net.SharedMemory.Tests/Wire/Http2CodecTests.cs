@@ -198,4 +198,165 @@ public class Http2CodecTests
         }
         finally { p.Release(); }
     }
+
+    [Test]
+    public void TrailersOnly_HeadersWithEndStream_SplitsIntoHeadersAndTrailers()
+    {
+        // gRFC G3 trailers-only response: server returns a non-OK status (or
+        // any status without a body) as a SINGLE H2 HEADERS frame with
+        // END_STREAM set, carrying both the response pseudo-headers
+        // (`:status`, `content-type`) and the gRPC trailing fields
+        // (`grpc-status`, `grpc-message`, custom trailer metadata).
+        //
+        // The receiving codec MUST surface this as TWO logical frames —
+        // initial Headers (without EndStream) followed by Trailers (with
+        // EndStream) — so the upper layer's response state machine
+        // observes a Trailers frame and completes the call. Without the
+        // split, the call hangs forever waiting for trailers that never
+        // arrive on the wire.
+        using var ring = CreateRing();
+        var streamId = 7u;
+
+        // Build the HPACK header block by hand to mirror what a real
+        // grpc-go / grpc-java server would emit for a NotFound response.
+        var fields = new List<(string Name, byte[] Value)>
+        {
+            (":status", System.Text.Encoding.ASCII.GetBytes("200")),
+            ("content-type", System.Text.Encoding.ASCII.GetBytes("application/grpc")),
+            ("grpc-status", System.Text.Encoding.ASCII.GetBytes("5")),       // NotFound
+            ("grpc-message", System.Text.Encoding.ASCII.GetBytes("not found")),
+            ("custom-trailer", System.Text.Encoding.ASCII.GetBytes("xyz")),
+        };
+        var (hpackBuf, hpackLen) = Grpc.Net.SharedMemory.Wire.Hpack.HpackEncoder.Encode(fields);
+        try
+        {
+            // Hand-craft an H2 HEADERS frame: 9-byte header + HPACK block.
+            // Flags = END_HEADERS | END_STREAM (canonical trailers-only form).
+            byte flags = (byte)(Http2Flags.EndHeaders | Http2Flags.EndStream);
+            var totalLen = Http2FrameHeader.Size + hpackLen;
+            var frameBytes = new byte[totalLen];
+            Http2FrameHeader.Encode(
+                frameBytes.AsSpan(0, Http2FrameHeader.Size),
+                Http2FrameType.Headers, flags, streamId, hpackLen);
+            hpackBuf.AsSpan(0, hpackLen).CopyTo(frameBytes.AsSpan(Http2FrameHeader.Size));
+            ring.Write(frameBytes);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(hpackBuf);
+        }
+
+        // First read: surfaces the response Headers half WITHOUT EndStream.
+        // Upper-layer response handler treats this as the initial response
+        // headers and continues waiting for trailers (which arrive on the
+        // very next read thanks to the codec's pending-frame stash).
+        var (h1, p1) = FrameProtocol.ReadFramePayload(ring);
+        try
+        {
+            Assert.That(h1.Type, Is.EqualTo(FrameType.Headers),
+                "First frame from a trailers-only HEADERS must be initial Headers.");
+            Assert.That(h1.StreamId, Is.EqualTo(streamId));
+            // Internal Headers frame uses HeadersFlags.Initial (0x01) which
+            // shares its byte value with TrailersFlags.EndStream — flag-byte
+            // semantics are interpreted relative to FrameType, not by raw bit
+            // overlap. Asserting `Type == Headers` IS the EndStream-absence
+            // check at the internal-frame level.
+            Assert.That(h1.Flags, Is.EqualTo((byte)HeadersFlags.Initial));
+
+            var hv1 = HeadersV1.Decode(p1.Memory.Span);
+            Assert.That(hv1.HeaderType, Is.EqualTo((byte)1),
+                "Trailers-only's Headers half maps to server-initial style.");
+        }
+        finally { p1.Release(); }
+
+        // Second read: surfaces the Trailers half. CRITICAL: this read must
+        // NOT block on the ring (the wire is empty after the single H2
+        // HEADERS) — the codec must return the stashed synthetic Trailers
+        // frame from its decoder state.
+        var (h2, p2) = FrameProtocol.ReadFramePayload(ring);
+        try
+        {
+            Assert.That(h2.Type, Is.EqualTo(FrameType.Trailers),
+                "Second frame from a trailers-only HEADERS must be Trailers.");
+            Assert.That(h2.StreamId, Is.EqualTo(streamId));
+            Assert.That(h2.Flags & TrailersFlags.EndStream, Is.EqualTo(TrailersFlags.EndStream),
+                "Trailers half must carry EndStream (signals call completion).");
+
+            var tv1 = TrailersV1.Decode(p2.Memory.Span);
+            Assert.That(tv1.GrpcStatusCode, Is.EqualTo(global::Grpc.Core.StatusCode.NotFound),
+                "Trailers half must carry the parsed grpc-status (gRFC G3).");
+            Assert.That(tv1.GrpcStatusMessage, Is.EqualTo("not found"),
+                "Trailers half must carry the parsed grpc-message.");
+            // Custom trailer metadata belongs in the trailers half by gRFC
+            // convention (the only half that semantically owns trailing fields).
+            Assert.That(tv1.Metadata, Has.Count.EqualTo(1));
+            Assert.That(tv1.Metadata[0].Key, Is.EqualTo("custom-trailer"));
+        }
+        finally { p2.Release(); }
+    }
+
+    [Test]
+    public void TrailersOnly_FollowedByNextStream_DoesNotContaminateState()
+    {
+        // After draining a trailers-only stream's two synthetic frames, the
+        // codec's per-ring decoder state must be clean: a subsequent stream
+        // on the same ring must be parsed without leakage from the prior
+        // trailers-only state (e.g., the StreamsWithInitialHeaders entry
+        // for stream 7 must not bleed into stream 9).
+        using var ring = CreateRing();
+
+        // First: drive a trailers-only HEADERS on stream 7, drain both
+        // synthetic frames.
+        var fields = new List<(string Name, byte[] Value)>
+        {
+            (":status", System.Text.Encoding.ASCII.GetBytes("200")),
+            ("grpc-status", System.Text.Encoding.ASCII.GetBytes("5")),
+        };
+        var (hpackBuf, hpackLen) = Grpc.Net.SharedMemory.Wire.Hpack.HpackEncoder.Encode(fields);
+        try
+        {
+            byte flags = (byte)(Http2Flags.EndHeaders | Http2Flags.EndStream);
+            var frameBytes = new byte[Http2FrameHeader.Size + hpackLen];
+            Http2FrameHeader.Encode(
+                frameBytes.AsSpan(0, Http2FrameHeader.Size),
+                Http2FrameType.Headers, flags, 7u, hpackLen);
+            hpackBuf.AsSpan(0, hpackLen).CopyTo(frameBytes.AsSpan(Http2FrameHeader.Size));
+            ring.Write(frameBytes);
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(hpackBuf); }
+
+        var (h1, p1) = FrameProtocol.ReadFramePayload(ring);
+        Assert.That(h1.Type, Is.EqualTo(FrameType.Headers));
+        p1.Release();
+
+        var (h2, p2) = FrameProtocol.ReadFramePayload(ring);
+        Assert.That(h2.Type, Is.EqualTo(FrameType.Trailers));
+        p2.Release();
+
+        // Now: a fresh non-trailers-only HEADERS on stream 9 must surface
+        // as a single Headers frame (no synthetic Trailers).
+        var initial = new HeadersV1 { HeaderType = 1 };
+        var (initBuf, initLen) = initial.Encode();
+        try
+        {
+            FrameProtocol.WriteFrame(ring,
+                new FrameHeader(FrameType.Headers, 9u, (uint)initLen, HeadersFlags.Initial),
+                initBuf.AsSpan(0, initLen));
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(initBuf); }
+
+        var (h3, p3) = FrameProtocol.ReadFramePayload(ring);
+        try
+        {
+            Assert.That(h3.Type, Is.EqualTo(FrameType.Headers));
+            Assert.That(h3.StreamId, Is.EqualTo(9u));
+            // Same flag-overlap caveat as above: a fresh non-trailers-only
+            // Headers carries only HeadersFlags.Initial; the test that the
+            // synthetic Trailers stash didn't bleed into the next stream is
+            // simply that the very next read produces an internal Headers
+            // frame (not Trailers).
+            Assert.That(h3.Flags, Is.EqualTo((byte)HeadersFlags.Initial));
+        }
+        finally { p3.Release(); }
+    }
 }

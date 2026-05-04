@@ -59,6 +59,17 @@ internal static partial class Http2Codec
         // dict but pay only per-stream-switch overhead.
         public uint LastStreamId;
         public LpmAccumulator? LastAcc;
+
+        // Synthetic-frame queue (for trailers-only HEADERS, RFC G3 §"Trailers-only").
+        // A single H2 HEADERS+END_STREAM that carries both response status
+        // pseudo-headers and gRPC trailing fields must surface to the upper
+        // layer as TWO logical frames — Headers (without END_STREAM) followed
+        // by Trailers (with END_STREAM). The reader emits the Headers half
+        // immediately and stashes the Trailers half here; the next call to
+        // <see cref="ReadFramePayloadInternal"/> returns the stash before
+        // touching the ring.
+        public FrameHeader? PendingFrameHeader;
+        public FramePayload PendingFramePayload;
     }
 
     /// <summary>Accumulates a single in-progress gRPC LPM message across multiple DATA frames.</summary>
@@ -153,6 +164,21 @@ internal static partial class Http2Codec
     {
         var state = GetState(ring);
         Span<byte> hb = stackalloc byte[Http2FrameHeader.Size];
+
+        // Drain any frame the previous read split off (currently only used
+        // for trailers-only HEADERS, where one H2 frame surfaces as two
+        // internal frames). Pulling the stash before touching the ring keeps
+        // the FIFO invariant intact: the Trailers we stashed last call must
+        // be observed by the upper layer before any subsequent ring frame
+        // (which on a typical post-trailers-only stream will be RST_STREAM
+        // or simply nothing).
+        if (state.PendingFrameHeader is { } pendingHeader)
+        {
+            var pendingPayload = state.PendingFramePayload;
+            state.PendingFrameHeader = null;
+            state.PendingFramePayload = default;
+            return (pendingHeader, pendingPayload);
+        }
 
         while (true)
         {
@@ -553,23 +579,54 @@ internal static partial class Http2Codec
 
         if (!hasInitial)
         {
-            // First HEADERS on this stream → initial headers (mapped to FrameType.Headers).
+            // First HEADERS on this stream.
+            //
+            // Two cases:
+            //  1) Normal: HEADERS without END_STREAM → initial response
+            //     headers; subsequent DATA frames carry the body and a
+            //     follow-up HEADERS w/ END_STREAM carries the trailers.
+            //  2) Trailers-only (gRFC G3): HEADERS w/ END_STREAM as the
+            //     SOLE frame on this stream — server is returning a status
+            //     without a response body (e.g. NotFound, Unauthenticated).
+            //     The single HEADERS block carries response pseudo-headers
+            //     (`:status`, `content-type`, …) AND gRPC trailing fields
+            //     (`grpc-status`, `grpc-message`, custom trailer metadata).
+            //     The upper-layer state machine expects a Headers frame
+            //     followed by a Trailers frame to complete the call; if we
+            //     surface only one frame the call hangs forever waiting for
+            //     trailers that never arrive.
+            //
+            // For case 2 we split the HPACK block into a Headers half and a
+            // Trailers half (see <see cref="HpackHeadersAdapter.DecodeTrailersOnly"/>),
+            // emit the Headers immediately, and stash the Trailers in
+            // <see cref="Http2DecoderState.PendingFrameHeader"/>. The next
+            // call to <see cref="ReadFramePayloadInternal"/> returns the
+            // stash before touching the ring, preserving FIFO order.
+            if (endStream)
+            {
+                var (headersV1, trailersV1) = HpackHeadersAdapter.DecodeTrailersOnly(headerBlock);
+
+                var (hPayload, hLen) = headersV1.Encode();
+                var (tPayload, tLen) = trailersV1.Encode();
+
+                state.PendingFrameHeader = new FrameHeader(
+                    FrameType.Trailers, streamId, (uint)tLen, TrailersFlags.EndStream);
+                state.PendingFramePayload = FramePayload.FromPooled(tPayload, tLen);
+
+                // No persistent stream state to retain: trailers-only means
+                // the stream ended in this single HEADERS frame; any further
+                // wire frames on this stream id (none expected from a well-
+                // behaved peer) get treated as a fresh stream.
+                var hHdr = new FrameHeader(
+                    FrameType.Headers, streamId, (uint)hLen, HeadersFlags.Initial);
+                return (hHdr, FramePayload.FromPooled(hPayload, hLen));
+            }
+
             var v1 = HpackHeadersAdapter.DecodeHeaders(headerBlock);
             (payloadBytes, payloadLen) = v1.Encode();
             internalType = FrameType.Headers;
             internalFlags = (byte)HeadersFlags.Initial;
             state.StreamsWithInitialHeaders[streamId] = 1;
-
-            if (endStream)
-            {
-                // Trailers-only response: peer sent both initial-status and grpc-status
-                // in a single HEADERS w/ END_STREAM. Surface as Headers; the upper layer
-                // (or a future enhancement) can split if needed. We keep stream state to
-                // allow a synthetic Trailers to be emitted by upper-layer logic. For now,
-                // we simply remove initial state and let the next frame on this stream
-                // (likely none) be treated as fresh.
-                state.StreamsWithInitialHeaders.Remove(streamId);
-            }
         }
         else
         {

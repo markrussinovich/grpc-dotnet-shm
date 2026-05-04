@@ -243,6 +243,109 @@ internal static class HpackHeadersAdapter
     }
 
     /// <summary>
+    /// Decodes an HPACK header block that arrived as a "trailers-only" HEADERS
+    /// frame (single frame carrying both response status pseudo-headers and
+    /// gRPC trailing fields, with H2 END_STREAM set on first HEADERS — the
+    /// canonical wire form for status-only gRPC responses such as NotFound).
+    /// </summary>
+    /// <remarks>
+    /// gRFC G3 §"Trailers-only" defines this single-frame form as the way a
+    /// server returns a non-OK status (or any status without a response body)
+    /// over HTTP/2. The receiving codec MUST surface the same logical pair —
+    /// initial-headers followed by trailers — that the upper layer would see
+    /// for a multi-frame response, otherwise the client's response-handling
+    /// state machine never observes a Trailers frame and the call hangs.
+    /// <para>
+    /// This method decodes the HPACK block once and partitions the fields:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description><b>Initial headers</b>: <c>:status</c>,
+    ///     <c>content-type</c>, <c>grpc-encoding</c>, <c>grpc-accept-encoding</c>,
+    ///     <c>te</c> — i.e., transport-/encoding-level fields the client
+    ///     handler expects to see before any application data.</description></item>
+    ///   <item><description><b>Trailers</b>: <c>grpc-status</c>,
+    ///     <c>grpc-message</c>, <c>grpc-status-details-bin</c>, and any
+    ///     custom application metadata. By gRFC convention, custom metadata
+    ///     in a trailers-only block belongs in the trailers half (the only
+    ///     half a status-only response semantically owns).</description></item>
+    /// </list>
+    /// </remarks>
+    public static (HeadersV1 Headers, TrailersV1 Trailers) DecodeTrailersOnly(ReadOnlySpan<byte> hpackBlock)
+    {
+        var fields = HpackDecoder.Decode(hpackBlock);
+
+        // Initial-headers half: server-initial style HeadersV1 (HeaderType = 1).
+        // Custom application metadata goes to trailers per the partition rule
+        // above, so the metadata list here stays empty.
+        var headers = new HeadersV1
+        {
+            Version = 1,
+            HeaderType = 1,
+            Metadata = Array.Empty<MetadataKV>(),
+        };
+
+        // Trailers half: built up below.
+        var status = StatusCode.OK;
+        string? msg = null;
+        var grouped = new Dictionary<string, List<byte[]>>(StringComparer.Ordinal);
+
+        foreach (var (name, value) in fields)
+        {
+            switch (name)
+            {
+                case PseudoStatus:
+                case ContentType:
+                case TeHeader:
+                    // Belong in initial headers; the upper layer reconstructs
+                    // them from HeadersV1's transport fields when present, so
+                    // we don't surface them as metadata.
+                    break;
+                case GrpcStatus:
+                    {
+                        var s = Encoding.ASCII.GetString(value);
+                        if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var code))
+                        {
+                            status = (StatusCode)code;
+                        }
+                        break;
+                    }
+                case GrpcMessage:
+                    msg = GrpcMessageEncoder.Decode(Encoding.UTF8.GetString(value));
+                    break;
+                default:
+                    if (name.StartsWith(":", StringComparison.Ordinal))
+                    {
+                        // Unknown pseudo-header — ignore for forward
+                        // compatibility (mirrors DecodeHeaders).
+                        break;
+                    }
+                    if (!grouped.TryGetValue(name, out var bucket))
+                    {
+                        bucket = new List<byte[]>();
+                        grouped[name] = bucket;
+                    }
+                    bucket.Add(value);
+                    break;
+            }
+        }
+
+        var trailerMeta = new List<MetadataKV>(grouped.Count);
+        foreach (var (k, v) in grouped)
+        {
+            trailerMeta.Add(new MetadataKV { Key = k, Values = v });
+        }
+
+        var trailers = new TrailersV1
+        {
+            Version = 1,
+            GrpcStatusCode = status,
+            GrpcStatusMessage = msg,
+            Metadata = trailerMeta,
+        };
+        return (headers, trailers);
+    }
+
+    /// <summary>
     /// Encodes a deadline (in Unix nanoseconds) as a gRPC <c>grpc-timeout</c> value.
     /// Picks the smallest unit so the integer fits the 8-digit limit (gRFC A4).
     /// </summary>
