@@ -987,19 +987,34 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     }
                     else
                     {
-                        // Single frame — decompress then check size
-                        var protoSpan = DecompressLpm(f.Memory.Span, compression, grpcEncoding);
-                        if (maxReceiveMessageSize > 0 && protoSpan.Length > maxReceiveMessageSize)
+                        // Single frame — decompress then check size.
+                        // try/finally: under SingleStreamMode the server
+                        // enables ZeroCopyRead, so <c>f</c> may be a ZC
+                        // payload backed by ring memory; if Decompress or
+                        // ParseFrom throws (malformed compression frame,
+                        // bad protobuf, oversized payload), skipping
+                        // <see cref="InboundFrame.ReturnToPool"/> would
+                        // leave <see cref="ShmRing.SpeculativeReservedBytes"/>
+                        // charged forever and the peer writer would lose
+                        // ring capacity for the rest of the connection.
+                        // The multi-frame chain path already wraps
+                        // MergeFrom in try/finally; mirror that here.
+                        try
+                        {
+                            var protoSpan = DecompressLpm(f.Memory.Span, compression, grpcEncoding);
+                            if (maxReceiveMessageSize > 0 && protoSpan.Length > maxReceiveMessageSize)
+                            {
+                                throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                                    $"Received message exceeds the maximum configured message size ({protoSpan.Length} vs {maxReceiveMessageSize})"));
+                            }
+                            return pooledDeserialization
+                                ? PooledProtoParser.ParseFrom<TReq>(protoSpan)
+                                : parser.ParseFrom(protoSpan);
+                        }
+                        finally
                         {
                             f.ReturnToPool();
-                            throw new RpcException(new Status(StatusCode.ResourceExhausted,
-                                $"Received message exceeds the maximum configured message size ({protoSpan.Length} vs {maxReceiveMessageSize})"));
                         }
-                        var result = pooledDeserialization
-                            ? PooledProtoParser.ParseFrom<TReq>(protoSpan)
-                            : parser.ParseFrom(protoSpan);
-                        f.ReturnToPool();
-                        return result;
                     }
                 }
                 else if (f.Type == FrameType.HalfClose || f.Type == FrameType.Cancel || f.Type == FrameType.Trailers)
@@ -1293,11 +1308,25 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     }
                     else
                     {
-                        // Single frame — skip 5-byte gRPC LPM header per G3 spec.
+                        // Single frame — assign <c>_previousFrame</c>
+                        // EAGERLY so any throw during decompression,
+                        // parsing, or the size check leaves the frame
+                        // owned by the streaming reader, ready for
+                        // <see cref="Dispose"/> (or the next
+                        // <see cref="MoveNext"/>) to call
+                        // <see cref="InboundFrame.ReturnToPool"/>.
+                        // Without this eager assignment, a malformed
+                        // compressed payload, an InvalidProtocolBufferException,
+                        // or an oversized message would skip the release,
+                        // leaving <see cref="ShmRing.SpeculativeReservedBytes"/>
+                        // charged on a ZC-eligible frame (server enables
+                        // ZeroCopyRead under SingleStreamMode) and
+                        // permanently shrinking the ring's cross-process
+                        // capacity from the peer writer's view.
+                        _previousFrame = frame;
                         var protoSpan = DecompressLpm(frame.Memory.Span, _compression, _grpcEncoding);
                         if (_maxReceiveMessageSize > 0 && protoSpan.Length > _maxReceiveMessageSize)
                         {
-                            frame.ReturnToPool();
                             throw new RpcException(new Status(StatusCode.ResourceExhausted,
                                 $"Received message exceeds the maximum configured message size ({protoSpan.Length} vs {_maxReceiveMessageSize})"));
                         }
@@ -1305,7 +1334,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                             ? PooledProtoParser.ParseFrom<T>(protoSpan)
                             : _parser.ParseFrom(protoSpan);
 
-                        _previousFrame = frame;
                         var eosSingle = (frame.Flags & MessageFlags.EndStream) != 0;
                         if (eosSingle)
                         {
