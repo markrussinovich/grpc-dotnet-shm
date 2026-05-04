@@ -418,49 +418,88 @@ internal static partial class Http2Codec
             FramePayload? firstCompleted = null;
             FramePayload? bufferedTail = null;
             var remaining = bodyBytes;
+            var ringCommitted = false;
 
-            while (remaining.Length > 0)
+            try
             {
-                var (completed, consumed) = FeedAccumulator(acc, remaining);
-                if (consumed == 0)
+                while (remaining.Length > 0)
                 {
-                    // Defensive: FeedAccumulator made no progress on a
-                    // non-empty input. Should not happen given the logic
-                    // above (Phase 1/2 always consumes at least one byte
-                    // when src is non-empty), but break to avoid infinite
-                    // loop in case of future regressions.
-                    break;
-                }
-                remaining = remaining.Slice(consumed);
+                    var (completed, consumed) = FeedAccumulator(acc, remaining);
+                    if (consumed == 0)
+                    {
+                        // Defensive: FeedAccumulator made no progress on a
+                        // non-empty input. Should not happen given the logic
+                        // above (Phase 1/2 always consumes at least one byte
+                        // when src is non-empty), but break to avoid infinite
+                        // loop in case of future regressions.
+                        break;
+                    }
+                    remaining = remaining.Slice(consumed);
 
-                if (completed is { } payload)
+                    if (completed is { } payload)
+                    {
+                        if (firstCompleted == null)
+                        {
+                            firstCompleted = payload;
+                        }
+                        else if (bufferedTail == null)
+                        {
+                            bufferedTail = payload;
+                        }
+                        else
+                        {
+                            // bufferedTail is no longer the terminal Message —
+                            // a newer completion has arrived. Flush the old
+                            // tail to the queue WITHOUT EndStream (that flag
+                            // belongs to whoever ends up final) and adopt the
+                            // new payload as the new buffered tail.
+                            state.PendingFrames.Enqueue((
+                                new FrameHeader(FrameType.Message, streamId,
+                                    (uint)bufferedTail.Value.Length, 0),
+                                bufferedTail.Value));
+                            bufferedTail = payload;
+                        }
+                    }
+                }
+
+                // Commit the ring read regardless — we've materialised everything we need.
+                ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+                ringCommitted = true;
+            }
+            finally
+            {
+                if (!ringCommitted)
                 {
-                    if (firstCompleted == null)
-                    {
-                        firstCompleted = payload;
-                    }
-                    else if (bufferedTail == null)
-                    {
-                        bufferedTail = payload;
-                    }
-                    else
-                    {
-                        // bufferedTail is no longer the terminal Message —
-                        // a newer completion has arrived. Flush the old
-                        // tail to the queue WITHOUT EndStream (that flag
-                        // belongs to whoever ends up final) and adopt the
-                        // new payload as the new buffered tail.
-                        state.PendingFrames.Enqueue((
-                            new FrameHeader(FrameType.Message, streamId,
-                                (uint)bufferedTail.Value.Length, 0),
-                            bufferedTail.Value));
-                        bufferedTail = payload;
-                    }
+                    // FeedAccumulator (or any other inner step) threw. We
+                    // already advanced <c>_pendingReadIdx</c> by
+                    // <c>payloadLen</c> via the <see cref="ShmRing.ReserveRead"/>
+                    // call above, but never published the matching
+                    // <see cref="ShmRing.CommitReadRaw"/> on the shared
+                    // <c>header.ReadIdx</c>. Without this defensive
+                    // commit, the cross-process writer would see ring
+                    // capacity skewed by the unconsumed (from its view)
+                    // bytes for the rest of the connection's life — and
+                    // any future ReadFramePayload retry would re-read
+                    // the same bytes from <c>_pendingReadIdx</c>. Even
+                    // though InvalidDataException currently tears the
+                    // connection down (so the leak is bounded), defense
+                    // in depth: keep the two indices in sync at all
+                    // exit points.
+                    try { ring.CommitReadRaw(baseCommitReadIdx, totalBytes); }
+                    catch { /* swallow during exception unwind */ }
+
+                    // Release any locally-held completions to return their
+                    // pooled buffers and (if speculative — currently never,
+                    // since FeedAccumulator only emits FromPooled) drop
+                    // their SpeculativeReservedBytes increment. Do NOT
+                    // release entries already in PendingFrames — those are
+                    // committed to the queue contract and would be a
+                    // use-after-free if a subsequent ReadFramePayload call
+                    // dequeues them.
+                    firstCompleted?.Release();
+                    bufferedTail?.Release();
                 }
             }
-
-            // Commit the ring read regardless — we've materialised everything we need.
-            ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
 
             if (firstCompleted is { } first)
             {

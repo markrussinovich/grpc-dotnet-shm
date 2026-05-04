@@ -287,9 +287,50 @@ public sealed class ShmRing : IDisposable
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal void OpenZcChain() => Volatile.Write(ref _chainOpen, true);
 
-    /// <summary>Codec emitted a chain's final frame; consumer's last Release will fire <see cref="EndZcReservation"/>.</summary>
+    /// <summary>
+    /// Codec emitted a chain's final frame.
+    /// </summary>
+    /// <remarks>
+    /// In the typical (regular ZC) path, the consumer's last
+    /// <see cref="FramePayload.Release"/> on a still-held ZC frame fires
+    /// <see cref="EndZcReservation"/> via the
+    /// <c>(remaining == 0 &amp;&amp; !IsChainOpen)</c> gate inside
+    /// <see cref="FramePayload.Release"/>: the regular ZC path's last
+    /// frame increments <see cref="SpeculativeReservedBytes"/> just
+    /// before this <c>CloseZcChain</c> call, so SpecReserved &gt; 0 at
+    /// close time and the consumer's later Release of that frame will
+    /// satisfy the gate.
+    /// <para>
+    /// Wrap-copy chain end (chain opened on a contiguous first frame
+    /// but the chain's final frame fell to the copy path due to a
+    /// reservation that wraps the ring boundary) breaks this invariant:
+    /// the wrap-copy last frame does NOT increment SpecReserved. If a
+    /// concurrent consumer happens to have released ALL preceding ZC
+    /// frames before the reader gets here, SpecReserved is already 0
+    /// and no future Release on a pooled (wrap-copy) FramePayload can
+    /// observe the gate — <see cref="_zcActive"/> stays <c>true</c>
+    /// forever, <c>header.ReadIdx</c> stays frozen, and ring capacity
+    /// permanently shrinks from the writer's perspective.
+    /// </para>
+    /// <para>
+    /// We close that race by firing <see cref="EndZcReservation"/>
+    /// defensively here when SpecReserved is observed at 0 immediately
+    /// after the close. <c>EndZcReservation</c> is idempotent
+    /// (<see cref="PublishTarget"/> is a CAS loop, the
+    /// <c>_zcActive=false</c> write is plain), so the rare race where a
+    /// concurrent Release also fires it is harmless.
+    /// </para>
+    /// </remarks>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    internal void CloseZcChain() => Volatile.Write(ref _chainOpen, false);
+    internal void CloseZcChain()
+    {
+        Volatile.Write(ref _chainOpen, false);
+        if (Volatile.Read(ref SpeculativeReservedBytes) == 0
+            && Volatile.Read(ref _zcActive))
+        {
+            EndZcReservation();
+        }
+    }
 
     /// <summary>
     /// Codec-local: marks the in-flight multi-frame message as committed to
