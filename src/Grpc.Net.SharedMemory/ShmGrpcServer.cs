@@ -506,17 +506,11 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 // TryPause failed: ExecuteInline with intermediate buffer.
                 byte[] serializedBuffer;
                 int serializedSize;
+                bool returnBuffer = false;
                 if (size > 0)
                 {
-                    var cached = stream.Connection.CachedWriteBuffer;
-                    if (cached != null && cached.Length >= 5 + size)
-                        serializedBuffer = cached;
-                    else
-                    {
-                        if (cached != null) ArrayPool<byte>.Shared.Return(cached);
-                        serializedBuffer = ArrayPool<byte>.Shared.Rent(5 + size);
-                        stream.Connection.CachedWriteBuffer = serializedBuffer;
-                    }
+                    serializedBuffer = ArrayPool<byte>.Shared.Rent(5 + size);
+                    returnBuffer = true;
                     serializedBuffer[0] = 0;
                     System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
                         serializedBuffer.AsSpan(1, 4), (uint)size);
@@ -529,18 +523,25 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     serializedSize = 5;
                 }
 
-                writer.ExecuteInline(() =>
+                try
                 {
-                    if (!context.HeadersSent)
+                    writer.ExecuteInline(() =>
                     {
-                        stream.SendResponseHeadersInline(writer);
-                        context.MarkHeadersSent();
-                    }
-                    writer.WriteInline(stream.StreamId,
-                        serializedBuffer.AsSpan(0, serializedSize), 0, default);
-                    stream.SendTrailersInline(writer, context.Status.StatusCode,
-                        context.Status.Detail, context.ResponseTrailers);
-                });
+                        if (!context.HeadersSent)
+                        {
+                            stream.SendResponseHeadersInline(writer);
+                            context.MarkHeadersSent();
+                        }
+                        writer.WriteInline(stream.StreamId,
+                            serializedBuffer.AsSpan(0, serializedSize), 0, default);
+                        stream.SendTrailersInline(writer, context.Status.StatusCode,
+                            context.Status.Detail, context.ResponseTrailers);
+                    });
+                }
+                finally
+                {
+                    if (returnBuffer) ArrayPool<byte>.Shared.Return(serializedBuffer);
+                }
                 return;
             }
 
@@ -663,17 +664,11 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 // TryPause failed: ExecuteInline with intermediate buffer.
                 byte[] serializedBuffer;
                 int serializedSize;
+                bool returnBuffer = false;
                 if (size > 0)
                 {
-                    var cached = stream.Connection.CachedWriteBuffer;
-                    if (cached != null && cached.Length >= 5 + size)
-                        serializedBuffer = cached;
-                    else
-                    {
-                        if (cached != null) ArrayPool<byte>.Shared.Return(cached);
-                        serializedBuffer = ArrayPool<byte>.Shared.Rent(5 + size);
-                        stream.Connection.CachedWriteBuffer = serializedBuffer;
-                    }
+                    serializedBuffer = ArrayPool<byte>.Shared.Rent(5 + size);
+                    returnBuffer = true;
                     serializedBuffer[0] = 0;
                     System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
                         serializedBuffer.AsSpan(1, 4), (uint)size);
@@ -686,17 +681,24 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     serializedSize = 5;
                 }
 
-                writer.ExecuteInline(() =>
+                try
                 {
-                    if (!context.HeadersSent)
+                    writer.ExecuteInline(() =>
                     {
-                        stream.SendResponseHeadersInline(writer);
-                        context.MarkHeadersSent();
-                    }
-                    writer.WriteInline(stream.StreamId, serializedBuffer.AsSpan(0, serializedSize), 0, default);
-                    stream.SendTrailersInline(writer, context.Status.StatusCode,
-                        context.Status.Detail, context.ResponseTrailers);
-                });
+                        if (!context.HeadersSent)
+                        {
+                            stream.SendResponseHeadersInline(writer);
+                            context.MarkHeadersSent();
+                        }
+                        writer.WriteInline(stream.StreamId, serializedBuffer.AsSpan(0, serializedSize), 0, default);
+                        stream.SendTrailersInline(writer, context.Status.StatusCode,
+                            context.Status.Detail, context.ResponseTrailers);
+                    });
+                }
+                finally
+                {
+                    if (returnBuffer) ArrayPool<byte>.Shared.Return(serializedBuffer);
+                }
                 return;
             }
 
@@ -825,7 +827,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         // hold the chain as a list of InboundFrames (no codec→pool memcpy)
         // and feed a multi-segment ReadOnlySequence to MergeFrom(ROS).
         var conn = stream.Connection;
-        byte[]? assembled = conn.BorrowReadBuffer();
+        byte[]? assembled = null;
         int assembledPos = 0;
         bool usedAssembled = false;
 
@@ -1013,9 +1015,11 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         }
         finally
         {
-            // Return assembled buffer to connection cache (not ArrayPool).
+            // Compressed multi-frame path uses an ArrayPool-backed assembled
+            // buffer; return it on exit. ArrayPool's LOH bucket reuse provides
+            // cross-call buffer recycling without per-connection cache pinning.
             if (assembled != null)
-                conn.ReturnReadBuffer(assembled);
+                ArrayPool<byte>.Shared.Return(assembled);
             // Defensive: release chain frames if an exception bypassed the
             // normal release path.
             if (chainFrames != null)
@@ -1080,7 +1084,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             _maxReceiveMessageSize = cfg.MaxReceiveMessageSize;
             _compression = cfg.Compression;
             _grpcEncoding = cfg.GrpcEncoding;
-            _assembled = stream.Connection.BorrowReadBuffer();
+            _assembled = null;
         }
 
         public T Current => _current ?? throw new InvalidOperationException("No current message");
@@ -1339,9 +1343,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             }
             if (_assembled != null)
             {
-                // Return to connection cache instead of ArrayPool
-                // to avoid LOH churn across stream lifecycles.
-                _stream.Connection.ReturnReadBuffer(_assembled);
+                ArrayPool<byte>.Shared.Return(_assembled);
                 _assembled = null;
                 _assembledPos = 0;
             }

@@ -77,49 +77,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// </summary>
     internal bool SingleStreamMode { get; set; }
 
-    /// <summary>
-    /// Per-connection reusable write buffer for singleStreamMode unary responses.
-    /// Eliminates per-call ArrayPool.Rent for same-sized messages.
-    /// </summary>
-    internal byte[]? CachedWriteBuffer;
-
-    /// <summary>
-    /// Per-connection reusable read/assembly buffer for multi-frame messages.
-    /// Used by server-side ReadSingleMessageAsync and client-side
-    /// ShmControlResponseContent to avoid repeated LOH allocations
-    /// (ArrayPool.Rent/Return of 64MB+ buffers) on every Unary call.
-    /// Access via BorrowReadBuffer/ReturnReadBuffer for thread safety.
-    /// </summary>
-    private byte[]? _cachedReadBuffer;
-
-    /// <summary>
-    /// Max buffer size to cache. Set to ring capacity so assembled buffers
-    /// for messages up to ring capacity (the common case) are reused across
-    /// calls. Messages exceeding ring capacity (e.g. 256MB on a 64MB ring)
-    /// require multi-round-trip assembly and produce oversized buffers that
-    /// are returned to ArrayPool to avoid inflating idle connection RSS.
-    /// </summary>
-    private readonly int _maxCachedReadBufferSize;
-
-    /// <summary>Atomically borrows the cached read buffer (may return null).</summary>
-    internal byte[]? BorrowReadBuffer()
-        => Interlocked.Exchange(ref _cachedReadBuffer, null);
-
-    /// <summary>
-    /// Returns a buffer to the cache. If the cache already has a buffer
-    /// (concurrent return) or the buffer exceeds the size cap, the buffer
-    /// is returned to ArrayPool instead.
-    /// </summary>
-    internal void ReturnReadBuffer(byte[]? buffer)
-    {
-        if (buffer == null) return;
-        if (buffer.Length > _maxCachedReadBufferSize
-            || Interlocked.CompareExchange(ref _cachedReadBuffer, buffer, null) != null)
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
-    }
-
     // Keepalive (A73 RFC)
     private readonly ShmKeepaliveOptions _keepaliveOptions;
     private readonly ShmKeepaliveEnforcementPolicy? _enforcementPolicy;
@@ -316,11 +273,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // SendFrame → _frameWriter.Enqueue. If the writer isn't initialized
         // yet, that's a NullReferenceException.
         _frameWriter = new ShmFrameWriter(TxRing, _disposeCts);
-
-        // Cache read buffers up to maxFramePayload (cap/3) — covers
-        // single-frame messages (4MB, 16MB). Larger assembled buffers
-        // from multi-frame messages go back to ArrayPool.
-        _maxCachedReadBufferSize = (int)TxRing.Capacity;
 
         // Start background frame reader
         _frameReaderTask = FrameReaderLoopAsync();
@@ -962,14 +914,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         _frameWriter?.Dispose();
 
-        if (CachedWriteBuffer != null)
-        {
-            ArrayPool<byte>.Shared.Return(CachedWriteBuffer);
-            CachedWriteBuffer = null;
-        }
-        var cachedRead = Interlocked.Exchange(ref _cachedReadBuffer, null);
-        if (cachedRead != null) ArrayPool<byte>.Shared.Return(cachedRead);
-
         if (Volatile.Read(ref _goAwaySent) == 0)
         {
             Interlocked.Exchange(ref _goAwaySent, 1);
@@ -1015,14 +959,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
 
         _frameWriter?.Dispose();
-
-        if (CachedWriteBuffer != null)
-        {
-            ArrayPool<byte>.Shared.Return(CachedWriteBuffer);
-            CachedWriteBuffer = null;
-        }
-        var cachedRead2 = Interlocked.Exchange(ref _cachedReadBuffer, null);
-        if (cachedRead2 != null) ArrayPool<byte>.Shared.Return(cachedRead2);
 
         if (Volatile.Read(ref _goAwaySent) == 0)
         {

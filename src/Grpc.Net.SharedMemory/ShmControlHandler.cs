@@ -1079,10 +1079,11 @@ internal sealed class ShmControlResponseContent : HttpContent,
     private List<InboundFrame>? _chainFrames;
     private int _chainBodySize;          // accumulated body size (excludes LPM 5-byte header at chain start)
 
-    // Multi-frame accumulation (compressed path only): connection-level
-    // cached buffer. Borrowed from ShmConnection.CachedReadBuffer on
-    // construction, returned on Dispose to avoid LOH churn on repeated
-    // Unary calls.
+    // Multi-frame accumulation (compressed path only). Allocated lazily
+    // via ArrayPool when the compressed code path needs a contiguous
+    // buffer; returned to ArrayPool on Dispose. ArrayPool's LOH bucket
+    // recycling provides cross-call reuse without per-connection
+    // pinning.
     private byte[]? _assembled;
     private int _assembledPos;
 
@@ -1148,8 +1149,7 @@ internal sealed class ShmControlResponseContent : HttpContent,
     {
         _stream = stream;
         Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
-        // Borrow cached read buffer from connection (may be null on first call).
-        _assembled = stream.Connection.BorrowReadBuffer();
+        _assembled = null;
     }
 
     /// <summary>
@@ -1652,7 +1652,7 @@ internal sealed class ShmControlResponseContent : HttpContent,
 
             if (_assembled != null)
             {
-                _stream.Connection.ReturnReadBuffer(_assembled);
+                ArrayPool<byte>.Shared.Return(_assembled);
                 _assembled = null;
             }
             _stream.Dispose();

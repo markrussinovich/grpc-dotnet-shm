@@ -45,30 +45,45 @@ public static class FrameProtocol
     {
         if (ring.Wire == Wire.WireFormat.Http2)
         {
-            Interlocked.Increment(ref s_h2FramesRead);
+            // Lazy flag flip — the first frame on each codec marks the
+            // flag. Subsequent frames see the flag already set and the
+            // branch predictor learns to skip the write. Cost after
+            // warmup: one Volatile.Read + one always-not-taken branch.
+            if (!s_h2ReadUsed) s_h2ReadUsed = true;
             return Wire.Http2Codec.ReadFramePayload(ring, cancellationToken, zeroCopy);
         }
-        Interlocked.Increment(ref s_custom16FramesRead);
+        if (!s_c16ReadUsed) s_c16ReadUsed = true;
         return ReadFramePayloadCustom16(ring, cancellationToken, zeroCopy);
     }
 
-    private static long s_h2FramesRead;
-    private static long s_custom16FramesRead;
-    private static long s_h2FramesWritten;
-    private static long s_custom16FramesWritten;
+    // Codec-usage flags. Replaced per-frame Interlocked counters with
+    // per-process lazy bools. true is the absorbing state, so a race
+    // between two writers both setting true is benign.
+    //
+    // <c>internal</c> so that the inline-direct writer in
+    // <see cref="ShmFrameWriter"/> can flip them without a method call.
+    internal static bool s_h2ReadUsed;
+    internal static bool s_c16ReadUsed;
+    internal static bool s_h2WriteUsed;
+    internal static bool s_c16WriteUsed;
 
-    /// <summary>Test/diagnostic helper: returns total frames read by each codec.</summary>
+    /// <summary>
+    /// Test/diagnostic helper: returns 1 for each codec that has been used
+    /// since the last <see cref="ResetCodecCounters"/>, 0 otherwise.
+    /// (Per-frame counts were dropped in favour of a per-process flag
+    /// flip to keep the dispatch hot-path branch-predictable.)
+    /// </summary>
     public static (long Custom16Read, long Http2Read, long Custom16Write, long Http2Write) GetCodecCounters()
-        => (Volatile.Read(ref s_custom16FramesRead), Volatile.Read(ref s_h2FramesRead),
-            Volatile.Read(ref s_custom16FramesWritten), Volatile.Read(ref s_h2FramesWritten));
+        => (s_c16ReadUsed ? 1L : 0L, s_h2ReadUsed ? 1L : 0L,
+            s_c16WriteUsed ? 1L : 0L, s_h2WriteUsed ? 1L : 0L);
 
-    /// <summary>Resets the codec counters.</summary>
+    /// <summary>Resets the codec-usage flags.</summary>
     public static void ResetCodecCounters()
     {
-        Volatile.Write(ref s_h2FramesRead, 0);
-        Volatile.Write(ref s_custom16FramesRead, 0);
-        Volatile.Write(ref s_h2FramesWritten, 0);
-        Volatile.Write(ref s_custom16FramesWritten, 0);
+        s_h2ReadUsed = false;
+        s_c16ReadUsed = false;
+        s_h2WriteUsed = false;
+        s_c16WriteUsed = false;
     }
 
     /// <summary>
@@ -138,42 +153,54 @@ public static class FrameProtocol
             var totalBytes = ShmConstants.FrameHeaderSize + payloadLength;
             var contiguous = payloadReservation.Second.IsEmpty;
 
-            // ===== Hot path: single-frame ZC =====
+            // ===== Hot path: single-frame, no chain in flight, no copy-mode in progress =====
             //
-            // The vast majority of frames (small / mid messages) are
-            // single-frame final messages. Short-circuit those before
-            // touching any chain-state fields. IsSpeculativeZcEligible
-            // includes the at-most-one-ZC FIFO guard
-            // (SpeculativeReservedBytes==0), back-pressure, ring-size,
-            // and adaptive minimum-payload checks; it is the single
-            // source of truth for ZC eligibility on this side.
+            // Covers the dominant case: every single-frame ping-pong / unary
+            // RPC. Reads only IsChainOpen and ChainCopyMode (Volatile.Reads
+            // the slow path would have read anyway, so this is no extra cost
+            // on cold path) and short-circuits BOTH the ZC happy path and the
+            // sub-threshold copy fallback. The slow path's chain-decision
+            // tree is bypassed entirely here.
             //
-            // We still check IsChainOpen to skip this fast path while a
-            // multi-frame chain is in flight (its frames have isMore=true
-            // on continuations and isMore=false only on the FINAL chain
-            // frame, which must run through the chain logic to call
-            // CloseZcChain). That single Volatile.Read is the only
-            // chain-state cost on the hot path.
-            if (zeroCopy
-                && !isMore
-                && contiguous
-                && !ring.IsChainOpen
-                && ring.IsSpeculativeZcEligible(payloadLength, contiguous: true))
+            // Falls through to the slow path when:
+            //   - isMore=true (multi-frame continuation)
+            //   - IsChainOpen=true (the !isMore frame is the FINAL frame of
+            //     an active chain ZC, which must call CloseZcChain)
+            //   - ChainCopyMode=true (the !isMore frame is the FINAL frame
+            //     of a copy-mode multi-frame message, which must reset the
+            //     ChainCopyMode flag)
+            if (!isMore && !ring.IsChainOpen && !ring.ChainCopyMode)
             {
-                // Fused single-frame ZC: BeginSingleFrameZcCommit sets
-                // _deferredReadIdxTarget to its post-frame value directly,
-                // saving 1 Volatile.Read + 1 Volatile.Write vs the
-                // BeginZc+CommitReadRaw two-step. Net per-frame overhead
-                // drops from ~9 atomic ops to ~6 (matches master + 1
-                // re-snapshot in EndZc that's required for cross-process
-                // safety).
-                ring.BeginSingleFrameZcCommit(baseCommitReadIdx, totalBytes);
-                Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
-                return (header, FramePayload.FromRingMemorySpeculative(
-                    payloadReservation.First.Slice(0, payloadLength), ring, totalBytes));
+                if (zeroCopy && contiguous
+                    && ring.IsSpeculativeZcEligible(payloadLength, contiguous: true))
+                {
+                    // Fused single-frame ZC: BeginSingleFrameZcCommit sets
+                    // _deferredReadIdxTarget to its post-frame value
+                    // directly, saving 1 Volatile.Read + 1 Volatile.Write
+                    // vs the BeginZc + CommitReadRaw two-step.
+                    ring.BeginSingleFrameZcCommit(baseCommitReadIdx, totalBytes);
+                    Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
+                    return (header, FramePayload.FromRingMemorySpeculative(
+                        payloadReservation.First.Slice(0, payloadLength), ring, totalBytes));
+                }
+
+                // Single-frame copy: sub-ZC-threshold, ZC disabled, or
+                // wrap. CommitReadRaw advances the shared ReadIdx
+                // immediately (no chain anchor in flight under this gate).
+                var pooled = ArrayPool<byte>.Shared.Rent(payloadLength);
+                if (contiguous)
+                {
+                    payloadReservation.First.Span.Slice(0, payloadLength).CopyTo(pooled);
+                }
+                else
+                {
+                    CopyFromReservation(payloadReservation, pooled.AsSpan(0, payloadLength));
+                }
+                ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+                return (header, FramePayload.FromPooled(pooled, payloadLength));
             }
 
-            // ===== Slow path: multi-frame chain or copy =====
+            // ===== Slow path: multi-frame chain, copy-mode continuation, or chain-final =====
             //
             // Modes for a multi-frame logical message:
             //
@@ -370,11 +397,11 @@ public static class FrameProtocol
     {
         if (ring.Wire == Wire.WireFormat.Http2)
         {
-            Interlocked.Increment(ref s_h2FramesWritten);
+            if (!s_h2WriteUsed) s_h2WriteUsed = true;
             Wire.Http2Codec.WriteFrame(ring, header, payload1, payload2, cancellationToken);
             return;
         }
-        Interlocked.Increment(ref s_custom16FramesWritten);
+        if (!s_c16WriteUsed) s_c16WriteUsed = true;
         WriteFrameCore(ring, header, payload1, payload2, cancellationToken);
     }
 
