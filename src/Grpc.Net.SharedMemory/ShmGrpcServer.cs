@@ -1236,13 +1236,28 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                             startSegment: _chainHead!, startIndex: 5,
                             endSegment: _chainTail, endIndex: _chainTail.Memory.Length);
 
-                        var msg = new T();
-                        Google.Protobuf.MessageExtensions.MergeFrom(msg, ros);
+                        // try/finally so a malformed-protobuf
+                        // <see cref="Google.Protobuf.InvalidProtocolBufferException"/>
+                        // (or any other parser failure) does not strand the
+                        // accumulated chain frames in <c>_chainFrames</c>.
+                        // Without this, the next call into ProcessFrame
+                        // would see <c>_chainHead != null</c> and silently
+                        // append the next message's frames onto the stale
+                        // chain (corrupting subsequent parses) and eventually
+                        // leak all those held pool buffers via DisposeAsync.
+                        T msg;
+                        try
+                        {
+                            msg = new T();
+                            Google.Protobuf.MessageExtensions.MergeFrom(msg, ros);
+                        }
+                        finally
+                        {
+                            ReleaseChain(_chainFrames);
+                            _chainFrames = null;
+                            _chainHead = _chainTail = null;
+                        }
                         _current = msg;
-
-                        ReleaseChain(_chainFrames);
-                        _chainFrames = null;
-                        _chainHead = _chainTail = null;
                         _previousFrame = default;
 
                         var eosChain = (frame.Flags & MessageFlags.EndStream) != 0;
