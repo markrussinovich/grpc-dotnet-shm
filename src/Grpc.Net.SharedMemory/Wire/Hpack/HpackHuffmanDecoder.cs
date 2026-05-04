@@ -82,6 +82,14 @@ internal static class HpackHuffmanDecoder
         var written = 0;
         var current = 0;
 
+        // Track bits consumed since the last symbol completion (current==0).
+        // RFC 7541 §5.2 mandates that any trailing bits at end-of-input must
+        // be a strict prefix of the EOS symbol (all 1s, ≤ 7 bits). We
+        // accumulate these so the end-of-input check below can validate them
+        // without needing to reach back into <paramref name="source"/>.
+        var partialBits = 0;
+        var partialAllOnes = true;
+
         for (var i = 0; i < source.Length; i++)
         {
             var b = source[i];
@@ -102,6 +110,8 @@ internal static class HpackHuffmanDecoder
                     }
                     destination[written++] = (byte)symbol;
                     current = 0;
+                    partialBits = 0;
+                    partialAllOnes = true;
                 }
                 else if (next == 0)
                 {
@@ -132,16 +142,29 @@ internal static class HpackHuffmanDecoder
                 else
                 {
                     current = next;
+                    partialBits++;
+                    if (dir == 0)
+                    {
+                        partialAllOnes = false;
+                    }
                 }
             }
         }
 
+        // End-of-input check (RFC 7541 §5.2). If the bit-by-bit walk ended
+        // mid-symbol (`current != 0`), the partial path must be padding —
+        // i.e. a prefix of the EOS symbol (all 1s) of length < 8 bits.
+        // Without this check, a peer could end its Huffman stream at any
+        // mid-symbol point on a 0-bit transition without the decoder
+        // noticing, allowing trailing bytes to be treated as a covert
+        // channel or to silently truncate the intended symbol stream.
         if (current != 0)
         {
-            // Reached end of input mid-symbol. Allowed only if the partial path
-            // is a prefix of the EOS code (all 1s) AND fewer than 8 bits remained
-            // (RFC 7541 §5.2). The bit-by-bit loop guarantees this when current
-            // is reached by all-1 transitions, so accept silently here.
+            if (partialBits >= 8 || !partialAllOnes)
+            {
+                throw new InvalidDataException(
+                    "HPACK Huffman: input ended mid-symbol with non-padding bits");
+            }
         }
 
         return written;

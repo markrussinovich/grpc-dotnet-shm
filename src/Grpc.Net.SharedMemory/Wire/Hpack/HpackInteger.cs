@@ -78,16 +78,32 @@ internal static class HpackInteger
         {
             var b = source[i];
             bytesRead++;
-            value += (uint)(b & 0x7F) << shift;
+            // Detect overflow into the high bits BEFORE accumulating: any
+            // shift beyond 32 bits is overflow by definition (RFC 7541
+            // §5.1 limits encoded integers to 2^32 - 1 minus 2^prefixBits;
+            // peers that exceed this are malformed). The shift==32 check
+            // also catches the next-iteration overflow case where the
+            // running shift advances past 32 because the previous loop
+            // iteration set the high-bit on b.
+            if (shift > 32)
+            {
+                throw new InvalidDataException("HPACK integer overflow");
+            }
+            var contribution = (ulong)(b & 0x7F) << shift;
+            // Use 64-bit arithmetic to detect the final-iteration overflow
+            // case: prefixBits prefix + accumulated low bits + this byte's
+            // 7 bits in their proper position must still fit in uint.
+            var newValue = (ulong)value + contribution;
+            if (newValue > uint.MaxValue)
+            {
+                throw new InvalidDataException("HPACK integer overflow");
+            }
+            value = (uint)newValue;
             if ((b & 0x80) == 0)
             {
                 return value;
             }
             shift += 7;
-            if (shift >= 32)
-            {
-                throw new InvalidDataException("HPACK integer overflow");
-            }
         }
 
         throw new InvalidDataException("HPACK integer truncated");

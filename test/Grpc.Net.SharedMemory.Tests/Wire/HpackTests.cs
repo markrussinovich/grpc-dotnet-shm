@@ -107,6 +107,95 @@ public class HpackTests
         Assert.That(HpackStaticTable.FindExact("user-agent", "anything"), Is.EqualTo(0));
         Assert.That(HpackStaticTable.FindName("user-agent"), Is.EqualTo(58));
     }
+
+    [Test]
+    public void IntegerDecoder_RejectsOverflow_AllContinuationBytesMaxed()
+    {
+        // RFC 7541 §5.1: encoded integers must fit in uint32.
+        //
+        // Construct a sequence whose final byte clears the continuation
+        // bit but causes the running uint accumulator to wrap. The
+        // pre-fix decoder used native uint arithmetic without overflow
+        // detection on the FINAL accumulation step (only the next-byte
+        // shift counter could throw), so it returned a silently-wrapped
+        // small value instead of erroring.
+        //
+        // prefix = 7-bit, max = 127 (signals continuation).
+        // bytes 0..3 (each 0xFF):
+        //   value += 0x7F << 0 / 7 / 14 / 21
+        //   accumulated = 127 + 0x7F + 0x3F80 + 0x1FC000 + 0xFE000000
+        //               = 0xFE20407F (just under 4 GiB)
+        // byte 4 = 0x10:
+        //   high bit clear → loop terminates here (no shift bump → old
+        //   code's `shift >= 32` check never fires)
+        //   contribution = 0x10 << 28 = 0x1_00000000 → uint addition
+        //   silently wraps; value finally returned = 0xFE20407F (wrong).
+        //   Correct behaviour: throw InvalidDataException.
+        var source = new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0x10 };
+        Assert.Throws<InvalidDataException>(() =>
+        {
+            HpackInteger.Decode(firstByte: 0x7F, prefixBits: 7, source, out _);
+        });
+    }
+
+    [Test]
+    public void IntegerDecoder_RejectsOverflow_LongContinuation()
+    {
+        // Pathological: 8 continuation bytes — far beyond the 32-bit
+        // uint range. Decoder must throw before completing the loop.
+        var source = new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+        Assert.Throws<InvalidDataException>(() =>
+        {
+            HpackInteger.Decode(firstByte: 0x7F, prefixBits: 7, source, out _);
+        });
+    }
+
+    [Test]
+    public void HuffmanDecoder_RejectsEndOfInputMidSymbolWithNonOnesPrefix()
+    {
+        // Construct a valid Huffman prefix of an internal trie node whose
+        // path is NOT all-1s, then truncate the stream there. RFC 7541 §5.2
+        // requires trailing bits at end-of-input to be a strict prefix of
+        // the EOS code (all 1s). A non-all-ones partial path means the
+        // peer truncated mid-symbol on a non-padding boundary.
+        //
+        // Symbol 'a' = 0b00011 (5 bits). Encode just one byte with the
+        // top 5 bits = 00011 and the trailing 3 bits = 0 (padding zeros).
+        // Decoder should successfully read 'a' from the first 5 bits, then
+        // see end-of-input with 3 remaining 0-bits. Since 0-bit padding
+        // does not match the EOS-prefix all-ones requirement, the
+        // remaining bits route to the `next == 0` branch first which
+        // catches the invalid padding. To test the END-OF-BUFFER branch
+        // specifically, encode a partial code that ends ON a 0-bit
+        // transition INSIDE the trie:
+        //   Symbol 'b' = 0b100011 (6 bits). Encode just 4 bits (1000),
+        //   with trailing 4 bits also 0. 1000-prefix walks the trie to
+        //   an internal node along a 0-bit, so end-of-byte leaves
+        //   `current != 0` and `partialAllOnes == false`.
+        var encoded = new byte[] { 0b1000_0000 };
+        var dst = new byte[16];
+        Assert.Throws<InvalidDataException>(() =>
+            HpackHuffmanDecoder.Decode(encoded, dst));
+    }
+
+    [Test]
+    public void HuffmanDecoder_AcceptsValidEosPaddingAtEnd()
+    {
+        // Sanity: encoding "www.example.com" (Appendix C.4 of RFC 7541)
+        // ends with 6 padding bits = 111111 (prefix of EOS code = 30 ones).
+        // This case is covered by HuffmanRoundTrip_ViaKnownVector_DecodesCorrectly
+        // already; replicate here as a regression guard against the
+        // tightened end-of-input check accidentally rejecting valid
+        // EOS-prefix padding.
+        var encoded = new byte[]
+        {
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        };
+        var dst = new byte[64];
+        var written = HpackHuffmanDecoder.Decode(encoded, dst);
+        Assert.That(System.Text.Encoding.ASCII.GetString(dst, 0, written),
+            Is.EqualTo("www.example.com"));
+    }
 }
 
 [TestFixture]

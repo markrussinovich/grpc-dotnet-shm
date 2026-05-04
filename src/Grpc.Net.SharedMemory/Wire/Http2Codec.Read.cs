@@ -627,19 +627,20 @@ internal static partial class Http2Codec
         }
         ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
 
-        // Send ACK back asynchronously? On the read thread we can't write
-        // (writes go through ShmFrameWriter). Settings ACK is best-effort:
-        // FrameWriterLoop is responsible for emitting the initial SETTINGS;
-        // for the ACK we issue a direct ring write here since SETTINGS frames
-        // are tiny (<256 bytes) and never compete with handler frames.
-        try
-        {
-            WriteSettings(ring, ack: true, ct);
-        }
-        catch
-        {
-            // Best-effort.
-        }
+        // SETTINGS ACK is intentionally NOT emitted from this read path.
+        //
+        // The <paramref name="ring"/> here is the connection's RxRing (the
+        // ring this side reads from); the peer is its sole writer. Issuing
+        // <see cref="WriteSettings"/> on it would violate the SPSC ring
+        // invariant and corrupt the peer's in-flight writes.
+        //
+        // The transport's wire-format negotiation happens via the control
+        // segment (see <c>ShmControlHandler.HandleConnectAsync</c>); peers
+        // do not gate behaviour on receiving an HTTP/2 SETTINGS ACK over
+        // the data segment, so dropping the ACK here is safe. If a future
+        // peer does require the ACK, route the write through this side's
+        // <c>ShmFrameWriter</c> on the matching TxRing (would need to map
+        // RxRing → ShmConnection); leaving as a no-op until needed.
     }
 
     private static (FrameHeader Header, FramePayload Payload) ReadPingFrame(
