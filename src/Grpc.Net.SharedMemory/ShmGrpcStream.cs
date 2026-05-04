@@ -199,6 +199,48 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         };
 
         var (payload, payloadLength) = _requestHeaders.Encode();
+
+        // Single-stream-mode inline-write fast path. When the connection
+        // negotiated single-stream mode and only one stream is active,
+        // bypass the WriterLoop queue and write Headers directly to the
+        // ring under TryPauseWriterLoop.
+        //
+        // This is critical for correctness, not just perf: client unary
+        // sends Headers, then (fire-and-forget) writes the body Message
+        // via WriteInlineDirectMultiFrame which is also a TryPauseWriterLoop
+        // inline write. If Headers went through the queue while Message
+        // went inline, the two write paths race against each other on
+        // the SPSC ring and produce a "Headers not delivered before
+        // Message" failure mode (~1/15 stress runs on Intel Linux).
+        // Routing Headers through the same TryPause path serialises the
+        // sends through `_inlineWriterActive` CAS; both writes go to the
+        // ring in caller-thread order, no race.
+        //
+        // Falls back to the queued path when:
+        //   * not in single-stream mode (multi-stream pipelining wants
+        //     Headers in the WriterLoop's batch), or
+        //   * TryPauseWriterLoop fails (WriterLoop busy or another inline
+        //     writer holds the CAS); the queued path is correct (single
+        //     writer = WriterLoop) and Just Slower.
+        if (_connection.SingleStreamMode && _connection.ActiveStreamCount <= 1)
+        {
+            var writer = _connection.FrameWriter;
+            if (writer != null && writer.TryPauseWriterLoop())
+            {
+                try
+                {
+                    writer.WriteInlineFrame(FrameType.Headers, StreamId,
+                        HeadersFlags.Initial, payload.AsSpan(0, payloadLength), default);
+                    return Task.CompletedTask;
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(payload);
+                    writer.ResumeWriterLoop();
+                }
+            }
+        }
+
         if (payloadLength <= 512)
         {
             Task task;

@@ -390,23 +390,20 @@ public sealed class ShmControlHandler : HttpMessageHandler
                         if (_options.SingleStreamMode)
                         {
                             conn.ZeroCopyRead = true;
+                            // SingleStreamMode propagates to TxRing/RxRing
+                            // (see ShmConnection.SingleStreamMode setter), so
+                            // the chain-ZC budget on the data rings reflects
+                            // the negotiated mode and the client-side inline-
+                            // write fast paths are unlocked.
+                            //
+                            // Correctness depends on `SendRequestHeadersAsync`
+                            // taking the TryPauseWriterLoop inline-write path
+                            // when this flag is set so Headers, Message, and
+                            // HalfClose all serialise through the same inline
+                            // writer (no concurrent WriterLoop dequeue racing
+                            // against an inline writer on the same ring).
+                            conn.SingleStreamMode = true;
                             conn.FrameWriter?.EnableSingleStreamMode();
-                            // NOTE: deliberately not setting `conn.SingleStreamMode = true` here
-                            // even though the negotiation succeeded. The
-                            // `Connection.SingleStreamMode` flag gates several
-                            // client-side inline-write fast paths
-                            // (`WriteSerializedMessageAsync` line 866-style and
-                            // `SendResult` line 990-style) which were only
-                            // ever exercised on the server side until this
-                            // PR. Enabling them on the client surfaces a
-                            // frame-ordering issue (HEADERS/MESSAGE/HALFCLOSE
-                            // sequencing under TryPauseWriterLoop) that needs
-                            // a separate investigation. For now, leave the
-                            // flag off on the client so the client uses the
-                            // queued-write path it has always used; this
-                            // matches pre-PR behaviour and avoids the
-                            // "No request message received" regression
-                            // observed in benchmark runs at 1 B unary.
                         }
                         return conn;
                     }
@@ -869,6 +866,15 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         // Fast path: for protobuf IMessage types in singleStreamMode,
         // serialize directly into the ring buffer via
         // WriteInlineDirectMultiFrame (zero intermediate buffer).
+        //
+        // Note: NO `size > 0` guard. Empty messages (e.g., probe call
+        // with `SimpleRequest{ResponseSize=0}`) must also take this
+        // inline path so that Message and the subsequent HALFCLOSE
+        // (also TryPause inline) serialise through the same
+        // `_inlineWriterActive` CAS. If the empty message fell through
+        // to the queued path while HALFCLOSE went inline, HALFCLOSE
+        // would reach the ring before the queued empty MESSAGE
+        // (race observed at probe time on Intel Linux).
         if (_shmStream.Connection.SingleStreamMode
             && _shmStream.Connection.ActiveStreamCount <= 1
             && message is Google.Protobuf.IMessage protoMsg)
@@ -877,7 +883,7 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
             if (writer != null)
             {
                 var size = protoMsg.CalculateSize();
-                if (size > 0 && writer.TryPauseWriterLoop())
+                if (writer.TryPauseWriterLoop())
                 {
                     try
                     {
@@ -979,18 +985,36 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 
         internal Task SendResult(CancellationToken cancellationToken)
         {
+            // Empty-payload shortcut: when the protobuf serialised to nothing
+            // (e.g., `SimpleRequest{ResponseSize=0}`), we still need to ship
+            // the 5-byte gRPC LPM header. Under SingleStreamMode that empty
+            // header MUST take the same TryPauseWriterLoop inline path as
+            // the subsequent HALFCLOSE (see SendHalfCloseAsync); otherwise
+            // an inline HALFCLOSE write would beat a queued empty MESSAGE
+            // to the ring and the server would see HALFCLOSE first.
+            //
+            // Route through `_buffer` either way: if `_buffer` is null,
+            // pre-fill it with the 5-byte empty LPM header and let the
+            // single inline path below handle it.
             if (_buffer == null || _position <= 5)
             {
-                // Empty protobuf message — send cached 5-byte gRPC LPM header.
-                return _stream.SendMessageAsync(EmptyGrpcLpm, cancellationToken);
+                if (_buffer == null)
+                {
+                    _buffer = ArrayPool<byte>.Shared.Rent(5);
+                }
+                // EmptyGrpcLpm = 5 zero bytes; copy into the buffer's first 5 bytes.
+                EmptyGrpcLpm.AsSpan().CopyTo(_buffer.AsSpan(0, 5));
+                _position = 5;
             }
-
-            // Write the 5-byte gRPC length-prefix header at offset 0.
-            // Protobuf payload starts at offset 5, so payload length = _position - 5.
-            var protoLen = _position - 5;
-            _buffer[0] = 0; // no compression
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
-                _buffer.AsSpan(1, 4), (uint)protoLen);
+            else
+            {
+                // Write the 5-byte gRPC length-prefix header at offset 0.
+                // Protobuf payload starts at offset 5, so payload length = _position - 5.
+                var protoLen = _position - 5;
+                _buffer[0] = 0; // no compression
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                    _buffer.AsSpan(1, 4), (uint)protoLen);
+            }
 
             // In singleStreamMode with one active stream, bypass the queue.
             // - ≤ ringCapacity: TryPauseWriterLoop or ExecuteInline
