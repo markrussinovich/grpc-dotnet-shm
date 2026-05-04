@@ -60,16 +60,25 @@ internal static partial class Http2Codec
         public uint LastStreamId;
         public LpmAccumulator? LastAcc;
 
-        // Synthetic-frame queue (for trailers-only HEADERS, RFC G3 §"Trailers-only").
-        // A single H2 HEADERS+END_STREAM that carries both response status
-        // pseudo-headers and gRPC trailing fields must surface to the upper
-        // layer as TWO logical frames — Headers (without END_STREAM) followed
-        // by Trailers (with END_STREAM). The reader emits the Headers half
-        // immediately and stashes the Trailers half here; the next call to
-        // <see cref="ReadFramePayloadInternal"/> returns the stash before
-        // touching the ring.
-        public FrameHeader? PendingFrameHeader;
-        public FramePayload PendingFramePayload;
+        // Synthetic-frame queue: a single H2 wire frame can produce more
+        // than one logical internal frame. Two scenarios both depend on
+        // this:
+        //
+        //   1) Trailers-only HEADERS (gRFC G3): one HEADERS+END_STREAM
+        //      surfaces as Headers + Trailers (see EmitDecodedHeaders).
+        //
+        //   2) DATA-frame coalescing: a peer-side optimisation (or a
+        //      different gRPC implementation) may pack two or more
+        //      complete gRPC LPM messages into one H2 DATA frame, which
+        //      RFC 7540 §6.1 explicitly permits (DATA carries an opaque
+        //      byte stream; LPM message boundaries are not aligned with
+        //      H2 frame boundaries). The reader emits the first completed
+        //      LPM and stashes the remaining ones here.
+        //
+        // The queue is drained at the head of every ReadFramePayloadInternal
+        // call before the ring is touched, preserving FIFO order between
+        // synthetic frames and any subsequent wire frames.
+        public readonly Queue<(FrameHeader Header, FramePayload Payload)> PendingFrames = new();
     }
 
     /// <summary>Accumulates a single in-progress gRPC LPM message across multiple DATA frames.</summary>
@@ -165,19 +174,16 @@ internal static partial class Http2Codec
         var state = GetState(ring);
         Span<byte> hb = stackalloc byte[Http2FrameHeader.Size];
 
-        // Drain any frame the previous read split off (currently only used
-        // for trailers-only HEADERS, where one H2 frame surfaces as two
-        // internal frames). Pulling the stash before touching the ring keeps
-        // the FIFO invariant intact: the Trailers we stashed last call must
-        // be observed by the upper layer before any subsequent ring frame
-        // (which on a typical post-trailers-only stream will be RST_STREAM
-        // or simply nothing).
-        if (state.PendingFrameHeader is { } pendingHeader)
+        // Drain any synthetic frames the previous read split off (used for
+        // trailers-only HEADERS, where one H2 frame surfaces as two
+        // internal frames, and for DATA-frame coalescing, where one H2
+        // DATA carries multiple complete LPM messages). Pulling the queue
+        // before touching the ring keeps the FIFO invariant intact: the
+        // stash entries we deferred last call must be observed by the
+        // upper layer before any subsequent ring frame.
+        if (state.PendingFrames.Count > 0)
         {
-            var pendingPayload = state.PendingFramePayload;
-            state.PendingFrameHeader = null;
-            state.PendingFramePayload = default;
-            return (pendingHeader, pendingPayload);
+            return state.PendingFrames.Dequeue();
         }
 
         while (true)
@@ -378,32 +384,133 @@ internal static partial class Http2Codec
 
         try
         {
-            // Feed body into the per-stream accumulator. If the body completes
-            // a message, we return it. We don't surface multi-message DATA
-            // frames in one return; only the first completed message per call.
-            // (Our writer never packs >1 message per DATA frame, so this is
-            // safe in practice.)
+            // Feed body into the per-stream accumulator. RFC 7540 §6.1
+            // permits an H2 DATA frame to carry an arbitrary slice of the
+            // stream's byte sequence: that slice MAY contain a partial
+            // LPM, exactly one complete LPM, or multiple complete LPMs
+            // back-to-back (writer-side coalescing — common when peers
+            // batch small messages, and explicitly allowed by gRFC G3).
+            //
+            // We loop, consuming as much of <c>bodyBytes</c> as
+            // <see cref="FeedAccumulator"/> can. Each completion produces
+            // one logical internal Message frame. The first completion is
+            // returned from this call; subsequent completions go into
+            // <see cref="Http2DecoderState.PendingFrames"/>.
+            //
+            // EndStream semantics: the H2 frame's END_STREAM flag applies
+            // logically to whichever Message is the LAST one this DATA
+            // frame produces. To stamp EndStream correctly without
+            // patching a queued entry after the fact, we hold the most
+            // recent post-first completion in <c>bufferedTail</c> and
+            // only enqueue it when we see another completion overtake
+            // it. After the loop the still-buffered tail (if any) is the
+            // true terminal Message and gets stamped with EndStream.
+            //
+            // Allocation profile on the dominant single-LPM-per-DATA
+            // path (typical multi-frame chunked message, or a coalescing
+            // peer that happened to land one LPM per frame): zero heap
+            // allocations beyond the FramePayload itself. Coalesced
+            // 2-LPM DATA: one Queue.Enqueue (the Queue itself is
+            // amortised; lazily grown only when first used). 3+ LPMs:
+            // one Enqueue per extra completion. No List or array on the
+            // common paths.
             var acc = GetOrAddAcc(state, streamId);
-            var feedResult = FeedAccumulator(acc, bodyBytes);
+            FramePayload? firstCompleted = null;
+            FramePayload? bufferedTail = null;
+            var remaining = bodyBytes;
+
+            while (remaining.Length > 0)
+            {
+                var (completed, consumed) = FeedAccumulator(acc, remaining);
+                if (consumed == 0)
+                {
+                    // Defensive: FeedAccumulator made no progress on a
+                    // non-empty input. Should not happen given the logic
+                    // above (Phase 1/2 always consumes at least one byte
+                    // when src is non-empty), but break to avoid infinite
+                    // loop in case of future regressions.
+                    break;
+                }
+                remaining = remaining.Slice(consumed);
+
+                if (completed is { } payload)
+                {
+                    if (firstCompleted == null)
+                    {
+                        firstCompleted = payload;
+                    }
+                    else if (bufferedTail == null)
+                    {
+                        bufferedTail = payload;
+                    }
+                    else
+                    {
+                        // bufferedTail is no longer the terminal Message —
+                        // a newer completion has arrived. Flush the old
+                        // tail to the queue WITHOUT EndStream (that flag
+                        // belongs to whoever ends up final) and adopt the
+                        // new payload as the new buffered tail.
+                        state.PendingFrames.Enqueue((
+                            new FrameHeader(FrameType.Message, streamId,
+                                (uint)bufferedTail.Value.Length, 0),
+                            bufferedTail.Value));
+                        bufferedTail = payload;
+                    }
+                }
+            }
 
             // Commit the ring read regardless — we've materialised everything we need.
             ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
 
-            if (feedResult is { } completedPayload)
+            if (firstCompleted is { } first)
             {
-                byte msgFlags = endStream ? MessageFlags.EndStream : (byte)0;
-                var hdr = new FrameHeader(FrameType.Message, streamId, (uint)completedPayload.Length, msgFlags);
+                // Stamp EndStream on the LAST surfaced Message when the
+                // wire frame's H2 END_STREAM was set; everything before
+                // it gets plain Message flags. This is the canonical
+                // gRPC mapping: H2 END_STREAM marks the END of the
+                // stream's byte sequence, and the LAST LPM message in
+                // that sequence is the one carrying call termination
+                // semantics.
+                if (bufferedTail is { } tail)
+                {
+                    // Two or more completions: <c>first</c> goes back as
+                    // the call's response, <c>tail</c> is the genuine
+                    // terminal Message and rides the EndStream flag.
+                    var tailFlags = endStream ? MessageFlags.EndStream : (byte)0;
+                    state.PendingFrames.Enqueue((
+                        new FrameHeader(FrameType.Message, streamId,
+                            (uint)tail.Length, tailFlags),
+                        tail));
+                    var firstHdr = new FrameHeader(FrameType.Message, streamId,
+                        (uint)first.Length, 0);
+
+                    if (endStream)
+                    {
+                        state.StreamsWithInitialHeaders.Remove(streamId);
+                        if (RemoveAcc(state, streamId, out var doneAcc))
+                        {
+                            doneAcc!.Reset();
+                        }
+                    }
+                    return (firstHdr, first);
+                }
+
+                // Single completion (the dominant case for our own
+                // writer and for most multi-frame chunked paths): stamp
+                // EndStream directly onto <c>first</c>. Zero heap
+                // allocations beyond the FramePayload itself.
+                var msgFlags = endStream ? MessageFlags.EndStream : (byte)0;
+                var hdr = new FrameHeader(FrameType.Message, streamId,
+                    (uint)first.Length, msgFlags);
                 if (endStream)
                 {
                     state.StreamsWithInitialHeaders.Remove(streamId);
-                    // FeedAccumulator already nulled out acc.Buffer on completion;
-                    // Reset() here is defensive in case future changes leave state.
                     if (RemoveAcc(state, streamId, out var doneAcc))
                     {
                         doneAcc!.Reset();
                     }
                 }
-                return (hdr, completedPayload);
+                return (hdr, first);
             }
 
             // No complete message yet. If END_STREAM was set without finishing
@@ -430,13 +537,26 @@ internal static partial class Http2Codec
     }
 
     /// <summary>
-    /// Copies <paramref name="body"/> into <paramref name="acc"/> and, if a
-    /// complete LPM message was produced, returns it as a pooled
-    /// <see cref="FramePayload"/>; otherwise <c>null</c>.
+    /// Copies as many bytes from <paramref name="body"/> into <paramref name="acc"/>
+    /// as needed to either (a) complete one in-progress LPM message or
+    /// (b) reach end-of-input. Returns the completed message (or
+    /// <c>null</c> if more bytes are still needed) and the number of
+    /// bytes consumed from <paramref name="body"/>.
     /// </summary>
-    private static FramePayload? FeedAccumulator(LpmAccumulator acc, ReadOnlySpan<byte> body)
+    /// <remarks>
+    /// One call advances the accumulator by AT MOST one LPM message. If
+    /// <paramref name="body"/> contains additional LPM bytes after the
+    /// first completion, the caller is expected to invoke this method
+    /// again with the residual span (see
+    /// <see cref="TryReadDataFrame"/>'s consumption loop). This split
+    /// keeps the per-LPM logic simple and lets the caller decide how to
+    /// surface multiple completed messages (head returned to the upper
+    /// layer; rest stashed in <see cref="Http2DecoderState.PendingFrames"/>).
+    /// </remarks>
+    private static (FramePayload? Completed, int Consumed) FeedAccumulator(LpmAccumulator acc, ReadOnlySpan<byte> body)
     {
         var src = body;
+        var consumed = 0;
 
         // Phase 1: complete the 5-byte LPM header if necessary.
         if (acc.HeaderBytesSeen < 5)
@@ -446,10 +566,11 @@ internal static partial class Http2Codec
             src.Slice(0, take).CopyTo(acc.HeaderBuf.AsSpan(acc.HeaderBytesSeen));
             acc.HeaderBytesSeen += take;
             src = src.Slice(take);
+            consumed += take;
 
             if (acc.HeaderBytesSeen < 5)
             {
-                return null; // header still partial
+                return (null, consumed); // header still partial
             }
 
             var bodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
@@ -474,22 +595,17 @@ internal static partial class Http2Codec
             acc.Pos = 5;
         }
 
-        // Phase 2: copy body bytes into accumulator buffer.
+        // Phase 2: copy body bytes into accumulator buffer. Stop at this
+        // LPM's expected total — any leftover belongs to the next LPM
+        // and is surfaced via <c>consumed</c> so the caller can re-invoke
+        // with the residual span.
         if (src.Length > 0)
         {
             var room = acc.ExpectedTotal - acc.Pos;
             var take = Math.Min(room, src.Length);
             src.Slice(0, take).CopyTo(acc.Buffer.AsSpan(acc.Pos));
             acc.Pos += take;
-            // Note: if take < src.Length, the DATA frame contains the start of a
-            // *second* LPM message. Our writer never produces this, and the upper
-            // layer can't consume two messages from one ReadFramePayload call,
-            // so reject as a protocol error.
-            if (take < src.Length)
-            {
-                throw new InvalidDataException(
-                    "H2 DATA frame contains multiple gRPC LPM messages — not supported by this transport (writer must emit one message per DATA stream segment)");
-            }
+            consumed += take;
         }
 
         if (acc.Pos == acc.ExpectedTotal)
@@ -501,9 +617,9 @@ internal static partial class Http2Codec
             acc.Pos = 0;
             acc.ExpectedTotal = 0;
             acc.HeaderBytesSeen = 0;
-            return FramePayload.FromPooled(buf, len);
+            return (FramePayload.FromPooled(buf, len), consumed);
         }
-        return null;
+        return (null, consumed);
     }
 
     private static (FrameHeader Header, FramePayload Payload) ReadHeadersFrame(
@@ -609,9 +725,9 @@ internal static partial class Http2Codec
                 var (hPayload, hLen) = headersV1.Encode();
                 var (tPayload, tLen) = trailersV1.Encode();
 
-                state.PendingFrameHeader = new FrameHeader(
-                    FrameType.Trailers, streamId, (uint)tLen, TrailersFlags.EndStream);
-                state.PendingFramePayload = FramePayload.FromPooled(tPayload, tLen);
+                state.PendingFrames.Enqueue((
+                    new FrameHeader(FrameType.Trailers, streamId, (uint)tLen, TrailersFlags.EndStream),
+                    FramePayload.FromPooled(tPayload, tLen)));
 
                 // No persistent stream state to retain: trailers-only means
                 // the stream ended in this single HEADERS frame; any further
@@ -671,7 +787,30 @@ internal static partial class Http2Codec
     {
         if ((h2Flags & Http2Flags.Ack) != 0)
         {
-            // SETTINGS ACK has no payload.
+            // RFC 7540 §6.5.3 / RFC 9113 §6.5.3: a SETTINGS frame with the
+            // ACK flag set MUST have a payload length of zero. A peer that
+            // sends ACK with a non-zero payload is malformed; the spec
+            // requires treating this as a connection error of type
+            // FRAME_SIZE_ERROR.
+            //
+            // We must consume the bogus payload bytes from the ring BEFORE
+            // throwing, otherwise the next ReadFramePayload call would
+            // interpret those bytes as the start of a new H2 frame header
+            // and the ring read pointer would desync (the connection would
+            // then dump cryptic "Unknown H2 frame type" errors and either
+            // hang or terminate). Committing all 9 + payloadLen bytes
+            // matches the spec's "fully consume the frame, then fail the
+            // connection" expectation.
+            if (payloadLen != 0)
+            {
+                if (payloadLen > 0)
+                {
+                    var _ = ring.ReserveRead(payloadLen, ct);
+                }
+                ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+                throw new InvalidDataException(
+                    $"H2 SETTINGS ACK frame must have empty payload (got {payloadLen} bytes)");
+            }
             ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size);
             return;
         }

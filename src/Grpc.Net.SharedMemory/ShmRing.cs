@@ -994,7 +994,19 @@ public sealed class ShmRing : IDisposable
                 throw new RingClosedException();
             }
 
-            WaitForData(ref header, cancellationToken);
+            // Wait for the writer to advance PAST our local pending index
+            // (the byte boundary up to which the reader has already
+            // committed reservations to itself). Using <c>_pendingReadIdx</c>
+            // here — instead of the shared <c>header.ReadIdx</c> — is what
+            // makes the wait composable with speculative-ZC: while a ZC
+            // anchor is held the shared index is intentionally frozen, so
+            // a watermark of <c>header.ReadIdx</c> would always satisfy
+            // <c>writeIdx &gt; watermark</c> and cause this loop to spin at
+            // 100% CPU until the consumer's Release advances the shared
+            // index. <c>_pendingReadIdx</c> is the right semantic anchor:
+            // the reader has already "claimed" everything up to it, and we
+            // genuinely want to wait until NEW bytes arrive past that point.
+            WaitForDataAfter(ref header, pendingIdx, cancellationToken);
         }
     }
 
@@ -1274,17 +1286,43 @@ public sealed class ShmRing : IDisposable
 
     private void WaitForData(ref RingHeader header, CancellationToken cancellationToken)
     {
-        // Matches grpc-go-shmem's readWait: spin/block until writeIdx > readIdx.
-        // Uses shared readIdx (not _pendingReadIdx) because readWait must detect
-        // any unconsumed data in the ring, including data already borrowed but
-        // not yet committed. The caller (Read or ReserveRead) re-checks with
-        // its own index after WaitForData returns.
+        // Wait until any unconsumed data is visible at <c>header.ReadIdx</c>.
+        // Used by the byte-stream <see cref="Read(byte[], int, int, CancellationToken)"/>
+        // path which advances <c>header.ReadIdx</c> in lock-step with each
+        // copy-out. <see cref="ReserveRead"/> uses
+        // <see cref="WaitForDataAfter"/> instead because it advances a local
+        // <c>_pendingReadIdx</c> while leaving the shared index frozen
+        // during a speculative-ZC hold (see remarks on
+        // <see cref="WaitForDataAfter"/>).
+        WaitForDataAfter(ref header, Volatile.Read(ref header.ReadIdx), cancellationToken);
+    }
+
+    /// <summary>
+    /// Spins/blocks until <c>header.WriteIdx</c> advances past
+    /// <paramref name="watermark"/>.
+    /// </summary>
+    /// <remarks>
+    /// Crucial for <see cref="ReserveRead"/>'s wait path: that method tracks
+    /// reader progress in <see cref="_pendingReadIdx"/> rather than
+    /// <c>header.ReadIdx</c>, because the shared index is intentionally
+    /// frozen while a speculative-ZC reservation is held (cross-process
+    /// writers must not wrap onto bytes the reader still holds — see
+    /// <see cref="BeginZcReservation"/>). If <c>ReserveRead</c> instead
+    /// blocked on the shared <c>header.ReadIdx</c>, the wait would observe
+    /// <c>writeIdx &gt; ReadIdx</c> (the as-yet-unreleased ZC bytes) and
+    /// return immediately, even when no NEW frames had arrived. The reader
+    /// thread would spin at 100% CPU pulling <c>ReserveRead → WaitForData →
+    /// (immediate return) → loop</c> until the consumer's
+    /// <see cref="FramePayload.Release"/> advanced <c>header.ReadIdx</c> —
+    /// degrading the SingleStreamMode/ZC perf path this PR aims to optimise.
+    /// </remarks>
+    private void WaitForDataAfter(ref RingHeader header, ulong watermark, CancellationToken cancellationToken)
+    {
         var spinLimit = Volatile.Read(ref _dataSpinCutoff);
         for (var i = 0; i < spinLimit; i++)
         {
             var writeIdx = Volatile.Read(ref header.WriteIdx);
-            var readIdx = Volatile.Read(ref header.ReadIdx);
-            if (writeIdx > readIdx)
+            if (writeIdx > watermark)
             {
                 // Success - adapt spin limit: if we found data within the
                 // spin window, keep the cutoff at least at the current level.
@@ -1322,8 +1360,7 @@ public sealed class ShmRing : IDisposable
 
             // Re-check before blocking
             var writeIdx = Volatile.Read(ref header.WriteIdx);
-            var readIdx = Volatile.Read(ref header.ReadIdx);
-            if (writeIdx > readIdx)
+            if (writeIdx > watermark)
             {
                 return;
             }

@@ -359,4 +359,235 @@ public class Http2CodecTests
         }
         finally { p3.Release(); }
     }
+
+    [Test]
+    public void Settings_AckWithPayload_ThrowsAndConsumesFrame()
+    {
+        // RFC 7540 §6.5.3: SETTINGS frame with the ACK flag set MUST have
+        // payload length 0; otherwise the connection is malformed and the
+        // peer must treat it as FRAME_SIZE_ERROR.
+        //
+        // Critical correctness property: the codec must CONSUME the bogus
+        // payload bytes before throwing. If it only consumed the 9-byte
+        // frame header, the next ReadFramePayload call would interpret the
+        // leftover payload bytes as the start of a new H2 frame header and
+        // the read pointer would desync (manifests as cryptic "Unknown H2
+        // frame type" errors or a hard hang on the connection).
+        using var ring = CreateRing();
+
+        // Hand-craft a SETTINGS+ACK frame with a (forbidden) 6-byte payload.
+        const byte ackFlag = 0x01;
+        var bogusPayload = new byte[] { 0x00, 0x03, 0x00, 0x00, 0x10, 0x00 };
+        var totalLen = Http2FrameHeader.Size + bogusPayload.Length;
+        var frame1 = new byte[totalLen];
+        Http2FrameHeader.Encode(
+            frame1.AsSpan(0, Http2FrameHeader.Size),
+            Http2FrameType.Settings, ackFlag, streamId: 0, payloadLength: bogusPayload.Length);
+        bogusPayload.CopyTo(frame1.AsSpan(Http2FrameHeader.Size));
+
+        // Then write a normal Message frame so we can verify the read
+        // pointer advanced past the malformed SETTINGS by checking the
+        // next read returns a coherent frame (and not garbage interpreted
+        // from the bogus payload bytes).
+        var goodBody = System.Text.Encoding.UTF8.GetBytes("ok");
+        var goodLpm = new byte[5 + goodBody.Length];
+        goodLpm[0] = 0;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            goodLpm.AsSpan(1, 4), (uint)goodBody.Length);
+        goodBody.CopyTo(goodLpm.AsSpan(5));
+
+        ring.Write(frame1);
+        var goodHdr = new FrameHeader(FrameType.Message, 1u, (uint)goodLpm.Length, MessageFlags.EndStream);
+        FrameProtocol.WriteFrame(ring, goodHdr, goodLpm);
+
+        Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring),
+            "SETTINGS ACK with non-zero payload must throw.");
+
+        // Read pointer must have advanced past the malformed SETTINGS frame
+        // (header + bogus payload). The next read must return the good
+        // Message frame intact — proves no desync.
+        var (h, p) = FrameProtocol.ReadFramePayload(ring);
+        try
+        {
+            Assert.That(h.Type, Is.EqualTo(FrameType.Message),
+                "If SETTINGS ACK desync occurred, this read would mis-interpret " +
+                "the bogus payload bytes as a frame header and produce garbage.");
+            Assert.That(h.StreamId, Is.EqualTo(1u));
+            Assert.That(p.Memory.ToArray(), Is.EquivalentTo(goodLpm));
+        }
+        finally { p.Release(); }
+    }
+
+    [Test]
+    public void Data_MultipleLpmInOneFrame_SurfaceAsSeparateMessages()
+    {
+        // RFC 7540 §6.1: H2 DATA carries an opaque byte stream — gRPC LPM
+        // message boundaries are NOT aligned with H2 frame boundaries.
+        // A peer MAY pack two or more complete LPM messages into a single
+        // DATA frame (writer-side coalescing for small messages).
+        //
+        // Pre-fix the codec rejected this as "multiple gRPC LPM messages
+        // not supported", which broke interop with any peer that batches
+        // small messages (commonly grpc-go's internal write buffer
+        // flush). The fix consumes all complete LPMs in the DATA's body,
+        // returns the first as the call's response, and stashes the rest
+        // for the next ReadFramePayload call (FIFO order preserved).
+        using var ring = CreateRing();
+        var streamId = 11u;
+
+        // Build three LPM messages, concatenated.
+        var bodies = new[]
+        {
+            System.Text.Encoding.UTF8.GetBytes("first"),
+            System.Text.Encoding.UTF8.GetBytes("second-message"),
+            System.Text.Encoding.UTF8.GetBytes("third"),
+        };
+        var combined = new List<byte>();
+        foreach (var body in bodies)
+        {
+            combined.Add(0); // no compression
+            var lenBytes = new byte[4];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(lenBytes, (uint)body.Length);
+            combined.AddRange(lenBytes);
+            combined.AddRange(body);
+        }
+        var combinedArr = combined.ToArray();
+
+        // Hand-craft an H2 DATA frame with END_STREAM carrying ALL THREE
+        // LPM messages. END_STREAM applies to whichever Message is the
+        // last one this DATA produces (gRPC mapping of H2 stream end).
+        var totalLen = Http2FrameHeader.Size + combinedArr.Length;
+        var frame = new byte[totalLen];
+        Http2FrameHeader.Encode(
+            frame.AsSpan(0, Http2FrameHeader.Size),
+            Http2FrameType.Data, Http2Flags.EndStream, streamId, combinedArr.Length);
+        combinedArr.CopyTo(frame.AsSpan(Http2FrameHeader.Size));
+        ring.Write(frame);
+
+        // Read each surfaced Message in order.
+        var read = new List<(FrameHeader Header, byte[] Body)>();
+        for (var i = 0; i < bodies.Length; i++)
+        {
+            var (h, p) = FrameProtocol.ReadFramePayload(ring);
+            try
+            {
+                Assert.That(h.Type, Is.EqualTo(FrameType.Message));
+                Assert.That(h.StreamId, Is.EqualTo(streamId));
+                read.Add((h, p.Memory.ToArray()));
+            }
+            finally { p.Release(); }
+        }
+
+        // Each surfaced Message must contain the full LPM (5-byte header
+        // + body) for one of the input messages, in order.
+        for (var i = 0; i < bodies.Length; i++)
+        {
+            var expected = new byte[5 + bodies[i].Length];
+            expected[0] = 0;
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                expected.AsSpan(1, 4), (uint)bodies[i].Length);
+            bodies[i].CopyTo(expected.AsSpan(5));
+            Assert.That(read[i].Body, Is.EquivalentTo(expected),
+                $"Coalesced LPM #{i} must surface intact and in wire order.");
+        }
+
+        // Only the LAST Message must carry EndStream — the H2 DATA
+        // END_STREAM applies to the call's terminal LPM, not to every
+        // packed message.
+        Assert.That(read[0].Header.Flags & MessageFlags.EndStream, Is.EqualTo(0),
+            "Non-last coalesced messages must not carry EndStream.");
+        Assert.That(read[1].Header.Flags & MessageFlags.EndStream, Is.EqualTo(0),
+            "Non-last coalesced messages must not carry EndStream.");
+        Assert.That(read[2].Header.Flags & MessageFlags.EndStream, Is.EqualTo(MessageFlags.EndStream),
+            "The last surfaced message must carry EndStream.");
+    }
+
+    [Test]
+    public void ReserveRead_DuringSpeculativeZcHold_EntersKernelBlockNotBusyWait()
+    {
+        // Regression: while a speculative-ZC anchor is held, the shared
+        // header.ReadIdx is intentionally frozen to keep the cross-process
+        // writer from wrapping onto still-held bytes. Pre-fix
+        // ReserveRead's wait path delegated to WaitForData which compared
+        // header.ReadIdx to header.WriteIdx — and the frozen ReadIdx
+        // continued to satisfy `WriteIdx > ReadIdx` indefinitely. The
+        // spin-loop's success branch returned WITHOUT ever entering the
+        // kernel-block path's `Interlocked.Increment(DataWaiters)`. The
+        // reader thread therefore tight-looped at 100% CPU, and any
+        // back-pressure signal the writer might want to send (gated on
+        // <c>DataWaiters > 0</c>) would never fire because no waiter
+        // ever registered.
+        //
+        // Fix: ReserveRead now calls WaitForDataAfter(_pendingReadIdx),
+        // which compares against the local pending index and so does NOT
+        // see the still-held ZC bytes as "available". After the spin
+        // window expires it enters the kernel-block path, increments
+        // DataWaiters, and parks in <c>_sync.WaitForData</c>.
+        //
+        // Verification: launch a parallel ReserveRead worker while the
+        // ZC payload is still held, give it long enough to descend into
+        // the kernel-block path, then assert DataWaiters == 1. Pre-fix
+        // it would stay at 0 because the spin loop returned successfully
+        // every iteration. Post-fix it sits at 1 for the duration.
+        //
+        // We use <see cref="Segment.Create"/> rather than the bare
+        // ShmRing constructor so that <c>_sync</c> is a real
+        // synchronisation primitive (named events on Windows, futex on
+        // Linux) — without a real sync, both fixed and buggy versions
+        // would skip the kernel-block step (the pre-check after
+        // DataWaiters++ would still bail) and the test would lose its
+        // discriminator.
+        var name = $"grpc_zcwait_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 2 * 1024 * 1024, maxStreams: 10);
+        var ring = seg.RingA;
+
+        // Write one ZC-eligible payload (>= 64 KiB threshold).
+        var lpmBody = new byte[128 * 1024];
+        new Random(1).NextBytes(lpmBody);
+        var lpm = new byte[5 + lpmBody.Length];
+        lpm[0] = 0;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            lpm.AsSpan(1, 4), (uint)lpmBody.Length);
+        lpmBody.CopyTo(lpm.AsSpan(5));
+        FrameProtocol.WriteMessage(ring, streamId: 1, lpm, isLast: true);
+
+        var (_, fp) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        try
+        {
+            Assert.That(fp.IsSpeculativeZeroCopy, Is.True,
+                "Test sanity: payload must take the ZC path so the anchor is held.");
+            Assert.That(ring.SpeculativeReservedBytes, Is.GreaterThan(0L),
+                "Test sanity: ZC anchor must be held while the FramePayload is in scope.");
+
+            using var cts = new CancellationTokenSource();
+            var worker = Task.Run(() =>
+            {
+                try { ring.ReserveRead(9, cts.Token); }
+                catch (OperationCanceledException) { /* expected */ }
+            });
+
+            // Wait long enough for the worker to traverse the spin window
+            // (ShmConstants.SpinIterationsDefault is in the few-thousand
+            // range and Thread.SpinWait(1) is sub-microsecond) and enter
+            // the kernel-block path. 200 ms is overkill but keeps the
+            // test robust on slow CI.
+            var entered = SpinWait.SpinUntil(
+                () => ring.GetState().DataWaiters > 0,
+                TimeSpan.FromMilliseconds(500));
+
+            Assert.That(entered, Is.True,
+                "ReserveRead must enter the kernel-block path (DataWaiters=1) " +
+                "while the ZC anchor is held. Pre-fix WaitForData returned " +
+                "from the spin loop on every iteration because header.ReadIdx " +
+                "was frozen, never reaching the DataWaiters increment — the " +
+                "reader thread saturated a core and writer-side signalling " +
+                "never observed a waiter.");
+            Assert.That(ring.GetState().DataWaiters, Is.EqualTo(1u));
+
+            cts.Cancel();
+            Assert.That(worker.Wait(TimeSpan.FromSeconds(5)), Is.True,
+                "ReserveRead must observe cancellation promptly.");
+        }
+        finally { fp.Release(); }
+    }
 }
