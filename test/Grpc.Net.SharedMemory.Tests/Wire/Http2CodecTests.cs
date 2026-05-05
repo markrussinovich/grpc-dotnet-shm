@@ -629,4 +629,147 @@ public class Http2CodecTests
         }
         finally { fp.Release(); }
     }
+
+    // ===== H2 frame validation tests =====
+    //
+    // RFC 7540 §6.x defines strict size / streamId rules for control
+    // frames. Pre-fix our codec was lax, silently mapping any-length
+    // RST_STREAM into an internal Cancel and accepting non-spec-compliant
+    // SETTINGS / PING / GOAWAY / WINDOW_UPDATE. Each test below crafts a
+    // malformed frame, asserts the codec throws InvalidDataException,
+    // then writes a normal Message frame after and verifies it reads
+    // back intact — proves the read pointer stayed in sync (the codec
+    // must consume the malformed frame's full payload before throwing).
+
+    private static void WriteHandcraftedH2Frame(
+        ShmRing ring, Http2FrameType type, byte flags, uint streamId, byte[] payload)
+    {
+        var totalLen = Http2FrameHeader.Size + payload.Length;
+        var frame = new byte[totalLen];
+        Http2FrameHeader.Encode(
+            frame.AsSpan(0, Http2FrameHeader.Size),
+            type, flags, streamId, payload.Length);
+        payload.CopyTo(frame.AsSpan(Http2FrameHeader.Size));
+        ring.Write(frame);
+    }
+
+    private static void WriteGoodMessageFrame(ShmRing ring, uint streamId)
+    {
+        var body = System.Text.Encoding.UTF8.GetBytes("ok");
+        var lpm = new byte[5 + body.Length];
+        lpm[0] = 0;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(lpm.AsSpan(1, 4), (uint)body.Length);
+        body.CopyTo(lpm.AsSpan(5));
+        FrameProtocol.WriteFrame(ring,
+            new FrameHeader(FrameType.Message, streamId, (uint)lpm.Length, MessageFlags.EndStream),
+            lpm);
+    }
+
+    private static void AssertNextReadIsGoodMessage(ShmRing ring, uint streamId)
+    {
+        var (h, p) = FrameProtocol.ReadFramePayload(ring);
+        try
+        {
+            Assert.That(h.Type, Is.EqualTo(FrameType.Message),
+                "If the malformed frame caused desync, this read would mis-interpret " +
+                "leftover payload bytes as a frame header and produce garbage.");
+            Assert.That(h.StreamId, Is.EqualTo(streamId));
+        }
+        finally { p.Release(); }
+    }
+
+    [Test]
+    public void RstStream_WrongPayloadLength_ThrowsAndConsumesFrame()
+    {
+        // RFC 7540 §6.4: RST_STREAM payload MUST be exactly 4 bytes.
+        using var ring = CreateRing();
+        WriteHandcraftedH2Frame(ring, Http2FrameType.RstStream, 0, streamId: 5,
+            payload: new byte[] { 0x00, 0x00, 0x00, 0x08, 0xAA, 0xBB }); // 6 bytes
+        Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+
+        WriteGoodMessageFrame(ring, streamId: 7);
+        AssertNextReadIsGoodMessage(ring, streamId: 7);
+    }
+
+    [Test]
+    public void RstStream_StreamIdZero_ThrowsAndConsumesFrame()
+    {
+        // RFC 7540 §6.4: RST_STREAM streamId MUST be non-zero (idle stream
+        // identifier 0 is reserved for connection-level frames).
+        using var ring = CreateRing();
+        WriteHandcraftedH2Frame(ring, Http2FrameType.RstStream, 0, streamId: 0,
+            payload: new byte[] { 0x00, 0x00, 0x00, 0x08 });
+        Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+
+        WriteGoodMessageFrame(ring, streamId: 11);
+        AssertNextReadIsGoodMessage(ring, streamId: 11);
+    }
+
+    [Test]
+    public void Settings_NonAck_PayloadNotMultipleOfSix_Throws()
+    {
+        // RFC 7540 §6.5: non-ACK SETTINGS payload MUST be a multiple of 6
+        // (each setting is 2-byte id + 4-byte value).
+        using var ring = CreateRing();
+        WriteHandcraftedH2Frame(ring, Http2FrameType.Settings, 0, streamId: 0,
+            payload: new byte[] { 0x00, 0x03, 0x00, 0x00, 0x10 }); // 5 bytes
+        Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+
+        WriteGoodMessageFrame(ring, streamId: 13);
+        AssertNextReadIsGoodMessage(ring, streamId: 13);
+    }
+
+    [Test]
+    public void Settings_NonZeroStreamId_Throws()
+    {
+        // RFC 7540 §6.5: SETTINGS streamId MUST be 0.
+        using var ring = CreateRing();
+        // Empty payload (would be valid for ACK) but on non-zero streamId
+        // and with no ACK flag.
+        WriteHandcraftedH2Frame(ring, Http2FrameType.Settings, 0, streamId: 1,
+            payload: Array.Empty<byte>());
+        Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+
+        WriteGoodMessageFrame(ring, streamId: 15);
+        AssertNextReadIsGoodMessage(ring, streamId: 15);
+    }
+
+    [Test]
+    public void Ping_NonZeroStreamId_Throws()
+    {
+        // RFC 7540 §6.7: PING streamId MUST be 0.
+        using var ring = CreateRing();
+        WriteHandcraftedH2Frame(ring, Http2FrameType.Ping, 0, streamId: 3,
+            payload: new byte[8]); // valid 8-byte payload, but bad streamId
+        Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+
+        WriteGoodMessageFrame(ring, streamId: 17);
+        AssertNextReadIsGoodMessage(ring, streamId: 17);
+    }
+
+    [Test]
+    public void GoAway_NonZeroStreamId_Throws()
+    {
+        // RFC 7540 §6.8: GOAWAY streamId MUST be 0.
+        using var ring = CreateRing();
+        WriteHandcraftedH2Frame(ring, Http2FrameType.GoAway, 0, streamId: 9,
+            payload: new byte[8]); // valid 8-byte length but bad streamId
+        Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+
+        WriteGoodMessageFrame(ring, streamId: 19);
+        AssertNextReadIsGoodMessage(ring, streamId: 19);
+    }
+
+    [Test]
+    public void WindowUpdate_ZeroIncrement_Throws()
+    {
+        // RFC 7540 §6.9.1: WINDOW_UPDATE increment MUST be non-zero.
+        using var ring = CreateRing();
+        WriteHandcraftedH2Frame(ring, Http2FrameType.WindowUpdate, 0, streamId: 0,
+            payload: new byte[4]); // 4 bytes of zeros = increment of 0
+        Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+
+        WriteGoodMessageFrame(ring, streamId: 21);
+        AssertNextReadIsGoodMessage(ring, streamId: 21);
+    }
 }

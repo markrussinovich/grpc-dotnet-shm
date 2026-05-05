@@ -44,6 +44,85 @@ internal static class HpackHeadersAdapter
     private const string GrpcMessage = "grpc-message";
 
     /// <summary>
+    /// Returns true if a gRPC header name marks a binary metadata header
+    /// (gRFC G2 / gRPC-over-HTTP/2 spec): keys ending in <c>-bin</c> carry
+    /// arbitrary <see cref="byte"/>[] values.
+    /// </summary>
+    /// <remarks>
+    /// On the wire (HTTP/2 / HPACK) such values MUST be base64-encoded
+    /// (without padding is permitted; standard padding is what we emit
+    /// for clarity). Our internal <see cref="HeadersV1"/>/
+    /// <see cref="TrailersV1"/> models always carry the RAW bytes;
+    /// base64 conversion happens exactly at the HPACK adapter boundary.
+    /// <para>
+    /// Custom16 wire skips this entirely — it transports metadata as
+    /// raw bytes end-to-end inside our process boundary, which is fine
+    /// because both peers use the same SHM transport. H2 wire MUST
+    /// match the spec for cross-implementation interop and to avoid
+    /// confusing tooling (Wireshark, gRPC tracing, debug proxies).
+    /// </para>
+    /// </remarks>
+    private static bool IsBinaryHeader(string name)
+        => name.EndsWith("-bin", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Adds a raw metadata value to <paramref name="list"/>, base64-encoding
+    /// when <paramref name="name"/> is a binary header per
+    /// <see cref="IsBinaryHeader"/>.
+    /// </summary>
+    private static void AddMetadataValue(
+        List<(string Name, byte[] Value)> list, string name, byte[] rawValue)
+    {
+        if (IsBinaryHeader(name))
+        {
+            // Emit standard base64 (with padding). RFC 7541 HPACK accepts
+            // arbitrary bytes; gRFC G2 requires base64 specifically — the
+            // peer will base64-decode on receive.
+            var encoded = Encoding.ASCII.GetBytes(Convert.ToBase64String(rawValue));
+            list.Add((name, encoded));
+        }
+        else
+        {
+            list.Add((name, rawValue));
+        }
+    }
+
+    /// <summary>
+    /// Materialises a metadata value from a decoded HPACK header value,
+    /// base64-decoding when <paramref name="name"/> is a binary header.
+    /// </summary>
+    /// <remarks>
+    /// Tolerates malformed base64 by treating the value as raw bytes and
+    /// surfacing it to the upper layer; this matches grpc-go's lenient
+    /// behaviour (a strict <see cref="FormatException"/> here would tear
+    /// down the connection on a single bad header).
+    /// </remarks>
+    private static byte[] DecodeMetadataValue(string name, byte[] hpackValue)
+    {
+        if (!IsBinaryHeader(name))
+        {
+            return hpackValue;
+        }
+        try
+        {
+            // gRFC G2 also permits base64 WITHOUT padding (URL-safe variant
+            // is NOT used; standard alphabet only). Pad if needed before
+            // decoding so peers that omitted padding still parse.
+            var asciiText = Encoding.ASCII.GetString(hpackValue);
+            var padded = asciiText.Length % 4 == 0
+                ? asciiText
+                : asciiText + new string('=', 4 - (asciiText.Length % 4));
+            return Convert.FromBase64String(padded);
+        }
+        catch (FormatException)
+        {
+            // Malformed base64 — return raw bytes; upper layer can
+            // observe corruption and reject if it cares.
+            return hpackValue;
+        }
+    }
+
+    /// <summary>
     /// Encodes a <see cref="HeadersV1"/> instance into an HPACK header block.
     /// Returns a pooled buffer that the caller must return to <see cref="ArrayPool{T}.Shared"/>.
     /// </summary>
@@ -80,7 +159,7 @@ internal static class HpackHeadersAdapter
             var lowerName = kv.Key.ToLowerInvariant();
             foreach (var v in kv.Values)
             {
-                list.Add((lowerName, v));
+                AddMetadataValue(list, lowerName, v);
             }
         }
 
@@ -103,7 +182,7 @@ internal static class HpackHeadersAdapter
             var lowerName = kv.Key.ToLowerInvariant();
             foreach (var v in kv.Values)
             {
-                list.Add((lowerName, v));
+                AddMetadataValue(list, lowerName, v);
             }
         }
 
@@ -162,7 +241,7 @@ internal static class HpackHeadersAdapter
                         bucket = new List<byte[]>();
                         grouped[name] = bucket;
                     }
-                    bucket.Add(value);
+                    bucket.Add(DecodeMetadataValue(name, value));
                     break;
             }
         }
@@ -223,7 +302,7 @@ internal static class HpackHeadersAdapter
                         bucket = new List<byte[]>();
                         grouped[name] = bucket;
                     }
-                    bucket.Add(value);
+                    bucket.Add(DecodeMetadataValue(name, value));
                     break;
             }
         }
@@ -324,7 +403,7 @@ internal static class HpackHeadersAdapter
                         bucket = new List<byte[]>();
                         grouped[name] = bucket;
                     }
-                    bucket.Add(value);
+                    bucket.Add(DecodeMetadataValue(name, value));
                     break;
             }
         }

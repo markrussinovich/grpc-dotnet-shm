@@ -1762,8 +1762,31 @@ internal sealed class ShmGrpcResponseStream : Stream
 
         // Receive the next complete message. Each call accepts the caller's
         // cancellation token directly — no latched enumerator token.
+        //
+        // Ownership transfer: <c>InboundFrame</c> is a struct, so handing
+        // <c>_previousFrame</c> to <c>ReceiveNextMessageBufferAsync</c>
+        // copies it. The callee releases its local copy at entry, but our
+        // field is still a "live" struct copy of the same buffer. If the
+        // await is interrupted by cancellation/exception BEFORE the
+        // callee returns, our field is never updated — and the next
+        // <see cref="Dispose"/> call (or a follow-up retry on the same
+        // stream) would call <see cref="InboundFrame.ReturnToPool"/> on
+        // the SAME buffer a second time. For pooled buffers this is an
+        // ArrayPool double-return; for ZC payloads it is worse —
+        // <see cref="FramePayload.Release"/> is NOT idempotent
+        // (decrements <see cref="ShmRing.SpeculativeReservedBytes"/>),
+        // and the second call drives the counter negative, permanently
+        // disabling future ZC and corrupting the deferred-publish target.
+        //
+        // Fix: move the frame to a local and CLEAR the field BEFORE the
+        // await. Whichever side returns from the await — success path
+        // (we re-assign `_previousFrame = frame`) or exception path
+        // (`Dispose` sees a default field and doesn't double-release) —
+        // the buffer is released exactly once.
+        var toRelease = _previousFrame;
+        _previousFrame = default;
         var (mem, frame, eos) = await _shmStream.ReceiveNextMessageBufferAsync(
-            _previousFrame, cancellationToken).ConfigureAwait(false);
+            toRelease, cancellationToken).ConfigureAwait(false);
 
         if (eos)
         {

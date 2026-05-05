@@ -317,4 +317,125 @@ public class HpackHeadersAdapterTests
             ArrayPool<byte>.Shared.Return(buf);
         }
     }
+
+    [Test]
+    public void EncodeHeaders_BinaryMetadata_EmitsBase64OnTheWire()
+    {
+        // gRFC G2 / gRPC over HTTP/2 §"Binary headers": values for
+        // metadata keys ending in "-bin" MUST be base64-encoded on the
+        // HTTP/2 wire (HPACK layer). Our internal HeadersV1 stores raw
+        // bytes; the HpackHeadersAdapter is the boundary that does the
+        // conversion. Without this, real H2 peers (grpc-go, grpc-java,
+        // grpc-c++) would mis-interpret our binary metadata or reject
+        // values that contain bytes the HTTP header grammar disallows.
+        var rawBinary = new byte[] { 0x00, 0x01, 0xFF, 0x80, 0x10, 0x20 }; // contains non-printable bytes
+        var v1 = new HeadersV1
+        {
+            HeaderType = 0,
+            Method = "/svc/M",
+            Authority = "h",
+            Metadata = new[] { new MetadataKV("custom-trailer-bin", rawBinary) },
+        };
+        var (buf, len) = HpackHeadersAdapter.EncodeHeaders(v1);
+        try
+        {
+            // Decode the raw HPACK output (NOT via the adapter) to inspect
+            // exactly what bytes went on the wire.
+            var rawHeaders = HpackDecoder.Decode(buf.AsSpan(0, len));
+            var found = rawHeaders.FirstOrDefault(h => h.Name == "custom-trailer-bin");
+            Assert.That(found.Name, Is.EqualTo("custom-trailer-bin"));
+
+            // The wire value must be the base64 ASCII text of rawBinary.
+            var expectedBase64 = Convert.ToBase64String(rawBinary);
+            var actualWireText = Encoding.ASCII.GetString(found.Value);
+            Assert.That(actualWireText, Is.EqualTo(expectedBase64),
+                "Binary metadata MUST be base64-encoded on the H2/HPACK wire (gRFC G2).");
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
+
+    [Test]
+    public void DecodeHeaders_BinaryMetadata_RoundTripsRawBytes()
+    {
+        // End-to-end through our adapter: encode raw bytes via the adapter,
+        // decode via the adapter, expect raw bytes back. The adapter's
+        // base64 encode/decode pair must cancel exactly.
+        var rawBinary = new byte[] { 0x00, 0x01, 0xFF, 0x80, 0x10, 0x20, 0x42 };
+        var v1 = new HeadersV1
+        {
+            HeaderType = 0,
+            Method = "/svc/M",
+            Authority = "h",
+            Metadata = new[] { new MetadataKV("trace-id-bin", rawBinary) },
+        };
+        var (buf, len) = HpackHeadersAdapter.EncodeHeaders(v1);
+        try
+        {
+            var roundTripped = HpackHeadersAdapter.DecodeHeaders(buf.AsSpan(0, len));
+            Assert.That(roundTripped.Metadata, Has.Count.EqualTo(1));
+            Assert.That(roundTripped.Metadata[0].Key, Is.EqualTo("trace-id-bin"));
+            Assert.That(roundTripped.Metadata[0].Values, Has.Count.EqualTo(1));
+            Assert.That(roundTripped.Metadata[0].Values[0], Is.EquivalentTo(rawBinary),
+                "Adapter must round-trip raw -bin metadata bytes via base64 encode/decode.");
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
+
+    [Test]
+    public void DecodeTrailers_BinaryMetadata_RoundTripsRawBytes()
+    {
+        // Same round-trip property for trailers (status-details-bin etc.).
+        var rawDetails = new byte[] { 0x12, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F }; // a tiny google.rpc.Status proto
+        var v1 = new TrailersV1
+        {
+            GrpcStatusCode = global::Grpc.Core.StatusCode.NotFound,
+            Metadata = new[] { new MetadataKV("grpc-status-details-bin", rawDetails) },
+        };
+        var (buf, len) = HpackHeadersAdapter.EncodeTrailers(v1);
+        try
+        {
+            var rt = HpackHeadersAdapter.DecodeTrailers(buf.AsSpan(0, len));
+            Assert.That(rt.Metadata, Has.Count.EqualTo(1));
+            Assert.That(rt.Metadata[0].Key, Is.EqualTo("grpc-status-details-bin"));
+            Assert.That(rt.Metadata[0].Values[0], Is.EquivalentTo(rawDetails));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
+
+    [Test]
+    public void DecodeHeaders_NonBinaryMetadata_NoBase64Treatment()
+    {
+        // Plain-text metadata (key NOT ending in "-bin") must pass through
+        // verbatim with no base64 transformation. Specifically: if a
+        // user-supplied non-binary value happens to be valid base64 by
+        // accident, we must NOT decode it.
+        var v1 = new HeadersV1
+        {
+            HeaderType = 0,
+            Method = "/svc/M",
+            Authority = "h",
+            Metadata = new[] { new MetadataKV("user-id", "QUJD") }, // looks like base64 of "ABC"
+        };
+        var (buf, len) = HpackHeadersAdapter.EncodeHeaders(v1);
+        try
+        {
+            var rt = HpackHeadersAdapter.DecodeHeaders(buf.AsSpan(0, len));
+            var roundTrippedText = Encoding.UTF8.GetString(rt.Metadata[0].Values[0]);
+            Assert.That(roundTrippedText, Is.EqualTo("QUJD"),
+                "Non-binary metadata must NOT be base64-decoded even if it looks like base64.");
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
 }

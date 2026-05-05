@@ -243,14 +243,14 @@ internal static partial class Http2Codec
                     return ReadRstStreamFrame(ring, baseCommitReadIdx, streamId, payloadLen, cancellationToken);
 
                 case Http2FrameType.Settings:
-                    HandleSettingsFrame(ring, baseCommitReadIdx, h2Flags, payloadLen, cancellationToken);
+                    HandleSettingsFrame(ring, baseCommitReadIdx, h2Flags, streamId, payloadLen, cancellationToken);
                     continue; // Don't surface to upper layer.
 
                 case Http2FrameType.Ping:
-                    return ReadPingFrame(ring, baseCommitReadIdx, h2Flags, payloadLen, cancellationToken);
+                    return ReadPingFrame(ring, baseCommitReadIdx, h2Flags, streamId, payloadLen, cancellationToken);
 
                 case Http2FrameType.GoAway:
-                    return ReadGoAwayFrame(ring, baseCommitReadIdx, payloadLen, cancellationToken);
+                    return ReadGoAwayFrame(ring, baseCommitReadIdx, streamId, payloadLen, cancellationToken);
 
                 case Http2FrameType.WindowUpdate:
                     return ReadWindowUpdateFrame(ring, baseCommitReadIdx, streamId, payloadLen, cancellationToken);
@@ -842,11 +842,27 @@ internal static partial class Http2Codec
     private static (FrameHeader Header, FramePayload Payload) ReadRstStreamFrame(
         ShmRing ring, ulong baseCommitReadIdx, uint streamId, int payloadLen, CancellationToken ct)
     {
-        // Drain payload (4 bytes error code; we don't propagate the code).
-        if (payloadLen > 0)
+        // RFC 7540 §6.4: RST_STREAM
+        //   - payload length MUST be exactly 4 (treat other lengths as
+        //     FRAME_SIZE_ERROR connection error)
+        //   - stream identifier MUST be non-zero (treat zero as
+        //     PROTOCOL_ERROR connection error)
+        // We must drain the full malformed payload before throwing so the
+        // ring read pointer stays in sync (any subsequent read would
+        // otherwise mis-interpret leftover bytes as a new frame header).
+        if (payloadLen != 4 || streamId == 0)
         {
-            var _ = ring.ReserveRead(payloadLen, ct);
+            if (payloadLen > 0)
+            {
+                var _ = ring.ReserveRead(payloadLen, ct);
+            }
+            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            throw new InvalidDataException(
+                $"H2 RST_STREAM malformed (streamId={streamId}, payloadLen={payloadLen}; require streamId != 0 && payloadLen == 4)");
         }
+
+        // Drain payload (4 bytes error code; we don't propagate the code).
+        var _drain = ring.ReserveRead(payloadLen, ct);
         ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
 
         // Clean up all per-stream state. A pending LPM accumulator may still
@@ -864,8 +880,23 @@ internal static partial class Http2Codec
     }
 
     private static void HandleSettingsFrame(ShmRing ring, ulong baseCommitReadIdx,
-        byte h2Flags, int payloadLen, CancellationToken ct)
+        byte h2Flags, uint streamId, int payloadLen, CancellationToken ct)
     {
+        // RFC 7540 §6.5: SETTINGS frame
+        //   - stream identifier MUST be 0 (treat non-zero as PROTOCOL_ERROR)
+        //   - on non-ACK: payload length MUST be a multiple of 6
+        //     (treat otherwise as FRAME_SIZE_ERROR)
+        //   - on ACK: payload length MUST be 0 (already enforced below)
+        if (streamId != 0)
+        {
+            if (payloadLen > 0)
+            {
+                var _ = ring.ReserveRead(payloadLen, ct);
+            }
+            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            throw new InvalidDataException(
+                $"H2 SETTINGS frame must have streamId=0 (got {streamId})");
+        }
         if ((h2Flags & Http2Flags.Ack) != 0)
         {
             // RFC 7540 §6.5.3 / RFC 9113 §6.5.3: a SETTINGS frame with the
@@ -896,6 +927,19 @@ internal static partial class Http2Codec
             return;
         }
 
+        // RFC 7540 §6.5: non-ACK SETTINGS payload length MUST be a
+        // multiple of 6 (each setting is 2-byte id + 4-byte value).
+        if (payloadLen % 6 != 0)
+        {
+            if (payloadLen > 0)
+            {
+                var _ = ring.ReserveRead(payloadLen, ct);
+            }
+            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            throw new InvalidDataException(
+                $"H2 SETTINGS frame payload length {payloadLen} is not a multiple of 6");
+        }
+
         // Drain settings payload (we don't dynamically apply peer settings;
         // we negotiate via the control segment).
         if (payloadLen > 0)
@@ -921,13 +965,20 @@ internal static partial class Http2Codec
     }
 
     private static (FrameHeader Header, FramePayload Payload) ReadPingFrame(
-        ShmRing ring, ulong baseCommitReadIdx, byte h2Flags, int payloadLen, CancellationToken ct)
+        ShmRing ring, ulong baseCommitReadIdx, byte h2Flags, uint streamId, int payloadLen, CancellationToken ct)
     {
-        // PING is always 8 bytes.
-        if (payloadLen != 8)
+        // RFC 7540 §6.7: PING
+        //   - stream identifier MUST be 0 (PROTOCOL_ERROR otherwise)
+        //   - payload length MUST be exactly 8 (FRAME_SIZE_ERROR otherwise)
+        if (streamId != 0 || payloadLen != 8)
         {
+            if (payloadLen > 0)
+            {
+                var _ = ring.ReserveRead(payloadLen, ct);
+            }
             ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
-            throw new InvalidDataException($"H2 PING frame payload length {payloadLen} != 8");
+            throw new InvalidDataException(
+                $"H2 PING malformed (streamId={streamId}, payloadLen={payloadLen}; require streamId == 0 && payloadLen == 8)");
         }
 
         var payloadReservation = ring.ReserveRead(payloadLen, ct);
@@ -941,13 +992,21 @@ internal static partial class Http2Codec
     }
 
     private static (FrameHeader Header, FramePayload Payload) ReadGoAwayFrame(
-        ShmRing ring, ulong baseCommitReadIdx, int payloadLen, CancellationToken ct)
+        ShmRing ring, ulong baseCommitReadIdx, uint streamId, int payloadLen, CancellationToken ct)
     {
-        // RFC 7540 §6.8: 4-byte last-stream-id + 4-byte error code + optional debug data.
-        if (payloadLen < 8)
+        // RFC 7540 §6.8: GOAWAY
+        //   - stream identifier MUST be 0 (PROTOCOL_ERROR otherwise)
+        //   - payload at minimum 8 bytes: 4-byte last-stream-id + 4-byte
+        //     error code + optional debug data.
+        if (streamId != 0 || payloadLen < 8)
         {
+            if (payloadLen > 0)
+            {
+                var _ = ring.ReserveRead(payloadLen, ct);
+            }
             ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
-            throw new InvalidDataException($"H2 GOAWAY frame payload length {payloadLen} < 8");
+            throw new InvalidDataException(
+                $"H2 GOAWAY malformed (streamId={streamId}, payloadLen={payloadLen}; require streamId == 0 && payloadLen >= 8)");
         }
 
         var payloadReservation = ring.ReserveRead(payloadLen, ct);
@@ -971,8 +1030,13 @@ internal static partial class Http2Codec
     private static (FrameHeader Header, FramePayload Payload) ReadWindowUpdateFrame(
         ShmRing ring, ulong baseCommitReadIdx, uint streamId, int payloadLen, CancellationToken ct)
     {
+        // RFC 7540 §6.9.1: WINDOW_UPDATE payload length MUST be exactly 4.
         if (payloadLen != 4)
         {
+            if (payloadLen > 0)
+            {
+                var _ = ring.ReserveRead(payloadLen, ct);
+            }
             ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
             throw new InvalidDataException($"H2 WINDOW_UPDATE frame payload length {payloadLen} != 4");
         }
@@ -982,7 +1046,17 @@ internal static partial class Http2Codec
         CopyFromReservationSlice(payloadReservation, 0, raw);
         ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
 
+        // RFC 7540 §6.9.1: increment MUST be a non-zero 31-bit value.
+        // Zero is a stream-error / connection-error PROTOCOL_ERROR (a peer
+        // that emits zero-increment is malformed; silently accepting it
+        // would mask the protocol violation and could mask underlying
+        // peer bugs at integration time).
         var increment = BinaryPrimitives.ReadUInt32BigEndian(raw) & 0x7FFFFFFFu;
+        if (increment == 0)
+        {
+            throw new InvalidDataException(
+                "H2 WINDOW_UPDATE increment must be non-zero (RFC 7540 §6.9.1)");
+        }
 
         // Internal payload is 4-byte little-endian increment.
         var pooled = ArrayPool<byte>.Shared.Rent(4);
