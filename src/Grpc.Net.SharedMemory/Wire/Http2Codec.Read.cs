@@ -23,6 +23,8 @@ using System.Runtime.CompilerServices;
 namespace Grpc.Net.SharedMemory.Wire;
 internal static partial class Http2Codec
 {
+    internal const int MaxPendingSyntheticFrames = 4096;
+
     // Per-ring decoder state. Tracks which streams have had their initial
     // HEADERS frame so that subsequent HEADERS frames are interpreted as
     // gRPC trailers. Cleared when END_STREAM is observed.
@@ -79,6 +81,25 @@ internal static partial class Http2Codec
         // call before the ring is touched, preserving FIFO order between
         // synthetic frames and any subsequent wire frames.
         public readonly Queue<(FrameHeader Header, FramePayload Payload)> PendingFrames = new();
+    }
+
+    private static void EnqueuePendingFrame(
+        Http2DecoderState state, FrameHeader header, FramePayload payload)
+    {
+        if (state.PendingFrames.Count >= MaxPendingSyntheticFrames)
+        {
+            throw new InvalidDataException(
+                $"H2 DATA frame produced more than {MaxPendingSyntheticFrames + 1} logical gRPC messages");
+        }
+        state.PendingFrames.Enqueue((header, payload));
+    }
+
+    private static void ReleasePendingFrames(Http2DecoderState state)
+    {
+        while (state.PendingFrames.Count > 0)
+        {
+            state.PendingFrames.Dequeue().Payload.Release();
+        }
     }
 
     /// <summary>Accumulates a single in-progress gRPC LPM message across multiple DATA frames.</summary>
@@ -453,13 +474,27 @@ internal static partial class Http2Codec
                             // tail to the queue WITHOUT EndStream (that flag
                             // belongs to whoever ends up final) and adopt the
                             // new payload as the new buffered tail.
-                            state.PendingFrames.Enqueue((
-                                new FrameHeader(FrameType.Message, streamId,
-                                    (uint)bufferedTail.Value.Length, 0),
-                                bufferedTail.Value));
+                            try
+                            {
+                                EnqueuePendingFrame(state,
+                                    new FrameHeader(FrameType.Message, streamId,
+                                        (uint)bufferedTail.Value.Length, 0),
+                                    bufferedTail.Value);
+                            }
+                            catch
+                            {
+                                payload.Release();
+                                throw;
+                            }
                             bufferedTail = payload;
                         }
                     }
+                }
+
+                if (bufferedTail != null && state.PendingFrames.Count >= MaxPendingSyntheticFrames)
+                {
+                    throw new InvalidDataException(
+                        $"H2 DATA frame produced more than {MaxPendingSyntheticFrames + 1} logical gRPC messages");
                 }
 
                 // Commit the ring read regardless — we've materialised everything we need.
@@ -491,13 +526,20 @@ internal static partial class Http2Codec
                     // Release any locally-held completions to return their
                     // pooled buffers and (if speculative — currently never,
                     // since FeedAccumulator only emits FromPooled) drop
-                    // their SpeculativeReservedBytes increment. Do NOT
-                    // release entries already in PendingFrames — those are
-                    // committed to the queue contract and would be a
-                    // use-after-free if a subsequent ReadFramePayload call
-                    // dequeues them.
+                    // their SpeculativeReservedBytes increment.
+                    //
+                    // Also drain <see cref="Http2DecoderState.PendingFrames"/>:
+                    // any exception that bubbles out here is connection-fatal
+                    // (FrameReaderLoopAsync's outer catch tears the connection
+                    // down on InvalidDataException), so no future
+                    // ReadFramePayload call will dequeue these frames. Without
+                    // <see cref="ReleasePendingFrames"/> their pooled buffers
+                    // would leak until GC. Because no future dequeue is
+                    // possible, there is no use-after-free risk in releasing
+                    // them here.
                     firstCompleted?.Release();
                     bufferedTail?.Release();
+                    ReleasePendingFrames(state);
                 }
             }
 
@@ -516,10 +558,10 @@ internal static partial class Http2Codec
                     // the call's response, <c>tail</c> is the genuine
                     // terminal Message and rides the EndStream flag.
                     var tailFlags = endStream ? MessageFlags.EndStream : (byte)0;
-                    state.PendingFrames.Enqueue((
+                    EnqueuePendingFrame(state,
                         new FrameHeader(FrameType.Message, streamId,
                             (uint)tail.Length, tailFlags),
-                        tail));
+                        tail);
                     var firstHdr = new FrameHeader(FrameType.Message, streamId,
                         (uint)first.Length, 0);
 
@@ -764,9 +806,9 @@ internal static partial class Http2Codec
                 var (hPayload, hLen) = headersV1.Encode();
                 var (tPayload, tLen) = trailersV1.Encode();
 
-                state.PendingFrames.Enqueue((
+                EnqueuePendingFrame(state,
                     new FrameHeader(FrameType.Trailers, streamId, (uint)tLen, TrailersFlags.EndStream),
-                    FramePayload.FromPooled(tPayload, tLen)));
+                    FramePayload.FromPooled(tPayload, tLen));
 
                 // No persistent stream state to retain: trailers-only means
                 // the stream ended in this single HEADERS frame; any further

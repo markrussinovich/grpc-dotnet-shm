@@ -503,6 +503,45 @@ public class Http2CodecTests
     }
 
     [Test]
+    public void Data_TooManyCoalescedLpm_ThrowsAndClearsPendingFrames()
+    {
+        using var ring = CreateRing();
+        var streamId = 13u;
+        var messageCount = Http2Codec.MaxPendingSyntheticFrames + 2;
+        var combined = new byte[messageCount * 5];
+        for (var i = 0; i < messageCount; i++)
+        {
+            combined[i * 5] = 0;
+        }
+
+        var oversizedFrame = new byte[Http2FrameHeader.Size + combined.Length];
+        Http2FrameHeader.Encode(
+            oversizedFrame.AsSpan(0, Http2FrameHeader.Size),
+            Http2FrameType.Data, 0, streamId, combined.Length);
+        combined.CopyTo(oversizedFrame.AsSpan(Http2FrameHeader.Size));
+        ring.Write(oversizedFrame);
+
+        Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+
+        var goodBody = System.Text.Encoding.UTF8.GetBytes("after-limit");
+        var goodLpm = new byte[5 + goodBody.Length];
+        goodLpm[0] = 0;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(goodLpm.AsSpan(1, 4), (uint)goodBody.Length);
+        goodBody.CopyTo(goodLpm.AsSpan(5));
+        FrameProtocol.WriteFrame(ring,
+            new FrameHeader(FrameType.Message, streamId, (uint)goodLpm.Length, MessageFlags.EndStream),
+            goodLpm);
+
+        var (header, payload) = FrameProtocol.ReadFramePayload(ring);
+        try
+        {
+            Assert.That(header.Type, Is.EqualTo(FrameType.Message));
+            Assert.That(payload.Memory.ToArray(), Is.EquivalentTo(goodLpm));
+        }
+        finally { payload.Release(); }
+    }
+
+    [Test]
     public void ReserveRead_DuringSpeculativeZcHold_EntersKernelBlockNotBusyWait()
     {
         // Regression: while a speculative-ZC anchor is held, the shared

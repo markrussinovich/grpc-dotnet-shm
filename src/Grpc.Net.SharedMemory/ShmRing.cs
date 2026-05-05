@@ -1078,7 +1078,19 @@ public sealed class ShmRing : IDisposable
 
         ref var header = ref GetHeader();
 
-        Volatile.Write(ref header.ReadIdx, reservation.CommitReadIdx + (ulong)bytesConsumed);
+        var newReadIdx = reservation.CommitReadIdx + (ulong)bytesConsumed;
+        while (true)
+        {
+            var current = Volatile.Read(ref header.ReadIdx);
+            if (newReadIdx <= current)
+            {
+                return;
+            }
+            if (Interlocked.CompareExchange(ref header.ReadIdx, newReadIdx, current) == current)
+            {
+                break;
+            }
+        }
         SignalSpaceAvailability(ref header);
     }
 

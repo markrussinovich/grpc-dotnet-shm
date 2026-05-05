@@ -1058,49 +1058,78 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     internal void OnFrameReceived(InboundFrame frame)
     {
-        if (Volatile.Read(ref _disposed) != 0 || _cancelled)
+        var ownsFrame = true;
+        try
         {
-            frame.ReturnToPool();
-            return;
-        }
-
-        switch (frame.Type)
-        {
-            case FrameType.Cancel:
-                _cancelled = true;
-                CancelCancellationToken();
+            if (Volatile.Read(ref _disposed) != 0 || _cancelled)
+            {
                 frame.ReturnToPool();
-                _inboundFrames.Writer.TryComplete();
-                _connection.RemoveStream(StreamId);
-                break;
+                ownsFrame = false;
+                return;
+            }
 
-            case FrameType.HalfClose:
-                _halfCloseReceived = true;
-                if (!_inboundFrames.Writer.TryWrite(frame))
-                {
+            switch (frame.Type)
+            {
+                case FrameType.Cancel:
+                    _cancelled = true;
+                    CancelCancellationToken();
                     frame.ReturnToPool();
-                }
-                break;
+                    ownsFrame = false;
+                    _inboundFrames.Writer.TryComplete();
+                    _connection.RemoveStream(StreamId);
+                    break;
 
-            case FrameType.Trailers:
-                _halfCloseReceived = true;
-                if (!_inboundFrames.Writer.TryWrite(frame))
-                {
-                    frame.ReturnToPool();
-                }
-                _inboundFrames.Writer.TryComplete();
-                // Auto-remove from connection to prevent accumulation when
-                // callers don't dispose the stream (e.g., undisposed AsyncUnaryCall).
-                // No more frames will arrive after TRAILERS.
-                _connection.RemoveStream(StreamId);
-                break;
+                case FrameType.HalfClose:
+                    _halfCloseReceived = true;
+                    if (_inboundFrames.Writer.TryWrite(frame))
+                    {
+                        ownsFrame = false;
+                    }
+                    else
+                    {
+                        frame.ReturnToPool();
+                        ownsFrame = false;
+                    }
+                    break;
 
-            default:
-                if (!_inboundFrames.Writer.TryWrite(frame))
-                {
-                    frame.ReturnToPool();
-                }
-                break;
+                case FrameType.Trailers:
+                    _halfCloseReceived = true;
+                    if (_inboundFrames.Writer.TryWrite(frame))
+                    {
+                        ownsFrame = false;
+                    }
+                    else
+                    {
+                        frame.ReturnToPool();
+                        ownsFrame = false;
+                    }
+                    _inboundFrames.Writer.TryComplete();
+                    // Auto-remove from connection to prevent accumulation when
+                    // callers don't dispose the stream (e.g., undisposed AsyncUnaryCall).
+                    // No more frames will arrive after TRAILERS.
+                    _connection.RemoveStream(StreamId);
+                    break;
+
+                default:
+                    if (_inboundFrames.Writer.TryWrite(frame))
+                    {
+                        ownsFrame = false;
+                    }
+                    else
+                    {
+                        frame.ReturnToPool();
+                        ownsFrame = false;
+                    }
+                    break;
+            }
+        }
+        catch
+        {
+            if (ownsFrame)
+            {
+                frame.ReturnToPool();
+            }
+            throw;
         }
     }
 

@@ -582,13 +582,30 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 break;
 
             case FrameType.Ping:
-                HandlePing(header, payloadMemory.Span);
-                payload.Release();
+                try
+                {
+                    HandlePing(header, payloadMemory.Span);
+                }
+                finally
+                {
+                    payload.Release();
+                }
                 break;
 
             case FrameType.Pong:
-                HandlePong(header, payloadMemory.Span);
-                payload.Release();
+                // try/finally for symmetry with Ping above. <c>HandlePong</c>
+                // is currently a single field write and cannot throw, but a
+                // future BDP estimator / metrics hook on the pong path
+                // could; the cost on the no-throw path is zero (the JIT
+                // emits the finally inline before the normal break).
+                try
+                {
+                    HandlePong(header, payloadMemory.Span);
+                }
+                finally
+                {
+                    payload.Release();
+                }
                 break;
 
             case FrameType.GoAway:
@@ -609,10 +626,16 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                     break;
                 }
 
-                var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
-                    payloadMemory.Span.Slice(0, payloadLength));
-                AddSendQuota(header.StreamId, increment);
-                payload.Release();
+                try
+                {
+                    var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+                        payloadMemory.Span.Slice(0, payloadLength));
+                    AddSendQuota(header.StreamId, increment);
+                }
+                finally
+                {
+                    payload.Release();
+                }
                 break;
 
             default:

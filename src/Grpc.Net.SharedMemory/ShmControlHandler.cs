@@ -355,11 +355,12 @@ public sealed class ShmControlHandler : HttpMessageHandler
             // Send CONNECT request with preferred ring capacity from client options.
             // Server will negotiate: Min(clientPreferred, serverMax). Value 0 = use server default.
             var preferredRing = _options.RingCapacity;
-            // Advertise wire formats in preference order. We always include
-            // Custom16 as a fallback so legacy servers and pre-H2 clients keep working.
-            var supportedFormats = _options.PreferHttp2
+            // Advertise wire formats only when preferring H2. Without an
+            // advertisement, servers default to Custom16 and the CONNECT
+            // payload stays legacy-compatible.
+            Wire.WireFormat[]? supportedFormats = _options.PreferHttp2
                 ? new[] { Wire.WireFormat.Http2, Wire.WireFormat.Custom16 }
-                : new[] { Wire.WireFormat.Custom16 };
+                : null;
             await WriteControlFrameAsync(ctlTx, FrameType.Connect,
                 ControlWire.EncodeConnectRequest(preferredRing, preferredRing, _options.SingleStreamMode, supportedFormats), ct).ConfigureAwait(false);
 
