@@ -44,6 +44,27 @@ internal static partial class Http2Codec
     internal const int MaxLpmBodyLength = 1024 * 1024 * 1024;
 
     /// <summary>
+    /// Cumulative cap on a HEADERS + CONTINUATION sequence payload.
+    /// </summary>
+    /// <remarks>
+    /// RFC 7540 §6.10 allows a HEADERS or PUSH_PROMISE to span multiple
+    /// CONTINUATION frames; the spec does not impose a per-block size
+    /// limit (peers are expected to advertise <c>SETTINGS_MAX_HEADER_LIST_SIZE</c>
+    /// to bound this). Without a cap a malicious peer could stream
+    /// gigabytes of HEADERS payload, exhausting memory before any
+    /// upper-layer rate-limiting kicks in.
+    /// <para>
+    /// 8 MiB is generous (grpc-dotnet's default
+    /// <c>SETTINGS_MAX_HEADER_LIST_SIZE</c> is 16 KiB; nginx caps at
+    /// 8 KiB; envoy at 60 KiB) but matches the order-of-magnitude of
+    /// the existing <c>MaxLpmBodyLength</c> 1 GiB-class limits without
+    /// being a viable attack vector. Real gRPC traffic stays well
+    /// under 4 KiB of headers.
+    /// </para>
+    /// </remarks>
+    internal const int MaxHeaderListSize = 8 * 1024 * 1024;
+
+    /// <summary>
     /// Reads a single logical frame off the ring in HTTP/2 wire format and
     /// translates it to the internal <see cref="FrameHeader"/> /
     /// <see cref="FramePayload"/> model used by the upper layers.

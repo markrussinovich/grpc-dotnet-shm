@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Text;
 using Grpc.Net.SharedMemory.Wire;
 using NUnit.Framework;
@@ -771,5 +772,151 @@ public class Http2CodecTests
 
         WriteGoodMessageFrame(ring, streamId: 21);
         AssertNextReadIsGoodMessage(ring, streamId: 21);
+    }
+
+    [Test]
+    public void Headers_WithContinuation_TwoFragments_RoundTrip()
+    {
+        // RFC 7540 §6.10: a HEADERS payload may span HEADERS + N
+        // CONTINUATION frames, each except the last with END_HEADERS=0
+        // and the last with END_HEADERS=1. The whole sequence MUST stay
+        // on the same streamId and MUST NOT be interleaved with other
+        // frame types.
+        //
+        // Real H2 peers (grpc-go, grpc-java) emit CONTINUATION when a
+        // single header block exceeds SETTINGS_MAX_FRAME_SIZE — most
+        // commonly with large `grpc-status-details-bin` trailers in
+        // error responses. Pre-fix our codec rejected any HEADERS
+        // without END_HEADERS as "not supported", breaking interop.
+        using var ring = CreateRing();
+        var streamId = 23u;
+
+        // Build an HPACK header block large enough to be worth splitting
+        // (we'll split a small block — the codec doesn't care about the
+        // split point, only that streamId / END_HEADERS rules hold).
+        var fields = new List<(string Name, byte[] Value)>
+        {
+            (":method", System.Text.Encoding.ASCII.GetBytes("POST")),
+            (":scheme", System.Text.Encoding.ASCII.GetBytes("http")),
+            (":path", System.Text.Encoding.ASCII.GetBytes("/svc/M")),
+            (":authority", System.Text.Encoding.ASCII.GetBytes("h")),
+            ("content-type", System.Text.Encoding.ASCII.GetBytes("application/grpc")),
+            ("custom-h", System.Text.Encoding.ASCII.GetBytes("v1")),
+        };
+        var (hpackBuf, hpackLen) = Grpc.Net.SharedMemory.Wire.Hpack.HpackEncoder.Encode(fields);
+        try
+        {
+            // Split the HPACK block into two roughly equal halves.
+            var splitPoint = hpackLen / 2;
+            var firstHalf = hpackBuf.AsSpan(0, splitPoint).ToArray();
+            var secondHalf = hpackBuf.AsSpan(splitPoint, hpackLen - splitPoint).ToArray();
+
+            // HEADERS without END_HEADERS, then CONTINUATION with END_HEADERS.
+            // First HEADERS: NO END_HEADERS flag. (END_STREAM is fine here
+            // because gRPC client-initial often has END_STREAM=0, but for
+            // round-trip-checking we leave it 0.)
+            WriteHandcraftedH2Frame(ring,
+                Http2FrameType.Headers, flags: 0, streamId, firstHalf);
+
+            // CONTINUATION with END_HEADERS=1.
+            WriteHandcraftedH2Frame(ring,
+                Http2FrameType.Continuation, flags: Http2Flags.EndHeaders, streamId, secondHalf);
+
+            // Read back. The codec must reassemble the two fragments,
+            // decode the HPACK block, and emit a single Headers frame.
+            var (h, p) = FrameProtocol.ReadFramePayload(ring);
+            try
+            {
+                Assert.That(h.Type, Is.EqualTo(FrameType.Headers));
+                Assert.That(h.StreamId, Is.EqualTo(streamId));
+
+                var hv1 = HeadersV1.Decode(p.Memory.Span);
+                Assert.That(hv1.HeaderType, Is.EqualTo((byte)0),
+                    "Reassembled HEADERS must be parsed as client-initial.");
+                Assert.That(hv1.Method, Is.EqualTo("/svc/M"));
+                Assert.That(hv1.Authority, Is.EqualTo("h"));
+            }
+            finally { p.Release(); }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(hpackBuf);
+        }
+    }
+
+    [Test]
+    public void Headers_WithContinuation_StreamIdMismatch_Throws()
+    {
+        // RFC 7540 §6.10: CONTINUATION streamId MUST match the originating
+        // HEADERS streamId. A peer that interleaves CONTINUATION on a
+        // different stream is malformed (PROTOCOL_ERROR).
+        using var ring = CreateRing();
+        var headersStream = 25u;
+        var fields = new List<(string Name, byte[] Value)>
+        {
+            (":status", System.Text.Encoding.ASCII.GetBytes("200")),
+        };
+        var (hpackBuf, hpackLen) = Grpc.Net.SharedMemory.Wire.Hpack.HpackEncoder.Encode(fields);
+        try
+        {
+            var firstHalf = hpackBuf.AsSpan(0, 1).ToArray();
+            var secondHalf = hpackBuf.AsSpan(1, hpackLen - 1).ToArray();
+
+            WriteHandcraftedH2Frame(ring,
+                Http2FrameType.Headers, flags: 0, headersStream, firstHalf);
+            // CONTINUATION on a DIFFERENT stream — protocol error.
+            WriteHandcraftedH2Frame(ring,
+                Http2FrameType.Continuation, flags: Http2Flags.EndHeaders,
+                streamId: headersStream + 2, secondHalf);
+
+            Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+        }
+        finally { ArrayPool<byte>.Shared.Return(hpackBuf); }
+    }
+
+    [Test]
+    public void Headers_WithContinuation_NonContinuationFrameInterleaved_Throws()
+    {
+        // RFC 7540 §6.10: between a HEADERS without END_HEADERS and the
+        // terminal CONTINUATION, NO other frame type is allowed (not
+        // even on a different stream). Peer that interleaves DATA /
+        // SETTINGS / etc. is malformed.
+        using var ring = CreateRing();
+        var streamId = 27u;
+        var fields = new List<(string Name, byte[] Value)>
+        {
+            (":status", System.Text.Encoding.ASCII.GetBytes("200")),
+        };
+        var (hpackBuf, hpackLen) = Grpc.Net.SharedMemory.Wire.Hpack.HpackEncoder.Encode(fields);
+        try
+        {
+            var firstHalf = hpackBuf.AsSpan(0, 1).ToArray();
+
+            WriteHandcraftedH2Frame(ring,
+                Http2FrameType.Headers, flags: 0, streamId, firstHalf);
+            // Interleave a DATA frame instead of a CONTINUATION.
+            var bogusData = new byte[] { 0x00, 0x00, 0x00, 0x00, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE };
+            WriteHandcraftedH2Frame(ring,
+                Http2FrameType.Data, flags: 0, streamId, bogusData);
+
+            Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+        }
+        finally { ArrayPool<byte>.Shared.Return(hpackBuf); }
+    }
+
+    [Test]
+    public void Continuation_WithoutPrecedingHeaders_Throws()
+    {
+        // Stray CONTINUATION (no HEADERS before it) — the dispatcher
+        // case `Http2FrameType.Continuation` should reject it as
+        // out-of-sequence per RFC 7540 §6.10.
+        using var ring = CreateRing();
+        WriteHandcraftedH2Frame(ring,
+            Http2FrameType.Continuation, flags: Http2Flags.EndHeaders, streamId: 1,
+            payload: new byte[] { 0x82 }); // single indexed-header byte
+        Assert.Throws<InvalidDataException>(() => FrameProtocol.ReadFramePayload(ring));
+
+        WriteGoodMessageFrame(ring, streamId: 29);
+        AssertNextReadIsGoodMessage(ring, streamId: 29);
     }
 }

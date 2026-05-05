@@ -66,6 +66,30 @@ public class HpackTests
     }
 
     [Test]
+    public void DecoderAcceptsDynamicTableSizeUpdateZero_FollowedByHeader()
+    {
+        // RFC 7541 §6.3 dynamic table size update. We advertise
+        // SETTINGS_HEADER_TABLE_SIZE=0 so the only legitimate update from
+        // a peer is size=0 (acknowledging our advertisement, or explicitly
+        // disabling its own dynamic table after a previous non-zero
+        // setting). Encoding for size=0 with a 5-bit prefix is 0b001_00000
+        // = 0x20 (no continuation bytes since 0 < 31).
+        //
+        // After the size update, a real-world peer typically continues
+        // with normal indexed/literal headers. We verify the decoder
+        // accepts the size=0 update as a no-op AND continues parsing.
+        var blob = new byte[]
+        {
+            0x20,        // size update, value=0
+            0x82,        // indexed header field, idx=2 → :method GET
+        };
+        var headers = HpackDecoder.Decode(blob);
+        Assert.That(headers, Has.Count.EqualTo(1));
+        Assert.That(headers[0].Name, Is.EqualTo(":method"));
+        Assert.That(System.Text.Encoding.ASCII.GetString(headers[0].Value), Is.EqualTo("GET"));
+    }
+
+    [Test]
     public void HuffmanRoundTrip_ViaKnownVector_DecodesCorrectly()
     {
         var encoded = new byte[]

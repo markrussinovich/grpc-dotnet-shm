@@ -256,9 +256,19 @@ internal static partial class Http2Codec
                     return ReadWindowUpdateFrame(ring, baseCommitReadIdx, streamId, payloadLen, cancellationToken);
 
                 case Http2FrameType.Continuation:
+                    // CONTINUATION is consumed inline by the HEADERS reader
+                    // when it sees a frame without END_HEADERS. Reaching the
+                    // dispatcher with a CONTINUATION means the peer emitted
+                    // it OUT OF SEQUENCE — there was no preceding HEADERS
+                    // (or the preceding HEADERS already had END_HEADERS).
+                    // RFC 7540 §6.10: PROTOCOL_ERROR.
+                    if (payloadLen > 0)
+                    {
+                        var _ = ring.ReserveRead((int)payloadLen, cancellationToken);
+                    }
                     ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
                     throw new InvalidDataException(
-                        "H2 CONTINUATION frame received but not supported (peer must respect SETTINGS_MAX_FRAME_SIZE)");
+                        "H2 CONTINUATION frame received outside a HEADERS sequence (RFC 7540 §6.10)");
 
                 case Http2FrameType.Priority:
                     // Deprecated by RFC 9113; ignore.
@@ -712,55 +722,174 @@ internal static partial class Http2Codec
         var padded = (h2Flags & Http2Flags.Padded) != 0;
         var hasPriority = (h2Flags & Http2Flags.Priority) != 0;
 
-        if (!endHeaders)
-        {
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
-            throw new InvalidDataException(
-                "HEADERS frame without END_HEADERS not supported (peer must respect SETTINGS_MAX_FRAME_SIZE so CONTINUATION is unnecessary)");
-        }
-
-        if (payloadLen == 0)
+        // Empty HEADERS w/ END_HEADERS: trivial path.
+        if (endHeaders && payloadLen == 0)
         {
             ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size);
-            // Empty HEADERS — treat as initial header with no fields.
             return EmitDecodedHeaders(ReadOnlySpan<byte>.Empty, streamId, state, endStream);
         }
 
-        var payloadReservation = ring.ReserveRead(payloadLen, ct);
-
-        // Materialise to a contiguous buffer (HPACK decode requires continuous bytes).
-        var pooled = ArrayPool<byte>.Shared.Rent(payloadLen);
+        // Materialise the first fragment, accounting for PADDED + PRIORITY
+        // prefixes per RFC 7540 §6.2 (these flags appear ONLY on the first
+        // HEADERS frame; CONTINUATION carries no flags except END_HEADERS).
+        var firstFragment = ArrayPool<byte>.Shared.Rent(payloadLen == 0 ? 1 : payloadLen);
+        int firstHeaderBlockOffset;
+        int firstHeaderBlockLength;
         try
         {
-            CopyFromReservationSlice(payloadReservation, 0, pooled.AsSpan(0, payloadLen));
+            if (payloadLen > 0)
+            {
+                var payloadReservation = ring.ReserveRead(payloadLen, ct);
+                CopyFromReservationSlice(payloadReservation, 0, firstFragment.AsSpan(0, payloadLen));
+            }
             ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
 
-            var fragment = pooled.AsSpan(0, payloadLen);
-
-            // Skip PADDED + PRIORITY prefixes per RFC 7540 §6.2.
-            var padLength = 0;
-            var headerOffset = 0;
+            firstHeaderBlockOffset = 0;
+            firstHeaderBlockLength = payloadLen;
             if (padded)
             {
-                padLength = fragment[0];
-                headerOffset += 1;
+                if (payloadLen < 1)
+                {
+                    throw new InvalidDataException("HEADERS PADDED flag with empty payload");
+                }
+                int padLen = firstFragment[0];
+                firstHeaderBlockOffset += 1;
+                firstHeaderBlockLength = payloadLen - 1 - padLen;
             }
             if (hasPriority)
             {
-                headerOffset += 5;
+                firstHeaderBlockOffset += 5;
+                firstHeaderBlockLength -= 5;
             }
-            var headerBlockLength = payloadLen - headerOffset - padLength;
-            if (headerBlockLength < 0)
+            if (firstHeaderBlockLength < 0)
             {
                 throw new InvalidDataException("HEADERS frame: invalid pad/priority prefix");
             }
-            var headerBlock = fragment.Slice(headerOffset, headerBlockLength);
 
-            return EmitDecodedHeaders(headerBlock, streamId, state, endStream);
+            // Fast path: single HEADERS w/ END_HEADERS (the dominant case
+            // for gRPC traffic — SETTINGS_MAX_FRAME_SIZE = 16 MiB makes
+            // CONTINUATION almost never necessary).
+            if (endHeaders)
+            {
+                var single = firstFragment.AsSpan(firstHeaderBlockOffset, firstHeaderBlockLength);
+                return EmitDecodedHeaders(single, streamId, state, endStream);
+            }
+
+            // Slow path: HEADERS without END_HEADERS — reassemble the
+            // header block by reading CONTINUATION frames per RFC 7540
+            // §6.10. CONTINUATION constraints we enforce:
+            //   - frame type MUST be Continuation (PROTOCOL_ERROR otherwise)
+            //   - streamId MUST match the originating HEADERS stream
+            //   - cumulative payload bounded by MaxHeaderListSize
+            //   - any non-CONTINUATION frame from the peer mid-sequence
+            //     is a PROTOCOL_ERROR (peer cannot interleave other
+            //     frames between HEADERS and the terminal CONTINUATION)
+            return ReadHeadersWithContinuations(
+                ring, firstFragment, firstHeaderBlockOffset, firstHeaderBlockLength,
+                streamId, endStream, state, ct);
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(pooled);
+            ArrayPool<byte>.Shared.Return(firstFragment);
+        }
+    }
+
+    private static (FrameHeader Header, FramePayload Payload) ReadHeadersWithContinuations(
+        ShmRing ring, byte[] firstFragment, int firstOff, int firstLen,
+        uint streamId, bool endStream, Http2DecoderState state, CancellationToken ct)
+    {
+        // Accumulate the HPACK header block into a contiguous pooled
+        // buffer. Start it at 4× the first fragment's size to avoid
+        // growth in the typical 2-3 frame case; cap at MaxHeaderListSize.
+        var initialCap = Math.Max(firstLen * 4, 1024);
+        if (initialCap > MaxHeaderListSize) initialCap = MaxHeaderListSize;
+        var assembled = ArrayPool<byte>.Shared.Rent(initialCap);
+        int assembledLen = 0;
+        try
+        {
+            firstFragment.AsSpan(firstOff, firstLen).CopyTo(assembled.AsSpan(0, firstLen));
+            assembledLen = firstLen;
+
+            Span<byte> hb = stackalloc byte[Http2FrameHeader.Size];
+            while (true)
+            {
+                var headerReservation = ring.ReserveRead(Http2FrameHeader.Size, ct);
+                var contBaseIdx = headerReservation.CommitReadIdx;
+                CopyFromReservation(headerReservation, hb);
+                var (contType, contFlags, contPayloadLen, contStreamId) = Http2FrameHeader.Decode(hb);
+
+                if (contPayloadLen > MaxH2FramePayloadSize)
+                {
+                    ring.CommitReadRaw(contBaseIdx, Http2FrameHeader.Size);
+                    throw new InvalidDataException(
+                        $"H2 frame payload length {contPayloadLen} exceeds maximum {MaxH2FramePayloadSize}");
+                }
+                if (contType != Http2FrameType.Continuation)
+                {
+                    // PROTOCOL_ERROR: peer cannot interleave non-CONTINUATION
+                    // frames between HEADERS and the terminal CONTINUATION.
+                    if (contPayloadLen > 0)
+                    {
+                        var _ = ring.ReserveRead(contPayloadLen, ct);
+                    }
+                    ring.CommitReadRaw(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
+                    throw new InvalidDataException(
+                        $"H2 expected CONTINUATION (type=9) for stream {streamId}, got type=0x{(byte)contType:X2}");
+                }
+                if (contStreamId != streamId)
+                {
+                    if (contPayloadLen > 0)
+                    {
+                        var _ = ring.ReserveRead(contPayloadLen, ct);
+                    }
+                    ring.CommitReadRaw(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
+                    throw new InvalidDataException(
+                        $"H2 CONTINUATION streamId mismatch (expected {streamId}, got {contStreamId})");
+                }
+
+                // Cumulative header-list size check BEFORE materialising.
+                if (assembledLen + contPayloadLen > MaxHeaderListSize)
+                {
+                    if (contPayloadLen > 0)
+                    {
+                        var _ = ring.ReserveRead(contPayloadLen, ct);
+                    }
+                    ring.CommitReadRaw(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
+                    throw new InvalidDataException(
+                        $"H2 HEADERS+CONTINUATION cumulative payload exceeds {MaxHeaderListSize} bytes");
+                }
+
+                // Grow the assembled buffer if needed.
+                if (assembledLen + contPayloadLen > assembled.Length)
+                {
+                    var newSize = Math.Max(assembled.Length * 2, assembledLen + contPayloadLen);
+                    if (newSize > MaxHeaderListSize) newSize = MaxHeaderListSize;
+                    var bigger = ArrayPool<byte>.Shared.Rent(newSize);
+                    assembled.AsSpan(0, assembledLen).CopyTo(bigger);
+                    ArrayPool<byte>.Shared.Return(assembled);
+                    assembled = bigger;
+                }
+
+                if (contPayloadLen > 0)
+                {
+                    var contReservation = ring.ReserveRead(contPayloadLen, ct);
+                    CopyFromReservationSlice(
+                        contReservation, 0,
+                        assembled.AsSpan(assembledLen, contPayloadLen));
+                }
+                ring.CommitReadRaw(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
+                assembledLen += contPayloadLen;
+
+                if ((contFlags & Http2Flags.EndHeaders) != 0)
+                {
+                    return EmitDecodedHeaders(
+                        assembled.AsSpan(0, assembledLen), streamId, state, endStream);
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(assembled);
         }
     }
 
