@@ -478,7 +478,21 @@ internal sealed class ShmFrameWriter : IDisposable
                     // streams can deadlock: both sides' WriterLoops block on
                     // WaitForSpace while WindowUpdates sit in the queue behind
                     // the large message being written.
-                    if (entry.Type == FrameType.Message && payload.Length >= 65536)
+                    //
+                    // Also exit batch mode for ANY message that may need to
+                    // chunk on the current ring (payload + 16-byte header
+                    // bigger than ~half the ring). Otherwise a small ring +
+                    // multi-frame message deadlocks: chunk N reserves, fills,
+                    // commits silently (no OS signal under batch); the next
+                    // ReserveWrite blocks because reader is asleep waiting for
+                    // a signal that won't fire until EndBatchWrite — which
+                    // never runs because we're stuck in WaitForSpace.
+                    var ringCap = (int)_ring.Capacity;
+                    var willLikelyChunk = entry.Type == FrameType.Message
+                        && payload.Length >= 65536
+                        || (entry.Type == FrameType.Message
+                            && payload.Length + ShmConstants.FrameHeaderSize >= ringCap / 2);
+                    if (willLikelyChunk)
                     {
                         _ring.EndBatchWrite();
                         DrainControlFrames();
@@ -494,7 +508,7 @@ internal sealed class ShmFrameWriter : IDisposable
                         // removed due to suspected deadlock, but trace confirmed
                         // no deadlock — the "TIMEOUT" was performance regression
                         // from 32× extra signals per batch).
-                        if (payload.Length >= 65536)
+                        if (willLikelyChunk)
                             _ring.BeginBatchWrite();
                     }
                     else
@@ -662,6 +676,82 @@ internal sealed class ShmFrameWriter : IDisposable
     }
 
     /// <summary>
+    /// Inline-write fallback for wire formats where the hand-crafted SHM
+    /// header path doesn't apply (e.g. HTTP/2 — its codec needs to own
+    /// the on-wire header layout). Serialises the protobuf message into
+    /// a temporary pooled buffer, prepends the 5-byte gRPC LPM header,
+    /// and emits a single MESSAGE frame via <see cref="FrameProtocol.WriteFrame"/>.
+    /// Still benefits from the inline lock: bypasses the WriterLoop queue
+    /// and signals overhead.
+    /// </summary>
+    private void WriteInlineDirectMultiFrameViaCodec(uint streamId, int payloadSize, IMessage message, byte extraFlags, CancellationToken ct)
+    {
+        const int GrpcHeaderSize = 5;
+        var totalPayload = GrpcHeaderSize + payloadSize;
+        var buffer = ArrayPool<byte>.Shared.Rent(totalPayload);
+        try
+        {
+            buffer[0] = 0; // no compression
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(buffer.AsSpan(1, 4), (uint)payloadSize);
+            if (payloadSize > 0)
+            {
+                message.WriteTo(buffer.AsSpan(GrpcHeaderSize, payloadSize));
+            }
+
+            var isLast = (extraFlags & MessageFlags.More) == 0;
+            var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
+            var header = new FrameHeader(FrameType.Message, streamId, (uint)totalPayload, flags);
+            FrameProtocol.WriteFrame(_ring, header, buffer.AsSpan(0, totalPayload), ct);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    /// <summary>
+    /// On-wire frame header size for the active wire format on this writer's ring.
+    /// Custom16: 16 bytes; HTTP/2: 9 bytes.
+    /// </summary>
+    private int WireHeaderSize => _ring.Wire == Wire.WireFormat.Http2
+        ? Wire.Http2FrameHeader.Size
+        : ShmConstants.FrameHeaderSize;
+
+    /// <summary>
+    /// Encodes a MESSAGE/DATA wire-format frame header into <paramref name="dest"/>.
+    /// <paramref name="internalFlags"/> uses the SHM-internal convention
+    /// (<see cref="MessageFlags"/>): the H2 path translates to <c>END_STREAM</c>.
+    /// </summary>
+    private void EncodeMessageWireHeader(Span<byte> dest, uint streamId, int payloadLen, byte internalFlags)
+    {
+        if (_ring.Wire == Wire.WireFormat.Http2)
+        {
+            // Defensive: callers (WriteInlineDirectMultiFrame, RingFrameStream)
+            // are expected to chunk so each call's payload fits in a 24-bit
+            // length field. Bail out loudly rather than silently truncating
+            // or corrupting the on-wire frame.
+            if ((uint)payloadLen > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+            {
+                throw new InvalidOperationException(
+                    $"H2 wire frame payload {payloadLen} exceeds 24-bit limit. " +
+                    "Caller must apply Http2FrameHeader.MaxAllowedPayloadLength chunk cap.");
+            }
+            // Mirror Http2Codec.WriteH2Data: END_STREAM only on a final non-More chunk.
+            var isMore = (internalFlags & MessageFlags.More) != 0;
+            var isEndStream = (internalFlags & MessageFlags.EndStream) != 0 && !isMore;
+            Wire.Http2FrameHeader.Encode(
+                dest,
+                Wire.Http2FrameType.Data,
+                (byte)(isEndStream ? Wire.Http2Flags.EndStream : 0),
+                streamId,
+                payloadLen);
+            return;
+        }
+        var header = new FrameHeader(FrameType.Message, streamId, (uint)payloadLen, internalFlags);
+        header.EncodeTo(dest);
+    }
+
+    /// <summary>
     /// Serializes a protobuf message directly into the ring buffer as one or
     /// more frames, bypassing any intermediate byte[] buffer. A custom
     /// <see cref="RingFrameStream"/> feeds <see cref="CodedOutputStream"/>
@@ -675,6 +765,7 @@ internal sealed class ShmFrameWriter : IDisposable
     {
         DrainAllQueued();
 
+        var wireHdrSize = WireHeaderSize;
         var cap = (int)_ring.Capacity;
         // Single-frame threshold: payload ≤ cap/3 → WriteTo(Span) direct ring write.
         // Kept high to maximize speculative zero-copy on the reader side.
@@ -682,6 +773,18 @@ internal sealed class ShmFrameWriter : IDisposable
         // Multi-frame chunk size: cap/8 for deeper pipeline (~8 chunks in-flight).
         // More reader/writer overlap reduces WaitForSpace stalls on large messages.
         var chunkSize = Math.Max(1, cap / 8);
+
+        // HTTP/2 hard limit (RFC 7540 §4.2 / §6.5.2): per-frame payload must
+        // fit in 24 bits (≤ 2^24 - 1). Cap both thresholds below that so a
+        // 16 MiB protobuf (which yields a 16 MiB + 5 B framePayloadSize) is
+        // not handed to Http2FrameHeader.Encode where it would throw.
+        if (_ring.Wire == Wire.WireFormat.Http2)
+        {
+            if (singleFrameThreshold > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+                singleFrameThreshold = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
+            if (chunkSize > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+                chunkSize = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
+        }
 
         // The MESSAGE frame payload includes a 5-byte gRPC length-prefix
         // header (compression flag + big-endian uint32 length) followed by
@@ -695,27 +798,24 @@ internal sealed class ShmFrameWriter : IDisposable
         // protobuf fields to ring memory.
         if (framePayloadSize <= singleFrameThreshold)
         {
-            var totalSize = ShmConstants.FrameHeaderSize + framePayloadSize;
+            var totalSize = wireHdrSize + framePayloadSize;
             var reservation = _ring.ReserveWrite(totalSize, ct);
             if (reservation.Second.IsEmpty)
             {
-                // Write SHM frame header
+                // Wire-format-aware frame header (16 B Custom16 or 9 B H2).
                 var isLast = (extraFlags & MessageFlags.More) == 0;
                 var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
-                var header = new FrameHeader(FrameType.Message, streamId, (uint)framePayloadSize, flags);
-                Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
-                header.EncodeTo(headerBytes);
-                headerBytes.CopyTo(reservation.First.Span);
+                EncodeMessageWireHeader(reservation.First.Span, streamId, framePayloadSize, flags);
 
-                // Write 5-byte gRPC length-prefix header
-                var grpcHdr = reservation.First.Span.Slice(ShmConstants.FrameHeaderSize, GrpcHeaderSize);
+                // 5-byte gRPC LPM header.
+                var grpcHdr = reservation.First.Span.Slice(wireHdrSize, GrpcHeaderSize);
                 grpcHdr[0] = 0; // no compression
                 System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcHdr.Slice(1), (uint)payloadSize);
 
-                // Serialize directly into ring span — zero intermediate buffer
+                // Serialize directly into ring span — zero intermediate buffer.
                 if (payloadSize > 0)
                 {
-                    var payloadSpan = reservation.First.Span.Slice(ShmConstants.FrameHeaderSize + GrpcHeaderSize, payloadSize);
+                    var payloadSpan = reservation.First.Span.Slice(wireHdrSize + GrpcHeaderSize, payloadSize);
                     message.WriteTo(payloadSpan);
                 }
 
@@ -727,7 +827,7 @@ internal sealed class ShmFrameWriter : IDisposable
 
         // Multi-frame or wrap-around: prepend 5-byte gRPC header, then
         // WriteTo(IBufferWriter) through RingFrameStream.
-        using var rfs = new RingFrameStream(_ring, streamId, framePayloadSize, chunkSize, extraFlags, ct);
+        using var rfs = new RingFrameStream(this, streamId, framePayloadSize, chunkSize, extraFlags, ct);
         // Write gRPC header as first 5 bytes
         Span<byte> grpcHeader = stackalloc byte[GrpcHeaderSize];
         grpcHeader[0] = 0; // no compression
@@ -746,10 +846,12 @@ internal sealed class ShmFrameWriter : IDisposable
     /// </summary>
     private sealed class RingFrameStream : Stream, IBufferWriter<byte>
     {
+        private readonly ShmFrameWriter _owner;
         private readonly ShmRing _ring;
         private readonly uint _streamId;
         private readonly int _maxFramePayload;
         private readonly byte _extraFlags;
+        private readonly int _wireHeaderSize;
         private readonly CancellationToken _ct;
         private int _remainingPayload;     // total protobuf bytes left to write
         private int _currentFrameCapacity; // payload capacity of current frame
@@ -757,13 +859,15 @@ internal sealed class ShmFrameWriter : IDisposable
         private WriteReservation _currentReservation;
         private bool _reservationActive;
 
-        public RingFrameStream(ShmRing ring, uint streamId, int totalPayload,
+        public RingFrameStream(ShmFrameWriter owner, uint streamId, int totalPayload,
             int maxFramePayload, byte extraFlags, CancellationToken ct)
         {
-            _ring = ring;
+            _owner = owner;
+            _ring = owner._ring;
             _streamId = streamId;
             _maxFramePayload = maxFramePayload;
             _extraFlags = extraFlags;
+            _wireHeaderSize = owner.WireHeaderSize;
             _ct = ct;
             _remainingPayload = totalPayload;
             ReserveNextFrame();
@@ -772,13 +876,13 @@ internal sealed class ShmFrameWriter : IDisposable
         private void ReserveNextFrame()
         {
             var chunkPayload = Math.Min(_maxFramePayload, _remainingPayload);
-            var totalSize = ShmConstants.FrameHeaderSize + chunkPayload;
+            var totalSize = _wireHeaderSize + chunkPayload;
             _currentReservation = _ring.ReserveWrite(totalSize, _ct);
             _currentFrameCapacity = chunkPayload;
             _currentFrameWritten = 0;
             _reservationActive = true;
 
-            // Write frame header. We know the payload size upfront.
+            // Wire-format-aware frame header.
             var isLastFrame = (chunkPayload >= _remainingPayload);
             var isLast = isLastFrame && (_extraFlags & MessageFlags.More) == 0;
             byte flags;
@@ -786,11 +890,12 @@ internal sealed class ShmFrameWriter : IDisposable
                 flags = _extraFlags;
             else
                 flags = (byte)(MessageFlags.More | _extraFlags);
-            var header = new FrameHeader(FrameType.Message, _streamId, (uint)chunkPayload, flags);
-            Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
-            header.EncodeTo(headerBytes);
 
-            // Write header to reservation (may wrap).
+            // Stack-allocate up to 16 B (Custom16); H2 only needs 9.
+            Span<byte> headerBytes = stackalloc byte[16];
+            headerBytes = headerBytes[.._wireHeaderSize];
+            _owner.EncodeMessageWireHeader(headerBytes, _streamId, chunkPayload, flags);
+
             WriteToReservation(_currentReservation, 0, headerBytes);
         }
 
@@ -799,7 +904,7 @@ internal sealed class ShmFrameWriter : IDisposable
         {
             if (_reservationActive)
             {
-                var totalSize = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                var totalSize = _wireHeaderSize + _currentFrameWritten;
                 _ring.CommitWrite(_currentReservation, totalSize);
                 _reservationActive = false;
             }
@@ -814,7 +919,7 @@ internal sealed class ShmFrameWriter : IDisposable
             var spaceInFrame = _currentFrameCapacity - _currentFrameWritten;
             if (spaceInFrame <= 0)
             {
-                var totalSize = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                var totalSize = _wireHeaderSize + _currentFrameWritten;
                 _ring.CommitWrite(_currentReservation, totalSize);
                 _remainingPayload -= _currentFrameWritten;
                 _reservationActive = false;
@@ -822,7 +927,7 @@ internal sealed class ShmFrameWriter : IDisposable
                 spaceInFrame = _currentFrameCapacity;
             }
 
-            var writeOffset = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+            var writeOffset = _wireHeaderSize + _currentFrameWritten;
             // Return contiguous span within current reservation's First slice.
             // If reservation wraps (Second non-empty), limit to First's remaining.
             var firstLen = _currentReservation.First.Length;
@@ -844,7 +949,7 @@ internal sealed class ShmFrameWriter : IDisposable
             var spaceInFrame = _currentFrameCapacity - _currentFrameWritten;
             if (spaceInFrame <= 0)
             {
-                var totalSize = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                var totalSize = _wireHeaderSize + _currentFrameWritten;
                 _ring.CommitWrite(_currentReservation, totalSize);
                 _remainingPayload -= _currentFrameWritten;
                 _reservationActive = false;
@@ -852,7 +957,7 @@ internal sealed class ShmFrameWriter : IDisposable
                 spaceInFrame = _currentFrameCapacity;
             }
 
-            var writeOffset = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+            var writeOffset = _wireHeaderSize + _currentFrameWritten;
             var firstLen = _currentReservation.First.Length;
             if (writeOffset < firstLen)
             {
@@ -891,7 +996,7 @@ internal sealed class ShmFrameWriter : IDisposable
                     // blocked in a kernel wait and never see the data →
                     // deadlock. Each per-frame signal costs ~10µs (futex
                     // wake), negligible for multi-frame messages (≥16MB).
-                    var totalSize = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                    var totalSize = _wireHeaderSize + _currentFrameWritten;
                     _ring.CommitWrite(_currentReservation, totalSize);
                     _remainingPayload -= _currentFrameWritten;
                     _reservationActive = false;
@@ -900,7 +1005,7 @@ internal sealed class ShmFrameWriter : IDisposable
                 }
 
                 var toCopy = Math.Min(buffer.Length, spaceInFrame);
-                var writeOffset = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                var writeOffset = _wireHeaderSize + _currentFrameWritten;
                 WriteToReservation(_currentReservation, writeOffset, buffer[..toCopy]);
                 _currentFrameWritten += toCopy;
                 buffer = buffer[toCopy..];
@@ -952,14 +1057,14 @@ internal sealed class ShmFrameWriter : IDisposable
             {
                 try
                 {
-                    // Rewrite header with actual payload length.
-                    var header = new FrameHeader(FrameType.Message, _streamId,
-                        (uint)_currentFrameWritten, _extraFlags);
-                    Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
-                    header.EncodeTo(headerBytes);
+                    // Rewrite header with actual payload length, in the
+                    // wire format active on this ring.
+                    Span<byte> headerBytes = stackalloc byte[16];
+                    headerBytes = headerBytes[.._wireHeaderSize];
+                    _owner.EncodeMessageWireHeader(headerBytes, _streamId, _currentFrameWritten, _extraFlags);
                     WriteToReservation(_currentReservation, 0, headerBytes);
 
-                    var written = ShmConstants.FrameHeaderSize + _currentFrameWritten;
+                    var written = _wireHeaderSize + _currentFrameWritten;
                     _ring.CommitWrite(_currentReservation, written);
                 }
                 catch { /* ring may be closed */ }

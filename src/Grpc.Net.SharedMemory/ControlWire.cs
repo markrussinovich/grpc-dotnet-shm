@@ -29,23 +29,51 @@ public static class ControlWire
 {
     /// <summary>
     /// Encodes a CONNECT request.
-    /// Format: version(1) + ringA(8) + ringB(8) [+ flags(1)] = 17 or 18 bytes
+    /// Format (v1 baseline, 18 bytes):
+    ///     version(1) + ringA(8) + ringB(8) + flags(1)
+    /// Optional v1 extension (advertised wire formats, backward compatible):
+    ///     wireFormatCount(1) + wireFormats(N)
     /// flags bit 0: singleStreamMode requested
     /// </summary>
-    public static byte[] EncodeConnectRequest(ulong ringA = 0, ulong ringB = 0, bool singleStreamMode = false)
+    /// <param name="ringA">Client preferred capacity for ring A.</param>
+    /// <param name="ringB">Client preferred capacity for ring B.</param>
+    /// <param name="singleStreamMode">Whether single-stream optimisations are requested.</param>
+    /// <param name="supportedWireFormats">
+    /// Optional ordered list of wire formats the client supports (preference order).
+    /// If <c>null</c> or empty, the request is bit-identical to a legacy v1 CONNECT.
+    /// </param>
+    public static byte[] EncodeConnectRequest(
+        ulong ringA = 0,
+        ulong ringB = 0,
+        bool singleStreamMode = false,
+        IReadOnlyList<Wire.WireFormat>? supportedWireFormats = null)
     {
-        var buffer = new byte[1 + 8 + 8 + 1];
+        var extensionLen = 0;
+        if (supportedWireFormats is { Count: > 0 })
+        {
+            extensionLen = 1 + supportedWireFormats.Count;
+        }
+        var buffer = new byte[1 + 8 + 8 + 1 + extensionLen];
         buffer[0] = ShmConstants.ControlWireVersion;
         BinaryPrimitives.WriteUInt64LittleEndian(buffer.AsSpan(1, 8), ringA);
         BinaryPrimitives.WriteUInt64LittleEndian(buffer.AsSpan(9, 8), ringB);
         buffer[17] = (byte)(singleStreamMode ? 1 : 0);
+        if (extensionLen > 0)
+        {
+            buffer[18] = (byte)supportedWireFormats!.Count;
+            for (var i = 0; i < supportedWireFormats.Count; i++)
+            {
+                buffer[19 + i] = (byte)supportedWireFormats[i];
+            }
+        }
         return buffer;
     }
 
     /// <summary>
-    /// Decodes a CONNECT request.
+    /// Decodes a CONNECT request. Returns the legacy fields plus the optional
+    /// wire-format advertisement (empty array if the peer didn't advertise).
     /// </summary>
-    public static (ulong ringA, ulong ringB, bool singleStreamMode) DecodeConnectRequest(ReadOnlySpan<byte> data)
+    public static (ulong ringA, ulong ringB, bool singleStreamMode, Wire.WireFormat[] supportedWireFormats) DecodeConnectRequest(ReadOnlySpan<byte> data)
     {
         if (data.Length < 1)
         {
@@ -60,7 +88,7 @@ public static class ControlWire
         // Allow minimal v1 payloads (just version byte)
         if (data.Length == 1)
         {
-            return (0, 0, false);
+            return (0, 0, false, Array.Empty<Wire.WireFormat>());
         }
 
         if (data.Length < 1 + 8 + 8)
@@ -72,27 +100,68 @@ public static class ControlWire
         var ringB = BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(9, 8));
         // flags byte is optional for backward compatibility (old clients send 17 bytes)
         var singleStream = data.Length > 17 && (data[17] & 1) != 0;
-        return (ringA, ringB, singleStream);
+
+        // Optional wire-format extension at offset 18+.
+        Wire.WireFormat[] formats = Array.Empty<Wire.WireFormat>();
+        if (data.Length > 18)
+        {
+            int count = data[18];
+            // Strict validation: a peer that advertises N formats but doesn't
+            // include their bytes is malformed and the connection should fail
+            // rather than silently being treated as "no advertisement"
+            // (which would default to Custom16). Be loud about protocol errors.
+            if (data.Length < 19 + count)
+            {
+                throw new InvalidDataException(
+                    $"Connect request truncated: declared {count} wire formats but only {data.Length - 19} byte(s) of advertisement available");
+            }
+            formats = new Wire.WireFormat[count];
+            for (var i = 0; i < count; i++)
+            {
+                var raw = data[19 + i];
+                // Reject unknown enum values at the protocol boundary so we
+                // never propagate garbage into ring.Wire.
+                if (raw != (byte)Wire.WireFormat.Custom16 && raw != (byte)Wire.WireFormat.Http2)
+                {
+                    throw new InvalidDataException(
+                        $"Connect request advertises unknown wire format 0x{raw:X2} at index {i}");
+                }
+                formats[i] = (Wire.WireFormat)raw;
+            }
+        }
+
+        return (ringA, ringB, singleStream, formats);
     }
 
     /// <summary>
     /// Encodes an ACCEPT response with the data segment name.
-    /// Format: version(1) + nameLen(4) + name(n)
+    /// Format (v1 baseline): version(1) + nameLen(4) + name(n)
+    /// Optional v1 extension (backward compatible): selectedWireFormat(1)
     /// </summary>
-    public static byte[] EncodeConnectResponse(string segmentName)
+    /// <param name="segmentName">The data segment name advertised to the client.</param>
+    /// <param name="selectedWireFormat">
+    /// Selected wire format. <c>null</c> = legacy response (no extension), implies Custom16.
+    /// </param>
+    public static byte[] EncodeConnectResponse(string segmentName, Wire.WireFormat? selectedWireFormat = null)
     {
         var nameBytes = Encoding.UTF8.GetBytes(segmentName);
-        var buffer = new byte[1 + 4 + nameBytes.Length];
+        var extensionLen = selectedWireFormat.HasValue ? 1 : 0;
+        var buffer = new byte[1 + 4 + nameBytes.Length + extensionLen];
         buffer[0] = ShmConstants.ControlWireVersion;
         BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(1, 4), (uint)nameBytes.Length);
         nameBytes.CopyTo(buffer.AsSpan(5));
+        if (selectedWireFormat.HasValue)
+        {
+            buffer[5 + nameBytes.Length] = (byte)selectedWireFormat.Value;
+        }
         return buffer;
     }
 
     /// <summary>
-    /// Decodes an ACCEPT response.
+    /// Decodes an ACCEPT response. Returns the segment name and the optional
+    /// selected wire format (Custom16 if absent for backward compat).
     /// </summary>
-    public static string DecodeConnectResponse(ReadOnlySpan<byte> data)
+    public static (string SegmentName, Wire.WireFormat WireFormat) DecodeConnectResponse(ReadOnlySpan<byte> data)
     {
         if (data.Length < 1 + 4)
         {
@@ -110,7 +179,22 @@ public static class ControlWire
             throw new InvalidDataException("Connect response name missing");
         }
 
-        return Encoding.UTF8.GetString(data.Slice(5, nameLen));
+        var name = Encoding.UTF8.GetString(data.Slice(5, nameLen));
+        var wf = Wire.WireFormat.Custom16;
+        if (data.Length > 5 + nameLen)
+        {
+            var raw = data[5 + nameLen];
+            // Reject unknown enum values; treating an unrecognised byte as
+            // "default to Custom16" would silently downgrade clients that
+            // think they negotiated H2 with a misbehaving peer.
+            if (raw != (byte)Wire.WireFormat.Custom16 && raw != (byte)Wire.WireFormat.Http2)
+            {
+                throw new InvalidDataException(
+                    $"Connect response advertises unknown wire format 0x{raw:X2}");
+            }
+            wf = (Wire.WireFormat)raw;
+        }
+        return (name, wf);
     }
 
     /// <summary>

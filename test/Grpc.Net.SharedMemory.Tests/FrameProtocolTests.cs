@@ -608,5 +608,240 @@ public class ShmGrpcRequestStreamTests
         p.Release();
     }
 
+    [Test]
+    public void ZeroCopyRead_ChainZc_ReleasesAnchor_WhenContinuationWraps()
+    {
+        // Repro: chain-ZC anchor must close even when the chain's final
+        // frame falls to the copy path because its payload reservation
+        // wraps the ring boundary.
+        //
+        // Multi-frame chain ZC opens on the first frame when total LPM
+        // size ≤ ChainZcBudget (cap/2) and the first payload reservation
+        // is contiguous. The codec previously assumed every chain frame
+        // would also be contiguous and only called CloseZcChain on the
+        // tryZc=true branch. But a continuation frame can be non-
+        // contiguous if the writer's payload spans the ring's wrap
+        // boundary; in that case the codec falls to the copy path and
+        // (pre-fix) did NOT call CloseZcChain. The chain anchor stays
+        // open, so FramePayload.Release on the still-held ZC frame
+        // cannot fire EndZcReservation — header.ReadIdx never advances
+        // and the writer eventually deadlocks.
+        //
+        // Layout (cap = 1 MiB, maxFramePayload = cap/3 ≈ 349 525):
+        //   * One filler frame (640 KiB total wire) advances readIdx so
+        //     that the chain message starts ~640 KiB into the ring.
+        //   * Chain message 400 KiB: frame 1 ≈ 349 525 B (contiguous,
+        //     ZC-eligible, opens chain), frame 2 ≈ 60 075 B whose
+        //     payload reservation wraps because (640 KiB + frame 1 wire)
+        //     + frame 2 payload > cap.
+        const int Cap = 1024 * 1024;
+        var name = $"grpc_chainwrap_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: Cap, maxStreams: 10);
+        var ring = seg.RingA;
+
+        // Pre-position readIdx to ~640 KiB into the ring. Use TWO filler
+        // frames each below the cap/3 chunking threshold (so each is a
+        // single non-chunked frame); two reads then advance ReadIdx by
+        // exactly 2 × (16 + 327 664) = 655 360 bytes ≈ 640 KiB.
+        const int FillerPayload = 327_664;
+        var filler = new byte[FillerPayload];
+        for (var i = 0; i < 2; i++)
+        {
+            FrameProtocol.WriteMessage(ring, streamId: 1, filler, isLast: true);
+            var (_, fpFiller) = FrameProtocol.ReadFramePayload(ring, zeroCopy: false);
+            fpFiller.Release();
+        }
+
+        var positionAfterFiller = ring.GetState().ReadIdx & ((ulong)Cap - 1UL);
+        Assert.That(positionAfterFiller, Is.GreaterThan(638UL * 1024UL),
+            "Pre-positioning sanity: readIdx must clear the wrap-trigger threshold.");
+        Assert.That(positionAfterFiller, Is.LessThanOrEqualTo(699UL * 1024UL),
+            "Pre-positioning sanity: readIdx must leave room for frame 1 to be contiguous.");
+
+        // Build a 400 KiB chain payload prefixed with a valid 5-byte gRPC
+        // LPM header so the codec's chain-ZC sniff reads a credible body
+        // length (otherwise random bytes would declare an oversized body
+        // and cause the codec to take the copy-mode branch instead of
+        // opening the chain).
+        var chainPayload = new byte[400 * 1024];
+        new Random(99).NextBytes(chainPayload);
+        chainPayload[0] = 0; // no compression
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            chainPayload.AsSpan(1, 4), (uint)(chainPayload.Length - 5));
+
+        FrameProtocol.WriteMessage(ring, streamId: 1, chainPayload, isLast: true);
+
+        // Read the chain. Each ReadFramePayload returns one frame.
+        var frames = new System.Collections.Generic.List<FramePayload>();
+        var assembled = new byte[chainPayload.Length];
+        var off = 0;
+        var sawWrap = false;
+        while (true)
+        {
+            var (h, fp) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+            frames.Add(fp);
+            // A speculative-ZC frame's Memory points at ring storage; a
+            // copied frame's Memory points at a pooled buffer. Track that
+            // at least one of the chain frames took the copy path so the
+            // test fails clearly if the writer's chunking changes and
+            // stops triggering the wrap.
+            if (!fp.IsSpeculativeZeroCopy)
+            {
+                sawWrap = true;
+            }
+            fp.Memory.Span.CopyTo(assembled.AsSpan(off));
+            off += fp.Length;
+            if ((h.Flags & MessageFlags.More) == 0)
+            {
+                break;
+            }
+        }
+
+        Assert.That(off, Is.EqualTo(chainPayload.Length));
+        Assert.That(assembled.SequenceEqual(chainPayload), Is.True,
+            "Reassembled chain must equal the original payload.");
+        Assert.That(sawWrap, Is.True,
+            "Test sanity: at least one chain frame must hit the wrap copy path " +
+            "(otherwise the deadlock scenario isn't being exercised).");
+
+        // Release frames; once both ZC anchor and copy bookkeeping are
+        // resolved, EndZcReservation must fire so SpeculativeReservedBytes
+        // returns to 0 AND the chain anchor is closed.
+        foreach (var fp in frames)
+        {
+            fp.Release();
+        }
+
+        Assert.That(ring.IsChainOpen, Is.False,
+            "Chain anchor must close after the final frame's release " +
+            "(pre-fix: stuck true forever when last frame wrapped).");
+        Assert.That(ring.IsZcChainActive, Is.False,
+            "ZC anchor must release after the chain's last release.");
+        Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(0L));
+
+        // Sanity: the writer should now see free space again. If the chain
+        // anchor leaked, the deferred ReadIdx would still be at the chain
+        // start, hiding the released bytes from the writer.
+        Assert.That(ring.GetState().Used, Is.LessThan((ulong)(Cap / 4)),
+            "Writer's free-space view must reflect the released chain.");
+    }
+
+    [Test]
+    public void ZeroCopyRead_ChainZc_ReleasesAnchor_WhenLastWrapsAndPriorZcFramesPreReleased()
+    {
+        // Race regression: chain ZC opens on a contiguous first frame.
+        // Consumer-side Release of the EARLIER ZC chain frames may run
+        // concurrently with the reader's continued frame emission. If the
+        // chain's LAST frame falls to the wrap-copy path (does NOT
+        // increment SpeculativeReservedBytes), and the consumer happens
+        // to have released ALL preceding ZC frames before the reader
+        // reaches the last frame's CloseZcChain, then:
+        //
+        //   - Pre-fix: SpecReserved is already 0 at CloseZcChain time, so
+        //     no future FramePayload.Release on the pooled wrap-copy
+        //     frames can observe the (remaining==0 && !IsChainOpen) gate
+        //     in FramePayload.Release. _zcActive stays TRUE forever,
+        //     header.ReadIdx stays frozen at the chain start, and ring
+        //     capacity permanently shrinks from the writer's perspective.
+        //
+        //   - Post-fix: CloseZcChain re-checks SpecReserved after setting
+        //     _chainOpen=false, and fires EndZcReservation defensively
+        //     when it observes 0 (and _zcActive==true). EndZcReservation
+        //     is idempotent so the rare race where a concurrent Release
+        //     also fires it is harmless.
+        //
+        // Test layout: cap=1MiB, SingleStreamMode=true (so ChainZcBudget
+        // is ~cap rather than cap/2 — needed to fit a 3-frame chain).
+        // Pre-position readIdx so frames 1+2 are contiguous (ZC-eligible)
+        // and frame 3's read reservation wraps. Read frames 1+2,
+        // RELEASE them, THEN read frame 3 (which closes chain). Without
+        // the fix, IsZcChainActive stays true. With the fix, EndZc fires
+        // from CloseZcChain.
+        const int Cap = 1024 * 1024;
+        var name = $"grpc_chain_race_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: Cap, maxStreams: 10);
+        var ring = seg.RingA;
+        ring.SingleStreamMode = true; // ChainZcBudget = ~cap
+
+        // Pre-position readIdx to ~340 KiB into the ring. Single filler
+        // frame: payload = 340000 - 16 = 339984 (well under cap/3 chunking
+        // threshold so the writer emits exactly one frame). Reading it
+        // advances ReadIdx by exactly 340000 bytes.
+        const int PrePosition = 340000;
+        var filler = new byte[PrePosition - ShmConstants.FrameHeaderSize];
+        FrameProtocol.WriteMessage(ring, streamId: 1, filler, isLast: true);
+        var (_, ffp) = FrameProtocol.ReadFramePayload(ring, zeroCopy: false);
+        ffp.Release();
+
+        var posAfterFiller = ring.GetState().ReadIdx & ((ulong)Cap - 1UL);
+        Assert.That(posAfterFiller, Is.EqualTo((ulong)PrePosition),
+            "Pre-positioning sanity: readIdx must land exactly where computed.");
+
+        // Build 700 KiB chain message. With cap/3 chunk size = 349525
+        // payload bytes per frame:
+        //   frame 1: 349525 payload + 16 header = 349541 wire bytes
+        //   frame 2: 349525 payload + 16 header = 349541 wire bytes
+        //   frame 3: 17750 payload + 16 header = 17766 wire bytes
+        //
+        // Frame 3 reservation starts at PrePosition + 2*349541 = 1039082.
+        // Cap = 1048576. So frame 3 occupies [1039082, 1039082+17766) =
+        // [1039082, 1056848). 1056848 > 1048576 → wraps. ✓
+        const int Total = 700 * 1024;
+        var msg = new byte[Total];
+        new Random(99).NextBytes(msg);
+        msg[0] = 0; // no compression
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            msg.AsSpan(1, 4), (uint)(Total - 5));
+        FrameProtocol.WriteMessage(ring, streamId: 1, msg, isLast: true);
+
+        // Read frame 1 (ZC contiguous). DO NOT release yet.
+        var (h1, fp1) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        Assert.That(fp1.IsSpeculativeZeroCopy, Is.True,
+            "Test sanity: frame 1 must take the ZC path (chain anchor opens here).");
+
+        // Read frame 2 (ZC contiguous). DO NOT release yet.
+        var (h2, fp2) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        Assert.That(fp2.IsSpeculativeZeroCopy, Is.True,
+            "Test sanity: frame 2 must also take the ZC path.");
+
+        // Now SIMULATE the consumer racing the reader: release frames 1
+        // and 2 BEFORE we read frame 3. This drives SpeculativeReservedBytes
+        // to 0 while the chain is still open.
+        fp1.Release();
+        fp2.Release();
+        Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(0L),
+            "After releasing both ZC frames, SpecReserved must be 0.");
+        Assert.That(ring.IsChainOpen, Is.True,
+            "Chain must still be open: frame 3 has not been read yet.");
+        Assert.That(ring.IsZcChainActive, Is.True,
+            "ZC anchor must still be active: EndZc not yet fired.");
+
+        // Read frame 3 (wrap-copy LAST frame). Closes chain.
+        // Pre-fix: _zcActive stays true forever.
+        // Post-fix: CloseZcChain's defensive fire releases the anchor.
+        var (h3, fp3) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        Assert.That(fp3.IsSpeculativeZeroCopy, Is.False,
+            "Test sanity: frame 3 must take the wrap-copy path " +
+            "(otherwise the race scenario isn't being exercised).");
+        fp3.Release();
+
+        // Critical post-conditions: without the defensive fire,
+        // IsZcChainActive stays true and the ring's deferred ReadIdx
+        // never publishes — connection-fatal leak.
+        Assert.That(ring.IsChainOpen, Is.False,
+            "Chain anchor must close after the wrap-copy last frame.");
+        Assert.That(ring.IsZcChainActive, Is.False,
+            "ZC anchor must be torn down even when the consumer pre-released " +
+            "all preceding ZC frames before the reader closed the chain.");
+        Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(0L));
+
+        // Writer's free-space view must reflect the published target.
+        // If the leak occurred, header.ReadIdx would still be at
+        // PrePosition (chain start) and Used would be ~chain length
+        // larger than the actual outstanding data.
+        Assert.That(ring.GetState().Used, Is.LessThan((ulong)(Cap / 4)),
+            "Writer's free-space view must reflect the released chain.");
+    }
+
     #endregion
 }

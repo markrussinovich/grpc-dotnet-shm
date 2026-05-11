@@ -73,52 +73,25 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// When true, this connection was negotiated for single-stream mode.
-    /// Server handlers use ExecuteInline for atomic ring writes.
+    /// Server handlers use ExecuteInline for atomic ring writes; the data
+    /// rings raise their chain-ZC budget to <c>cap - SmallReserve</c>
+    /// (see <see cref="ShmRing.ChainZcBudget"/>) so a single in-flight
+    /// message can occupy almost the whole ring under ping-pong.
     /// </summary>
-    internal bool SingleStreamMode { get; set; }
-
-    /// <summary>
-    /// Per-connection reusable write buffer for singleStreamMode unary responses.
-    /// Eliminates per-call ArrayPool.Rent for same-sized messages.
-    /// </summary>
-    internal byte[]? CachedWriteBuffer;
-
-    /// <summary>
-    /// Per-connection reusable read/assembly buffer for multi-frame messages.
-    /// Used by server-side ReadSingleMessageAsync and client-side
-    /// ShmControlResponseContent to avoid repeated LOH allocations
-    /// (ArrayPool.Rent/Return of 64MB+ buffers) on every Unary call.
-    /// Access via BorrowReadBuffer/ReturnReadBuffer for thread safety.
-    /// </summary>
-    private byte[]? _cachedReadBuffer;
-
-    /// <summary>
-    /// Max buffer size to cache. Set to ring capacity so assembled buffers
-    /// for messages up to ring capacity (the common case) are reused across
-    /// calls. Messages exceeding ring capacity (e.g. 256MB on a 64MB ring)
-    /// require multi-round-trip assembly and produce oversized buffers that
-    /// are returned to ArrayPool to avoid inflating idle connection RSS.
-    /// </summary>
-    private readonly int _maxCachedReadBufferSize;
-
-    /// <summary>Atomically borrows the cached read buffer (may return null).</summary>
-    internal byte[]? BorrowReadBuffer()
-        => Interlocked.Exchange(ref _cachedReadBuffer, null);
-
-    /// <summary>
-    /// Returns a buffer to the cache. If the cache already has a buffer
-    /// (concurrent return) or the buffer exceeds the size cap, the buffer
-    /// is returned to ArrayPool instead.
-    /// </summary>
-    internal void ReturnReadBuffer(byte[]? buffer)
+    internal bool SingleStreamMode
     {
-        if (buffer == null) return;
-        if (buffer.Length > _maxCachedReadBufferSize
-            || Interlocked.CompareExchange(ref _cachedReadBuffer, buffer, null) != null)
+        get => _singleStreamMode;
+        set
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            _singleStreamMode = value;
+            // Propagate to the data rings so the codec's chain-ZC
+            // budget reflects the negotiated mode without taking a
+            // dependency on ShmConnection at the codec layer.
+            TxRing.SingleStreamMode = value;
+            RxRing.SingleStreamMode = value;
         }
     }
+    private bool _singleStreamMode;
 
     // Keepalive (A73 RFC)
     private readonly ShmKeepaliveOptions _keepaliveOptions;
@@ -188,10 +161,21 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="keepaliveOptions">Optional keepalive options.</param>
     /// <returns>A new client connection.</returns>
     public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null)
+        => ConnectAsClient(name, Wire.WireFormat.Custom16, keepaliveOptions);
+
+    /// <summary>
+    /// Creates a new client-side connection with the specified wire format.
+    /// </summary>
+    public static ShmConnection ConnectAsClient(string name, Wire.WireFormat wireFormat,
+        ShmKeepaliveOptions? keepaliveOptions = null)
     {
         var segment = Segment.Open(name);
         try
         {
+            // Apply wire format BEFORE constructing the connection so the
+            // FrameReaderLoop (started in the ctor) reads using the right codec.
+            segment.RingA.Wire = wireFormat;
+            segment.RingB.Wire = wireFormat;
             return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
         }
         catch
@@ -216,10 +200,24 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         uint maxStreams = 100,
         ShmKeepaliveOptions? keepaliveOptions = null,
         ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
+        => CreateAsServer(name, ringCapacity, maxStreams, Wire.WireFormat.Custom16, keepaliveOptions, enforcementPolicy);
+
+    /// <summary>
+    /// Creates a new server-side connection with the specified wire format.
+    /// </summary>
+    public static ShmConnection CreateAsServer(
+        string name,
+        ulong ringCapacity,
+        uint maxStreams,
+        Wire.WireFormat wireFormat,
+        ShmKeepaliveOptions? keepaliveOptions = null,
+        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
     {
         var segment = Segment.Create(name, ringCapacity, maxStreams);
         try
         {
+            segment.RingA.Wire = wireFormat;
+            segment.RingB.Wire = wireFormat;
             return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy);
         }
         catch
@@ -291,11 +289,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // SendFrame → _frameWriter.Enqueue. If the writer isn't initialized
         // yet, that's a NullReferenceException.
         _frameWriter = new ShmFrameWriter(TxRing, _disposeCts);
-
-        // Cache read buffers up to maxFramePayload (cap/3) — covers
-        // single-frame messages (4MB, 16MB). Larger assembled buffers
-        // from multi-frame messages go back to ArrayPool.
-        _maxCachedReadBufferSize = (int)TxRing.Capacity;
 
         // Start background frame reader
         _frameReaderTask = FrameReaderLoopAsync();
@@ -399,11 +392,13 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// Gets the ring buffer for sending data (client→server for client, server→client for server).
     /// </summary>
     internal ShmRing TxRing => _isClient ? _segment.RingA : _segment.RingB;
-
     /// <summary>
     /// Gets the ring buffer for receiving data (server→client for client, client→server for server).
     /// </summary>
     internal ShmRing RxRing => _isClient ? _segment.RingB : _segment.RingA;
+
+    /// <summary>Test-only helper exposing the wire format negotiated for the TX ring.</summary>
+    internal Wire.WireFormat GetTxRingWireFormatForTest() => TxRing.Wire;
 
     /// <summary>
     /// Sends a GoAway frame to initiate graceful shutdown.
@@ -587,13 +582,30 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 break;
 
             case FrameType.Ping:
-                HandlePing(header, payloadMemory.Span);
-                payload.Release();
+                try
+                {
+                    HandlePing(header, payloadMemory.Span);
+                }
+                finally
+                {
+                    payload.Release();
+                }
                 break;
 
             case FrameType.Pong:
-                HandlePong(header, payloadMemory.Span);
-                payload.Release();
+                // try/finally for symmetry with Ping above. <c>HandlePong</c>
+                // is currently a single field write and cannot throw, but a
+                // future BDP estimator / metrics hook on the pong path
+                // could; the cost on the no-throw path is zero (the JIT
+                // emits the finally inline before the normal break).
+                try
+                {
+                    HandlePong(header, payloadMemory.Span);
+                }
+                finally
+                {
+                    payload.Release();
+                }
                 break;
 
             case FrameType.GoAway:
@@ -614,10 +626,16 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                     break;
                 }
 
-                var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
-                    payloadMemory.Span.Slice(0, payloadLength));
-                AddSendQuota(header.StreamId, increment);
-                payload.Release();
+                try
+                {
+                    var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+                        payloadMemory.Span.Slice(0, payloadLength));
+                    AddSendQuota(header.StreamId, increment);
+                }
+                finally
+                {
+                    payload.Release();
+                }
                 break;
 
             default:
@@ -935,14 +953,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         _frameWriter?.Dispose();
 
-        if (CachedWriteBuffer != null)
-        {
-            ArrayPool<byte>.Shared.Return(CachedWriteBuffer);
-            CachedWriteBuffer = null;
-        }
-        var cachedRead = Interlocked.Exchange(ref _cachedReadBuffer, null);
-        if (cachedRead != null) ArrayPool<byte>.Shared.Return(cachedRead);
-
         if (Volatile.Read(ref _goAwaySent) == 0)
         {
             Interlocked.Exchange(ref _goAwaySent, 1);
@@ -988,14 +998,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
 
         _frameWriter?.Dispose();
-
-        if (CachedWriteBuffer != null)
-        {
-            ArrayPool<byte>.Shared.Return(CachedWriteBuffer);
-            CachedWriteBuffer = null;
-        }
-        var cachedRead2 = Interlocked.Exchange(ref _cachedReadBuffer, null);
-        if (cachedRead2 != null) ArrayPool<byte>.Shared.Return(cachedRead2);
 
         if (Volatile.Read(ref _goAwaySent) == 0)
         {

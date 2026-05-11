@@ -38,6 +38,14 @@ public readonly struct FramePayload
 
     public int Length => Memory.Length;
 
+    /// <summary>
+    /// True if this payload is a speculative zero-copy view of ring memory
+    /// (versus a pool-backed copy). Used by upper-layer multi-frame
+    /// assemblers to decide whether to chain segments (preserving ZC) or
+    /// copy into a contiguous buffer (compressed-message path needs that).
+    /// </summary>
+    public bool IsSpeculativeZeroCopy => _speculativeRing != null;
+
     private FramePayload(ReadOnlyMemory<byte> memory, byte[]? pooledBuffer,
         ShmRing? speculativeRing = null, int speculativeBytes = 0)
     {
@@ -72,7 +80,36 @@ public readonly struct FramePayload
         // Restore writer capacity by releasing the speculative reservation.
         if (_speculativeRing != null)
         {
-            Interlocked.Add(ref _speculativeRing.SpeculativeReservedBytes, -_speculativeBytes);
+            // Decrement the per-ring speculative byte count first. This is
+            // an atomic operation; the value returned is the post-decrement
+            // count.
+            //
+            // EndZcReservation must fire EXACTLY ONCE per chain anchor —
+            // once <c>SpeculativeReservedBytes</c> hits 0 AND the codec
+            // has already closed the chain (<c>!IsChainOpen</c>). Two
+            // possibilities at the moment we fire:
+            //
+            //   - Single-frame ZC (no chain opened): <c>IsChainOpen</c> is
+            //     false at all times; we always EndZc when the only frame's
+            //     bytes are released.
+            //   - Multi-frame chain ZC: codec opened the chain on the first
+            //     frame (<c>IsChainOpen=true</c>), closes it on the final
+            //     frame's emit. Consumer Releases fire in arbitrary order.
+            //     Without the <c>!IsChainOpen</c> gate, the FIRST Release
+            //     would tear down the anchor (clearing <c>_zcActive</c>),
+            //     stranding the still-in-flight chain frames whose data
+            //     would be overwritten by the cross-process writer.
+            //
+            // The <c>(remaining == 0 &amp;&amp; !IsChainOpen)</c> condition
+            // is checked atomically per Release; only one Release will see
+            // both true (the last one chronologically that is also after
+            // codec's CloseZcChain).
+            var remaining = Interlocked.Add(
+                ref _speculativeRing.SpeculativeReservedBytes, -_speculativeBytes);
+            if (remaining == 0 && !_speculativeRing.IsChainOpen)
+            {
+                _speculativeRing.EndZcReservation();
+            }
         }
     }
 }

@@ -46,6 +46,9 @@ public readonly struct InboundFrame
 
     public int Length => _payload.Length;
 
+    /// <summary>True if this frame's payload is a ring-backed ZC view.</summary>
+    public bool IsSpeculativeZeroCopy => _payload.IsSpeculativeZeroCopy;
+
     /// <summary>Returns the buffer to the pool or commits the ring read.</summary>
     public void ReturnToPool()
     {
@@ -196,6 +199,48 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         };
 
         var (payload, payloadLength) = _requestHeaders.Encode();
+
+        // Single-stream-mode inline-write fast path. When the connection
+        // negotiated single-stream mode and only one stream is active,
+        // bypass the WriterLoop queue and write Headers directly to the
+        // ring under TryPauseWriterLoop.
+        //
+        // This is critical for correctness, not just perf: client unary
+        // sends Headers, then (fire-and-forget) writes the body Message
+        // via WriteInlineDirectMultiFrame which is also a TryPauseWriterLoop
+        // inline write. If Headers went through the queue while Message
+        // went inline, the two write paths race against each other on
+        // the SPSC ring and produce a "Headers not delivered before
+        // Message" failure mode (~1/15 stress runs on Intel Linux).
+        // Routing Headers through the same TryPause path serialises the
+        // sends through `_inlineWriterActive` CAS; both writes go to the
+        // ring in caller-thread order, no race.
+        //
+        // Falls back to the queued path when:
+        //   * not in single-stream mode (multi-stream pipelining wants
+        //     Headers in the WriterLoop's batch), or
+        //   * TryPauseWriterLoop fails (WriterLoop busy or another inline
+        //     writer holds the CAS); the queued path is correct (single
+        //     writer = WriterLoop) and Just Slower.
+        if (_connection.SingleStreamMode && _connection.ActiveStreamCount <= 1)
+        {
+            var writer = _connection.FrameWriter;
+            if (writer != null && writer.TryPauseWriterLoop())
+            {
+                try
+                {
+                    writer.WriteInlineFrame(FrameType.Headers, StreamId,
+                        HeadersFlags.Initial, payload.AsSpan(0, payloadLength), default);
+                    return Task.CompletedTask;
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(payload);
+                    writer.ResumeWriterLoop();
+                }
+            }
+        }
+
         if (payloadLength <= 512)
         {
             Task task;
@@ -1013,49 +1058,78 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     internal void OnFrameReceived(InboundFrame frame)
     {
-        if (Volatile.Read(ref _disposed) != 0 || _cancelled)
+        var ownsFrame = true;
+        try
         {
-            frame.ReturnToPool();
-            return;
-        }
-
-        switch (frame.Type)
-        {
-            case FrameType.Cancel:
-                _cancelled = true;
-                CancelCancellationToken();
+            if (Volatile.Read(ref _disposed) != 0 || _cancelled)
+            {
                 frame.ReturnToPool();
-                _inboundFrames.Writer.TryComplete();
-                _connection.RemoveStream(StreamId);
-                break;
+                ownsFrame = false;
+                return;
+            }
 
-            case FrameType.HalfClose:
-                _halfCloseReceived = true;
-                if (!_inboundFrames.Writer.TryWrite(frame))
-                {
+            switch (frame.Type)
+            {
+                case FrameType.Cancel:
+                    _cancelled = true;
+                    CancelCancellationToken();
                     frame.ReturnToPool();
-                }
-                break;
+                    ownsFrame = false;
+                    _inboundFrames.Writer.TryComplete();
+                    _connection.RemoveStream(StreamId);
+                    break;
 
-            case FrameType.Trailers:
-                _halfCloseReceived = true;
-                if (!_inboundFrames.Writer.TryWrite(frame))
-                {
-                    frame.ReturnToPool();
-                }
-                _inboundFrames.Writer.TryComplete();
-                // Auto-remove from connection to prevent accumulation when
-                // callers don't dispose the stream (e.g., undisposed AsyncUnaryCall).
-                // No more frames will arrive after TRAILERS.
-                _connection.RemoveStream(StreamId);
-                break;
+                case FrameType.HalfClose:
+                    _halfCloseReceived = true;
+                    if (_inboundFrames.Writer.TryWrite(frame))
+                    {
+                        ownsFrame = false;
+                    }
+                    else
+                    {
+                        frame.ReturnToPool();
+                        ownsFrame = false;
+                    }
+                    break;
 
-            default:
-                if (!_inboundFrames.Writer.TryWrite(frame))
-                {
-                    frame.ReturnToPool();
-                }
-                break;
+                case FrameType.Trailers:
+                    _halfCloseReceived = true;
+                    if (_inboundFrames.Writer.TryWrite(frame))
+                    {
+                        ownsFrame = false;
+                    }
+                    else
+                    {
+                        frame.ReturnToPool();
+                        ownsFrame = false;
+                    }
+                    _inboundFrames.Writer.TryComplete();
+                    // Auto-remove from connection to prevent accumulation when
+                    // callers don't dispose the stream (e.g., undisposed AsyncUnaryCall).
+                    // No more frames will arrive after TRAILERS.
+                    _connection.RemoveStream(StreamId);
+                    break;
+
+                default:
+                    if (_inboundFrames.Writer.TryWrite(frame))
+                    {
+                        ownsFrame = false;
+                    }
+                    else
+                    {
+                        frame.ReturnToPool();
+                        ownsFrame = false;
+                    }
+                    break;
+            }
+        }
+        catch
+        {
+            if (ownsFrame)
+            {
+                frame.ReturnToPool();
+            }
+            throw;
         }
     }
 

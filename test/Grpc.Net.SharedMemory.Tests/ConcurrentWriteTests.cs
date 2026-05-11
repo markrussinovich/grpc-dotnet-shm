@@ -252,11 +252,35 @@ public class ConcurrentWriteTests
         var writing = true;
         var writerTasks = Enumerable.Range(0, 8).Select(i => Task.Run(async () =>
         {
+            ShmGrpcStream? stream = null;
             try
             {
-                var stream = client.CreateStream();
-                using var d = stream;
-                await stream.SendRequestHeadersAsync($"/test/GoAway{i}", "localhost");
+                // CreateStream/SendRequestHeaders may legitimately race with
+                // SendGoAway on a slow/loaded thread pool: the worker task is
+                // queued at t=0 but may not be scheduled until after the main
+                // thread has Sleep(50)+SendGoAway(). In that case the
+                // connection refuses new streams with InvalidOperationException
+                // ("Connection is being closed due to GoAway"), which is the
+                // CORRECT behaviour, not corruption. Catch it here so the
+                // outer "Errors must be empty" assertion still distinguishes
+                // a real corruption error from this expected race.
+                try
+                {
+                    stream = client.CreateStream();
+                    await stream.SendRequestHeadersAsync($"/test/GoAway{i}", "localhost");
+                }
+                catch (ObjectDisposedException)
+                {
+                    return; // race-lost vs SendGoAway; expected
+                }
+                catch (RingClosedException)
+                {
+                    return; // ditto
+                }
+                catch (InvalidOperationException)
+                {
+                    return; // CreateStream after GoAway throws this; expected
+                }
 
                 while (Volatile.Read(ref writing))
                 {
@@ -281,6 +305,10 @@ public class ConcurrentWriteTests
             catch (Exception ex)
             {
                 errors.Add(ex);
+            }
+            finally
+            {
+                stream?.Dispose();
             }
         })).ToArray();
 
