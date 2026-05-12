@@ -354,15 +354,10 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
             // Send CONNECT request with preferred ring capacity from client options.
             // Server will negotiate: Min(clientPreferred, serverMax). Value 0 = use server default.
+            // Wire format is always HTTP/2 (advertised in the extension).
             var preferredRing = _options.RingCapacity;
-            // Advertise wire formats only when preferring H2. Without an
-            // advertisement, servers default to Custom16 and the CONNECT
-            // payload stays legacy-compatible.
-            Wire.WireFormat[]? supportedFormats = _options.PreferHttp2
-                ? new[] { Wire.WireFormat.Http2, Wire.WireFormat.Custom16 }
-                : null;
             await WriteControlFrameAsync(ctlTx, FrameType.Connect,
-                ControlWire.EncodeConnectRequest(preferredRing, preferredRing, _options.SingleStreamMode, supportedFormats), ct).ConfigureAwait(false);
+                ControlWire.EncodeConnectRequest(preferredRing, preferredRing, _options.SingleStreamMode), ct).ConfigureAwait(false);
 
             // Read response
             var (responseHeader, responsePayload) = await ReadControlFrameAsync(ctlRx, ct).ConfigureAwait(false);
@@ -370,7 +365,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
             switch (responseHeader.Type)
             {
                 case FrameType.Accept:
-                    var (dataSegmentName, selectedWireFormat) = ControlWire.DecodeConnectResponse(responsePayload.Span);
+                    var dataSegmentName = ControlWire.DecodeConnectResponse(responsePayload.Span);
 
                     // Open the data segment
                     var dataSegment = Segment.Open(dataSegmentName);
@@ -381,11 +376,8 @@ public sealed class ShmControlHandler : HttpMessageHandler
                         // Signal that client has mapped the segment
                         dataSegment.SetClientReady(true);
 
-                        // Apply negotiated wire format to data rings BEFORE
-                        // any frames flow.
-                        dataSegment.RingA.Wire = selectedWireFormat;
-                        dataSegment.RingB.Wire = selectedWireFormat;
-
+                        // Wire format is always HTTP/2 — the protocol layer rejected
+                        // anything else.
                         // Create and return the connection
                         var conn = ShmConnection.FromClientSegment(dataSegmentName, dataSegment);
                         if (_options.SingleStreamMode)

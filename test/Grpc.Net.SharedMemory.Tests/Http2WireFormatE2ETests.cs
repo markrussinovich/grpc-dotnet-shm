@@ -50,8 +50,8 @@ public class Http2WireFormatE2ETests
     public async Task UnaryCall_OverHttp2Wire_Works()
     {
         var segmentName = $"grpc_h2_{Guid.NewGuid():N}";
-        using var server = ShmConnection.CreateAsServer(segmentName, 4096, 100, WireFormat.Http2);
-        using var client = ShmConnection.ConnectAsClient(segmentName, WireFormat.Http2);
+        using var server = ShmConnection.CreateAsServer(segmentName, 4096, 100);
+        using var client = ShmConnection.ConnectAsClient(segmentName);
 
         var requestData = Encoding.UTF8.GetBytes("ClientPayload");
         var responseData = Encoding.UTF8.GetBytes("Hello over HTTP/2!");
@@ -89,8 +89,8 @@ public class Http2WireFormatE2ETests
     public async Task ServerStreaming_OverHttp2Wire_Works()
     {
         var segmentName = $"grpc_h2_{Guid.NewGuid():N}";
-        using var server = ShmConnection.CreateAsServer(segmentName, 8192, 100, WireFormat.Http2);
-        using var client = ShmConnection.ConnectAsClient(segmentName, WireFormat.Http2);
+        using var server = ShmConnection.CreateAsServer(segmentName, 8192, 100);
+        using var client = ShmConnection.ConnectAsClient(segmentName);
 
         const int messageCount = 5;
 
@@ -127,8 +127,8 @@ public class Http2WireFormatE2ETests
     public async Task LargePayload_OverHttp2Wire_PreservesBytes()
     {
         var segmentName = $"grpc_h2_{Guid.NewGuid():N}";
-        using var server = ShmConnection.CreateAsServer(segmentName, 64 * 1024, 100, WireFormat.Http2);
-        using var client = ShmConnection.ConnectAsClient(segmentName, WireFormat.Http2);
+        using var server = ShmConnection.CreateAsServer(segmentName, 64 * 1024, 100);
+        using var client = ShmConnection.ConnectAsClient(segmentName);
 
         const int payloadSize = 4 * 1024;
         var rng = new Random(0x1234);
@@ -166,8 +166,8 @@ public class Http2WireFormatE2ETests
     public async Task SixteenMB_OverHttp2Wire_PreservesBytes()
     {
         var segmentName = $"grpc_h2_{Guid.NewGuid():N}";
-        using var server = ShmConnection.CreateAsServer(segmentName, 64 * 1024 * 1024, 100, WireFormat.Http2);
-        using var client = ShmConnection.ConnectAsClient(segmentName, WireFormat.Http2);
+        using var server = ShmConnection.CreateAsServer(segmentName, 64 * 1024 * 1024, 100);
+        using var client = ShmConnection.ConnectAsClient(segmentName);
 
         const int payloadSize = 16 * 1024 * 1024;
         var rng = new Random(0x9876);
@@ -208,16 +208,15 @@ public class Http2WireFormatE2ETests
     /// <summary>
     /// Boundary cases for HTTP/2's 24-bit frame length cap.
     /// Skips the small-ring (4 KiB) cases because the underlying transport
-    /// has a pre-existing limitation with payloads >> ring capacity that
-    /// affects both Custom16 and H2 (verified on master without H2 code).
+    /// has a pre-existing limitation with payloads >> ring capacity.
     /// </summary>
     [TestCaseSource(nameof(H2BoundarySizes))]
     [CancelAfter(60000)]
     public async Task H2_PayloadAtFrameBoundary_RoundTrip(int appPayloadSize, ulong ringCapacity)
     {
         var segmentName = $"grpc_h2bnd_{Guid.NewGuid():N}";
-        using var server = ShmConnection.CreateAsServer(segmentName, ringCapacity, 100, WireFormat.Http2);
-        using var client = ShmConnection.ConnectAsClient(segmentName, WireFormat.Http2);
+        using var server = ShmConnection.CreateAsServer(segmentName, ringCapacity, 100);
+        using var client = ShmConnection.ConnectAsClient(segmentName);
 
         var rng = new Random(0x55AA);
         var requestData = new byte[appPayloadSize];

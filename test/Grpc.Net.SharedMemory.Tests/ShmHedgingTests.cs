@@ -228,7 +228,7 @@ public class ShmHedgingTests
 
             for (int i = 0; i < 3; i++)
             {
-                await serverStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Message {i}"));
+                await serverStream.SendMessageAsync(LpmHelpers.WrapLpmText($"Message {i}"));
             }
 
             await serverStream.SendTrailersAsync(StatusCode.OK);

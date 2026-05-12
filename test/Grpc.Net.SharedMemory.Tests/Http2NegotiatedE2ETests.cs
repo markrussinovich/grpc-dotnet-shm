@@ -72,7 +72,7 @@ public class Http2NegotiatedE2ETests
         });
 
         using var handler = new ShmControlHandler(baseName,
-            new ShmClientTransportOptions { PreferHttp2 = true });
+            new ShmClientTransportOptions());
         var conn = await handler.ConnectForTest(default);
         try
         {
@@ -89,7 +89,6 @@ public class Http2NegotiatedE2ETests
             var received = await serverTask;
             Assert.That(received, Is.EqualTo(payload));
             Assert.That(resp, Is.EqualTo(payload));
-            Assert.That(conn.GetTxRingWireFormatForTest(), Is.EqualTo(WireFormat.Http2));
         }
         finally
         {

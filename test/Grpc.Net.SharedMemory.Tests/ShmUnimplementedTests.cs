@@ -140,7 +140,7 @@ public class ShmUnimplementedTests
         await clientStream.SendRequestHeadersAsync("/Greet.Greeter/ClientStreamDoesNotExist", "localhost");
         
         // Client still sends some messages before getting error
-        await clientStream.SendMessageAsync(new byte[] { 1, 2, 3 });
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { 1, 2, 3 }));
         await clientStream.SendHalfCloseAsync();
 
         await serverTask;
@@ -170,7 +170,7 @@ public class ShmUnimplementedTests
         // Client attempts bidirectional streaming on non-existent method
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/Greet.Greeter/BiDiDoesNotExist", "localhost");
-        await clientStream.SendMessageAsync(new byte[] { 1, 2, 3 });
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { 1, 2, 3 }));
         await clientStream.SendHalfCloseAsync();
 
         await serverTask;

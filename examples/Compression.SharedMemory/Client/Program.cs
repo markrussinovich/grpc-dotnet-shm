@@ -19,6 +19,7 @@
 using Grpc.Core;
 using Grpc.Net.SharedMemory;
 using Grpc.Net.SharedMemory.Compression;
+using System.Buffers.Binary;
 using System.Text;
 
 const string SegmentName = "compression_example_shm";
@@ -90,7 +91,7 @@ await stream.SendRequestHeadersAsync(requestHeaders);
 Console.WriteLine("Sent request headers");
 
 // Send the message (use original bytes - in real implementation, framing would handle compression)
-await stream.SendMessageAsync(messageBytes);
+await stream.SendMessageAsync(WrapLpm(messageBytes));
 Console.WriteLine("Sent message");
 
 // Signal half-close
@@ -114,7 +115,8 @@ foreach (var kv in responseHeaders.Metadata)
 var (frameType, payload) = await stream.ReceiveFrameAsync();
 if (frameType == FrameType.Message && payload != null)
 {
-    var responseText = Encoding.UTF8.GetString(payload);
+    // H2 DATA frame body is a gRPC LPM blob; strip the 5-byte prefix.
+    var responseText = Encoding.UTF8.GetString(UnwrapLpm(payload));
     Console.WriteLine($"Response ({payload.Length} bytes): {responseText.Substring(0, Math.Min(80, responseText.Length))}...");
 }
 
@@ -128,3 +130,23 @@ if (frameType == FrameType.Trailers && payload != null)
 
 Console.WriteLine();
 Console.WriteLine("Compression example completed!");
+
+// gRPC length-prefixed message helpers. H2 DATA frame body is
+// [compFlag(1)][len(4 BE)][body]; both sides must agree.
+static byte[] WrapLpm(byte[] body)
+{
+    var buf = new byte[5 + body.Length];
+    buf[0] = 0; // uncompressed
+    BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(1, 4), (uint)body.Length);
+    body.CopyTo(buf, 5);
+    return buf;
+}
+
+static ReadOnlySpan<byte> UnwrapLpm(byte[] framed)
+{
+    if (framed.Length < 5) throw new InvalidDataException($"LPM blob too short: {framed.Length}");
+    if (framed[0] != 0) throw new InvalidDataException($"Compressed LPM not supported (flag=0x{framed[0]:X2})");
+    var len = (int)BinaryPrimitives.ReadUInt32BigEndian(framed.AsSpan(1, 4));
+    if (5 + len > framed.Length) throw new InvalidDataException($"LPM declares {len} bytes, only {framed.Length - 5} available");
+    return framed.AsSpan(5, len);
+}

@@ -118,7 +118,7 @@ var streamingResults = new List<BenchResult>();
 
 // Run each transport independently to avoid idle-spin stack buildup in SHM frame reader
 #pragma warning disable CS8321
-foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv, StartShmH2Env })
+foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv })
 {
     // Force GC between transport tests to avoid cross-test interference
     // (TCP 256MB tests leave hundreds of MB on LOH that can cause GC pauses
@@ -140,9 +140,6 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv, 
 
     Console.WriteLine($"=== {env.Transport.ToUpper()} Transport ===");
     Console.WriteLine();
-
-    // Reset codec counters so the per-transport counters reflect this run only.
-    FrameProtocol.ResetCodecCounters();
 
     Console.WriteLine("  Unary ping-pong:");
     Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
@@ -174,10 +171,6 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv, 
         streamingResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
         Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
     }
-    Console.WriteLine();
-
-    var clientCounters = FrameProtocol.GetCodecCounters();
-    Console.WriteLine($"  client codec-counters: c16-read={clientCounters.Custom16Read} h2-read={clientCounters.Http2Read} c16-write={clientCounters.Custom16Write} h2-write={clientCounters.Http2Write}");
     Console.WriteLine();
 }
 
@@ -280,16 +273,6 @@ async Task<BenchEnv> StartTcpEnv()
 
 async Task<BenchEnv> StartShmEnv()
 {
-    return await StartShmEnvCore(preferHttp2: false, transportTag: "shm");
-}
-
-async Task<BenchEnv> StartShmH2Env()
-{
-    return await StartShmEnvCore(preferHttp2: true, transportTag: "shm-h2");
-}
-
-async Task<BenchEnv> StartShmEnvCore(bool preferHttp2, string transportTag)
-{
     var segmentName = $"bench_shm_{Environment.ProcessId}_{Guid.NewGuid():N}";
 
     Segment.TryRemoveSegment(segmentName);
@@ -305,7 +288,6 @@ async Task<BenchEnv> StartShmEnvCore(bool preferHttp2, string transportTag)
                 new ShmClientTransportOptions
                 {
                     SingleStreamMode = ShmBenchConfig.SingleStream,
-                    PreferHttp2 = preferHttp2,
                 }),
             DisposeHttpClient = true,
             MaxReceiveMessageSize = 512 * 1024 * 1024,
@@ -316,7 +298,7 @@ async Task<BenchEnv> StartShmEnvCore(bool preferHttp2, string transportTag)
 
         await WaitForServerReadyAsync(client, TimeSpan.FromSeconds(25));
 
-        return new BenchEnv(transportTag, client, channel, async () =>
+        return new BenchEnv("shm", client, channel, async () =>
         {
             channel.Dispose();
             await StopServerProcessAsync(serverProcess).ConfigureAwait(false);
@@ -588,10 +570,6 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
     }
     finally
     {
-        // Print codec counters so the parent benchmark can verify which
-        // wire codec actually carried the traffic.
-        var counters = FrameProtocol.GetCodecCounters();
-        Console.WriteLine($"[SERVER] codec-counters: c16-read={counters.Custom16Read} h2-read={counters.Http2Read} c16-write={counters.Custom16Write} h2-write={counters.Http2Write}");
         server.Shutdown();
         await server.DisposeAsync().ConfigureAwait(false);
         Segment.TryRemoveSegment(segmentName);

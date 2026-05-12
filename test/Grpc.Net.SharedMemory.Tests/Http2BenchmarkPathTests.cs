@@ -30,7 +30,7 @@ public class Http2BenchmarkPathTests
 {
     [Test]
     [CancelAfter(20000)]
-    public async Task UnaryCall_OverGrpcChannelWithPreferHttp2_Works()
+    public async Task UnaryCall_OverGrpcChannel_Works()
     {
         var segmentName = $"h2bench_{Guid.NewGuid():N}";
 
@@ -48,7 +48,6 @@ public class Http2BenchmarkPathTests
             using var handler = new ShmControlHandler(segmentName, new ShmClientTransportOptions
             {
                 EnableMultipleConnections = true,
-                PreferHttp2 = true,
                 SingleStreamMode = true,
                 ConnectTimeout = TimeSpan.FromSeconds(5),
             });

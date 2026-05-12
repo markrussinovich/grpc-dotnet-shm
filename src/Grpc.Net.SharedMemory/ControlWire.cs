@@ -28,52 +28,49 @@ namespace Grpc.Net.SharedMemory;
 public static class ControlWire
 {
     /// <summary>
-    /// Encodes a CONNECT request.
-    /// Format (v1 baseline, 18 bytes):
-    ///     version(1) + ringA(8) + ringB(8) + flags(1)
-    /// Optional v1 extension (advertised wire formats, backward compatible):
-    ///     wireFormatCount(1) + wireFormats(N)
-    /// flags bit 0: singleStreamMode requested
+    /// Wire-format byte for HTTP/2 in the CONNECT/ACCEPT extension.
+    /// The legacy <c>0</c> byte (Custom16) is rejected by current peers.
     /// </summary>
+    private const byte ProtocolWireHttp2 = 1;
+
+    /// <summary>
+    /// Encodes a CONNECT request.
+    /// Format (20 bytes):
+    ///     version(1) + ringA(8) + ringB(8) + flags(1)
+    ///   + wireFormatCount(1)=1 + wireFormat(1)=Http2
+    /// flags bit 0: singleStreamMode requested.
+    /// </summary>
+    /// <remarks>
+    /// Always advertises HTTP/2 (and only HTTP/2). Pre-H2 peers that
+    /// expected the optional extension to be absent will see a 20-byte
+    /// payload instead of 18 and reject (or default-to-Custom16 and then
+    /// fail at the codec). The server side validates the extension and
+    /// rejects connections that do not advertise H2.
+    /// </remarks>
     /// <param name="ringA">Client preferred capacity for ring A.</param>
     /// <param name="ringB">Client preferred capacity for ring B.</param>
     /// <param name="singleStreamMode">Whether single-stream optimisations are requested.</param>
-    /// <param name="supportedWireFormats">
-    /// Optional ordered list of wire formats the client supports (preference order).
-    /// If <c>null</c> or empty, the request is bit-identical to a legacy v1 CONNECT.
-    /// </param>
     public static byte[] EncodeConnectRequest(
         ulong ringA = 0,
         ulong ringB = 0,
-        bool singleStreamMode = false,
-        IReadOnlyList<Wire.WireFormat>? supportedWireFormats = null)
+        bool singleStreamMode = false)
     {
-        var extensionLen = 0;
-        if (supportedWireFormats is { Count: > 0 })
-        {
-            extensionLen = 1 + supportedWireFormats.Count;
-        }
-        var buffer = new byte[1 + 8 + 8 + 1 + extensionLen];
+        var buffer = new byte[1 + 8 + 8 + 1 + 1 + 1];
         buffer[0] = ShmConstants.ControlWireVersion;
         BinaryPrimitives.WriteUInt64LittleEndian(buffer.AsSpan(1, 8), ringA);
         BinaryPrimitives.WriteUInt64LittleEndian(buffer.AsSpan(9, 8), ringB);
         buffer[17] = (byte)(singleStreamMode ? 1 : 0);
-        if (extensionLen > 0)
-        {
-            buffer[18] = (byte)supportedWireFormats!.Count;
-            for (var i = 0; i < supportedWireFormats.Count; i++)
-            {
-                buffer[19 + i] = (byte)supportedWireFormats[i];
-            }
-        }
+        buffer[18] = 1;                  // wireFormatCount
+        buffer[19] = ProtocolWireHttp2;  // only Http2
         return buffer;
     }
 
     /// <summary>
-    /// Decodes a CONNECT request. Returns the legacy fields plus the optional
-    /// wire-format advertisement (empty array if the peer didn't advertise).
+    /// Decodes a CONNECT request. Validates that the peer advertises HTTP/2
+    /// and rejects everything else (legacy Custom16-only peers or unknown
+    /// formats are not accepted).
     /// </summary>
-    public static (ulong ringA, ulong ringB, bool singleStreamMode, Wire.WireFormat[] supportedWireFormats) DecodeConnectRequest(ReadOnlySpan<byte> data)
+    public static (ulong ringA, ulong ringB, bool singleStreamMode) DecodeConnectRequest(ReadOnlySpan<byte> data)
     {
         if (data.Length < 1)
         {
@@ -85,12 +82,6 @@ public static class ControlWire
             throw new InvalidDataException($"Unsupported connect request version {data[0]}");
         }
 
-        // Allow minimal v1 payloads (just version byte)
-        if (data.Length == 1)
-        {
-            return (0, 0, false, Array.Empty<Wire.WireFormat>());
-        }
-
         if (data.Length < 1 + 8 + 8)
         {
             throw new InvalidDataException("Connect request invalid length");
@@ -98,70 +89,67 @@ public static class ControlWire
 
         var ringA = BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(1, 8));
         var ringB = BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(9, 8));
-        // flags byte is optional for backward compatibility (old clients send 17 bytes)
         var singleStream = data.Length > 17 && (data[17] & 1) != 0;
 
-        // Optional wire-format extension at offset 18+.
-        Wire.WireFormat[] formats = Array.Empty<Wire.WireFormat>();
-        if (data.Length > 18)
+        // Wire-format extension is mandatory: peer must advertise Http2.
+        // A legacy peer that omits the extension or only advertises
+        // Custom16 is rejected at the protocol boundary.
+        if (data.Length <= 18)
         {
-            int count = data[18];
-            // Strict validation: a peer that advertises N formats but doesn't
-            // include their bytes is malformed and the connection should fail
-            // rather than silently being treated as "no advertisement"
-            // (which would default to Custom16). Be loud about protocol errors.
-            if (data.Length < 19 + count)
+            throw new InvalidDataException(
+                "Connect request missing wire-format advertisement; peer must support HTTP/2");
+        }
+        int count = data[18];
+        if (count == 0)
+        {
+            throw new InvalidDataException(
+                "Connect request advertises zero wire formats; peer must support HTTP/2");
+        }
+        if (data.Length < 19 + count)
+        {
+            throw new InvalidDataException(
+                $"Connect request truncated: declared {count} wire formats but only {data.Length - 19} byte(s) of advertisement available");
+        }
+        var sawHttp2 = false;
+        for (var i = 0; i < count; i++)
+        {
+            if (data[19 + i] == ProtocolWireHttp2)
             {
-                throw new InvalidDataException(
-                    $"Connect request truncated: declared {count} wire formats but only {data.Length - 19} byte(s) of advertisement available");
-            }
-            formats = new Wire.WireFormat[count];
-            for (var i = 0; i < count; i++)
-            {
-                var raw = data[19 + i];
-                // Reject unknown enum values at the protocol boundary so we
-                // never propagate garbage into ring.Wire.
-                if (raw != (byte)Wire.WireFormat.Custom16 && raw != (byte)Wire.WireFormat.Http2)
-                {
-                    throw new InvalidDataException(
-                        $"Connect request advertises unknown wire format 0x{raw:X2} at index {i}");
-                }
-                formats[i] = (Wire.WireFormat)raw;
+                sawHttp2 = true;
+                break;
             }
         }
+        if (!sawHttp2)
+        {
+            throw new InvalidDataException(
+                "Connect request does not advertise HTTP/2; legacy Custom16-only peers are not supported");
+        }
 
-        return (ringA, ringB, singleStream, formats);
+        return (ringA, ringB, singleStream);
     }
 
     /// <summary>
-    /// Encodes an ACCEPT response with the data segment name.
-    /// Format (v1 baseline): version(1) + nameLen(4) + name(n)
-    /// Optional v1 extension (backward compatible): selectedWireFormat(1)
+    /// Encodes an ACCEPT response with the data segment name. Always emits
+    /// the HTTP/2 wire-format byte at the end of the payload.
+    /// Format: version(1) + nameLen(4) + name(n) + wireFormat(1)=Http2.
     /// </summary>
     /// <param name="segmentName">The data segment name advertised to the client.</param>
-    /// <param name="selectedWireFormat">
-    /// Selected wire format. <c>null</c> = legacy response (no extension), implies Custom16.
-    /// </param>
-    public static byte[] EncodeConnectResponse(string segmentName, Wire.WireFormat? selectedWireFormat = null)
+    public static byte[] EncodeConnectResponse(string segmentName)
     {
         var nameBytes = Encoding.UTF8.GetBytes(segmentName);
-        var extensionLen = selectedWireFormat.HasValue ? 1 : 0;
-        var buffer = new byte[1 + 4 + nameBytes.Length + extensionLen];
+        var buffer = new byte[1 + 4 + nameBytes.Length + 1];
         buffer[0] = ShmConstants.ControlWireVersion;
         BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(1, 4), (uint)nameBytes.Length);
         nameBytes.CopyTo(buffer.AsSpan(5));
-        if (selectedWireFormat.HasValue)
-        {
-            buffer[5 + nameBytes.Length] = (byte)selectedWireFormat.Value;
-        }
+        buffer[5 + nameBytes.Length] = ProtocolWireHttp2;
         return buffer;
     }
 
     /// <summary>
-    /// Decodes an ACCEPT response. Returns the segment name and the optional
-    /// selected wire format (Custom16 if absent for backward compat).
+    /// Decodes an ACCEPT response. Validates that the server selected HTTP/2;
+    /// rejects legacy responses (no extension byte) and Custom16 selection.
     /// </summary>
-    public static (string SegmentName, Wire.WireFormat WireFormat) DecodeConnectResponse(ReadOnlySpan<byte> data)
+    public static string DecodeConnectResponse(ReadOnlySpan<byte> data)
     {
         if (data.Length < 1 + 4)
         {
@@ -180,21 +168,22 @@ public static class ControlWire
         }
 
         var name = Encoding.UTF8.GetString(data.Slice(5, nameLen));
-        var wf = Wire.WireFormat.Custom16;
-        if (data.Length > 5 + nameLen)
+
+        // Wire-format byte is mandatory; legacy responses (no extension)
+        // are rejected so we never silently downgrade to Custom16.
+        if (data.Length <= 5 + nameLen)
         {
-            var raw = data[5 + nameLen];
-            // Reject unknown enum values; treating an unrecognised byte as
-            // "default to Custom16" would silently downgrade clients that
-            // think they negotiated H2 with a misbehaving peer.
-            if (raw != (byte)Wire.WireFormat.Custom16 && raw != (byte)Wire.WireFormat.Http2)
-            {
-                throw new InvalidDataException(
-                    $"Connect response advertises unknown wire format 0x{raw:X2}");
-            }
-            wf = (Wire.WireFormat)raw;
+            throw new InvalidDataException(
+                "Connect response missing wire-format byte; peer must select HTTP/2");
         }
-        return (name, wf);
+        var raw = data[5 + nameLen];
+        if (raw != ProtocolWireHttp2)
+        {
+            throw new InvalidDataException(
+                $"Connect response selects wire format 0x{raw:X2}, expected HTTP/2 (0x{ProtocolWireHttp2:X2})");
+        }
+
+        return name;
     }
 
     /// <summary>

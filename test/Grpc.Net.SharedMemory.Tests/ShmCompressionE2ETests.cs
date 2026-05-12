@@ -56,7 +56,7 @@ public class ShmCompressionE2ETests : TransportTestBase
             {
                 await stream.SendResponseHeadersAsync();
 
-                await foreach (var msg in stream.ReceiveMessagesAsync())
+                await foreach (var msg in stream.ReceiveLpmMessagesAsync())
                 {
                     // Verify we received the original decompressed data
                     Assert.That(msg.Length, Is.EqualTo(originalMessage.Length),
@@ -64,7 +64,7 @@ public class ShmCompressionE2ETests : TransportTestBase
                     Assert.That(msg.ToArray(), Is.EqualTo(originalMessage));
 
                     // Echo it back (will be compressed by the server's compression options)
-                    await stream.SendMessageAsync(msg);
+                    await stream.SendMessageAsync(LpmHelpers.WrapLpm(msg));
                 }
 
                 await stream.SendTrailersAsync(StatusCode.OK);
@@ -75,11 +75,11 @@ public class ShmCompressionE2ETests : TransportTestBase
         // Client: create stream, send message, receive response
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/GzipEcho", "localhost");
-        await clientStream.SendMessageAsync(originalMessage);
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(originalMessage));
         await clientStream.SendHalfCloseAsync();
 
         ReadOnlyMemory<byte> receivedResponse = default;
-        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        await foreach (var msg in clientStream.ReceiveLpmMessagesAsync())
         {
             receivedResponse = msg;
         }
@@ -179,10 +179,10 @@ public class ShmCompressionE2ETests : TransportTestBase
             {
                 await stream.SendResponseHeadersAsync();
 
-                await foreach (var msg in stream.ReceiveMessagesAsync())
+                await foreach (var msg in stream.ReceiveLpmMessagesAsync())
                 {
                     Assert.That(msg.ToArray(), Is.EqualTo(originalMessage));
-                    await stream.SendMessageAsync(msg);
+                    await stream.SendMessageAsync(LpmHelpers.WrapLpm(msg));
                 }
 
                 await stream.SendTrailersAsync(StatusCode.OK);
@@ -192,11 +192,11 @@ public class ShmCompressionE2ETests : TransportTestBase
 
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/NoCompress", "localhost");
-        await clientStream.SendMessageAsync(originalMessage);
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(originalMessage));
         await clientStream.SendHalfCloseAsync();
 
         ReadOnlyMemory<byte> receivedResponse = default;
-        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        await foreach (var msg in clientStream.ReceiveLpmMessagesAsync())
         {
             receivedResponse = msg;
         }
@@ -229,10 +229,10 @@ public class ShmCompressionE2ETests : TransportTestBase
             {
                 await stream.SendResponseHeadersAsync();
 
-                await foreach (var msg in stream.ReceiveMessagesAsync())
+                await foreach (var msg in stream.ReceiveLpmMessagesAsync())
                 {
                     Assert.That(msg.ToArray(), Is.EqualTo(originalMessage));
-                    await stream.SendMessageAsync(msg);
+                    await stream.SendMessageAsync(LpmHelpers.WrapLpm(msg));
                 }
 
                 await stream.SendTrailersAsync(StatusCode.OK);
@@ -242,11 +242,11 @@ public class ShmCompressionE2ETests : TransportTestBase
 
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/SmallMsg", "localhost");
-        await clientStream.SendMessageAsync(originalMessage);
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(originalMessage));
         await clientStream.SendHalfCloseAsync();
 
         ReadOnlyMemory<byte> receivedResponse = default;
-        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        await foreach (var msg in clientStream.ReceiveLpmMessagesAsync())
         {
             receivedResponse = msg;
         }
@@ -287,11 +287,11 @@ public class ShmCompressionE2ETests : TransportTestBase
             {
                 await stream.SendResponseHeadersAsync();
 
-                await foreach (var msg in stream.ReceiveMessagesAsync())
+                await foreach (var msg in stream.ReceiveLpmMessagesAsync())
                 {
                     receivedOnServer.Add(msg.ToArray());
                     // Echo each message back
-                    await stream.SendMessageAsync(msg);
+                    await stream.SendMessageAsync(LpmHelpers.WrapLpm(msg));
                 }
 
                 await stream.SendTrailersAsync(StatusCode.OK);
@@ -305,12 +305,12 @@ public class ShmCompressionE2ETests : TransportTestBase
         // Send all messages
         foreach (var msg in messages)
         {
-            await clientStream.SendMessageAsync(msg);
+            await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(msg));
         }
         await clientStream.SendHalfCloseAsync();
 
         var receivedOnClient = new List<byte[]>();
-        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        await foreach (var msg in clientStream.ReceiveLpmMessagesAsync())
         {
             receivedOnClient.Add(msg.ToArray());
         }
@@ -353,10 +353,10 @@ public class ShmCompressionE2ETests : TransportTestBase
             {
                 await stream.SendResponseHeadersAsync();
 
-                await foreach (var msg in stream.ReceiveMessagesAsync())
+                await foreach (var msg in stream.ReceiveLpmMessagesAsync())
                 {
                     Assert.That(msg.ToArray(), Is.EqualTo(originalMessage));
-                    await stream.SendMessageAsync(msg);
+                    await stream.SendMessageAsync(LpmHelpers.WrapLpm(msg));
                 }
 
                 await stream.SendTrailersAsync(StatusCode.OK);
@@ -366,11 +366,11 @@ public class ShmCompressionE2ETests : TransportTestBase
 
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/DeflateEcho", "localhost");
-        await clientStream.SendMessageAsync(originalMessage);
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(originalMessage));
         await clientStream.SendHalfCloseAsync();
 
         ReadOnlyMemory<byte> receivedResponse = default;
-        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        await foreach (var msg in clientStream.ReceiveLpmMessagesAsync())
         {
             receivedResponse = msg;
         }

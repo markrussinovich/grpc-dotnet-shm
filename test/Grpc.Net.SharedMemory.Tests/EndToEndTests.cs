@@ -48,12 +48,12 @@ public class EndToEndTests
 
             // Read request from client
             byte[]? received = null;
-            await foreach (var m in s.ReceiveMessagesAsync())
+            await foreach (var m in s.ReceiveLpmMessagesAsync())
                 received = m;
 
             // Send response
             await s.SendResponseHeadersAsync();
-            await s.SendMessageAsync(responseData);
+            await s.SendMessageAsync(LpmHelpers.WrapLpm(responseData));
             await s.SendTrailersAsync(StatusCode.OK, "Success");
 
             return received;
@@ -62,13 +62,13 @@ public class EndToEndTests
         using var cs = clientConnection.CreateStream();
         var metadata = new Metadata { { "client-id", "test-client" } };
         await cs.SendRequestHeadersAsync("/greet.Greeter/SayHello", "localhost", metadata);
-        await cs.SendMessageAsync(requestData);
+        await cs.SendMessageAsync(LpmHelpers.WrapLpm(requestData));
         await cs.SendHalfCloseAsync();
 
         // Read response
         await cs.ReceiveResponseHeadersAsync();
         byte[]? resp = null;
-        await foreach (var m in cs.ReceiveMessagesAsync())
+        await foreach (var m in cs.ReceiveLpmMessagesAsync())
             resp = m;
 
         var serverReceived = await serverTask;
@@ -95,13 +95,13 @@ public class EndToEndTests
             using var s = stream!;
 
             // Drain client half-close
-            await foreach (var _ in s.ReceiveMessagesAsync()) { }
+            await foreach (var _ in s.ReceiveLpmMessagesAsync()) { }
 
             await s.SendResponseHeadersAsync();
             for (int i = 0; i < messageCount; i++)
             {
                 var message = Encoding.UTF8.GetBytes($"Message {i}");
-                await s.SendMessageAsync(message);
+                await s.SendMessageAsync(LpmHelpers.WrapLpm(message));
             }
             await s.SendTrailersAsync(StatusCode.OK);
         });
@@ -112,7 +112,7 @@ public class EndToEndTests
 
         await cs.ReceiveResponseHeadersAsync();
         var received = new List<byte[]>();
-        await foreach (var m in cs.ReceiveMessagesAsync())
+        await foreach (var m in cs.ReceiveLpmMessagesAsync())
             received.Add(m);
 
         await serverTask;
@@ -143,12 +143,12 @@ public class EndToEndTests
 
             // Read all client messages
             var received = new List<byte[]>();
-            await foreach (var m in s.ReceiveMessagesAsync())
+            await foreach (var m in s.ReceiveLpmMessagesAsync())
                 received.Add(m);
 
             await s.SendResponseHeadersAsync();
             var summary = Encoding.UTF8.GetBytes($"Received {received.Count}");
-            await s.SendMessageAsync(summary);
+            await s.SendMessageAsync(LpmHelpers.WrapLpm(summary));
             await s.SendTrailersAsync(StatusCode.OK);
 
             return received;
@@ -160,13 +160,13 @@ public class EndToEndTests
         for (int i = 0; i < messageCount; i++)
         {
             var message = Encoding.UTF8.GetBytes($"Client message {i}");
-            await cs.SendMessageAsync(message);
+            await cs.SendMessageAsync(LpmHelpers.WrapLpm(message));
         }
         await cs.SendHalfCloseAsync();
 
         await cs.ReceiveResponseHeadersAsync();
         byte[]? resp = null;
-        await foreach (var m in cs.ReceiveMessagesAsync())
+        await foreach (var m in cs.ReceiveLpmMessagesAsync())
             resp = m;
 
         var serverReceived = await serverTask;
@@ -196,13 +196,13 @@ public class EndToEndTests
 
             // Read all client messages
             var received = new List<byte[]>();
-            await foreach (var m in s.ReceiveMessagesAsync())
+            await foreach (var m in s.ReceiveLpmMessagesAsync())
                 received.Add(m);
 
             // Echo them back
             await s.SendResponseHeadersAsync();
             foreach (var msg in received)
-                await s.SendMessageAsync(msg);
+                await s.SendMessageAsync(LpmHelpers.WrapLpm(msg));
             await s.SendTrailersAsync(StatusCode.OK);
 
             return received;
@@ -214,13 +214,13 @@ public class EndToEndTests
         for (int i = 0; i < 3; i++)
         {
             var message = Encoding.UTF8.GetBytes($"Request {i}");
-            await cs.SendMessageAsync(message);
+            await cs.SendMessageAsync(LpmHelpers.WrapLpm(message));
         }
         await cs.SendHalfCloseAsync();
 
         await cs.ReceiveResponseHeadersAsync();
         var clientReceived = new List<byte[]>();
-        await foreach (var m in cs.ReceiveMessagesAsync())
+        await foreach (var m in cs.ReceiveLpmMessagesAsync())
             clientReceived.Add(m);
 
         var serverReceived = await serverTask;
@@ -249,7 +249,7 @@ public class EndToEndTests
             using var s = stream!;
 
             // Drain client messages
-            await foreach (var _ in s.ReceiveMessagesAsync()) { }
+            await foreach (var _ in s.ReceiveLpmMessagesAsync()) { }
 
             // Return error
             await s.SendResponseHeadersAsync();
@@ -261,7 +261,7 @@ public class EndToEndTests
         await cs.SendHalfCloseAsync();
 
         await cs.ReceiveResponseHeadersAsync();
-        await foreach (var _ in cs.ReceiveMessagesAsync()) { }
+        await foreach (var _ in cs.ReceiveLpmMessagesAsync()) { }
 
         await serverTask;
 
@@ -294,7 +294,7 @@ public class EndToEndTests
         // messages because the inbound channel is completed by the
         // Cancel frame. This proves cancel propagated through the ring.
         int serverMsgCount = 0;
-        await foreach (var _ in serverStream!.ReceiveMessagesAsync())
+        await foreach (var _ in serverStream!.ReceiveLpmMessagesAsync())
             serverMsgCount++;
         Assert.That(serverMsgCount, Is.EqualTo(0));
     }
@@ -319,7 +319,7 @@ public class EndToEndTests
             var headers = s.RequestHeaders;
 
             // Drain messages + respond
-            await foreach (var _ in s.ReceiveMessagesAsync()) { }
+            await foreach (var _ in s.ReceiveLpmMessagesAsync()) { }
             await s.SendResponseHeadersAsync();
             await s.SendTrailersAsync(StatusCode.OK);
 
@@ -331,7 +331,7 @@ public class EndToEndTests
         await cs.SendHalfCloseAsync();
 
         await cs.ReceiveResponseHeadersAsync();
-        await foreach (var _ in cs.ReceiveMessagesAsync()) { }
+        await foreach (var _ in cs.ReceiveLpmMessagesAsync()) { }
 
         var serverHeaders = await serverTask;
 
@@ -362,7 +362,7 @@ public class EndToEndTests
 
             var headers = s.RequestHeaders;
 
-            await foreach (var _ in s.ReceiveMessagesAsync()) { }
+            await foreach (var _ in s.ReceiveLpmMessagesAsync()) { }
             await s.SendResponseHeadersAsync();
             await s.SendTrailersAsync(StatusCode.OK);
 
@@ -374,7 +374,7 @@ public class EndToEndTests
         await cs.SendHalfCloseAsync();
 
         await cs.ReceiveResponseHeadersAsync();
-        await foreach (var _ in cs.ReceiveMessagesAsync()) { }
+        await foreach (var _ in cs.ReceiveLpmMessagesAsync()) { }
 
         var serverHeaders = await serverTask;
 
@@ -409,12 +409,12 @@ public class EndToEndTests
 
             // Read the large message
             byte[]? received = null;
-            await foreach (var m in s.ReceiveMessagesAsync())
+            await foreach (var m in s.ReceiveLpmMessagesAsync())
                 received = m;
 
             // Echo it back
             await s.SendResponseHeadersAsync();
-            await s.SendMessageAsync(received!);
+            await s.SendMessageAsync(LpmHelpers.WrapLpm(received!));
             await s.SendTrailersAsync(StatusCode.OK);
 
             return received;
@@ -422,12 +422,12 @@ public class EndToEndTests
 
         using var cs = clientConnection.CreateStream();
         await cs.SendRequestHeadersAsync("/test/Large", "localhost");
-        await cs.SendMessageAsync(largeMessage);
+        await cs.SendMessageAsync(LpmHelpers.WrapLpm(largeMessage));
         await cs.SendHalfCloseAsync();
 
         await cs.ReceiveResponseHeadersAsync();
         byte[]? resp = null;
-        await foreach (var m in cs.ReceiveMessagesAsync())
+        await foreach (var m in cs.ReceiveLpmMessagesAsync())
             resp = m;
 
         var serverReceived = await serverTask;

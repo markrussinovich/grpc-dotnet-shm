@@ -352,14 +352,48 @@ public sealed partial class Segment : IDisposable
         var filePath = FindExistingSegmentPath(name)
             ?? throw new FileNotFoundException($"Segment '{name}' not found at /dev/shm/grpc_shm_{name} or /tmp/grpc_shm_{name}");
 
-        // Open the backing file
-        var backingFile = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        // Open the backing file. Treat "vanished between probe and open" as
+        // FileNotFoundException so callers polling for server readiness can
+        // retry uniformly (they already retry that exception).
+        FileStream backingFile;
+        try
+        {
+            backingFile = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        }
+        catch (DirectoryNotFoundException ex)
+        {
+            throw new FileNotFoundException($"Segment '{name}' not found at '{filePath}' (directory missing)", filePath, ex);
+        }
 
-        // Validate minimum size
-        if (backingFile.Length < ShmConstants.SegmentHeaderSize)
+        long backingFileLength;
+        try
+        {
+            // Reading Length post-construction has been observed to throw
+            // ObjectDisposedException when the file is unlinked or replaced
+            // by a concurrent server-side dispose between FindExistingSegmentPath
+            // and here. Convert to FileNotFoundException so the test/client
+            // retry loop sees a familiar transient error.
+            try
+            {
+                backingFileLength = backingFile.Length;
+            }
+            catch (ObjectDisposedException ex)
+            {
+                throw new FileNotFoundException(
+                    $"Segment '{name}' became unavailable during open (likely concurrent server tear-down)",
+                    filePath, ex);
+            }
+
+            // Validate minimum size
+            if (backingFileLength < ShmConstants.SegmentHeaderSize)
+            {
+                throw new InvalidDataException($"Segment file too small: {backingFileLength} bytes");
+            }
+        }
+        catch
         {
             backingFile.Dispose();
-            throw new InvalidDataException($"Segment file too small: {backingFile.Length} bytes");
+            throw;
         }
 
         // Create memory-mapped file from the backing file (temporarily for header read)
@@ -369,7 +403,7 @@ public sealed partial class Segment : IDisposable
             mappedFile = MemoryMappedFile.CreateFromFile(
                 backingFile,
                 mapName: null,
-                backingFile.Length,
+                backingFileLength,
                 MemoryMappedFileAccess.ReadWrite,
                 HandleInheritability.None,
                 leaveOpen: false);
@@ -400,6 +434,18 @@ public sealed partial class Segment : IDisposable
         if (header.MagicValue != expectedMagic)
         {
             mappedFile.Dispose();
+            // Magic == 0 is the "file truncated to size but header not yet
+            // written" state inside <see cref="Create"/>: SetLength happens
+            // before WriteSegmentHeader, so a probe loop racing a starting
+            // server can observe an all-zero header. Surface this as
+            // FileNotFoundException so readiness probes (which already retry
+            // that exception) keep polling instead of failing the test.
+            if (header.MagicValue == 0)
+            {
+                throw new FileNotFoundException(
+                    $"Segment '{name}' exists but has not been initialised yet (likely starting server)",
+                    filePath);
+            }
             throw new InvalidDataException($"Invalid segment magic: expected 'GRPCSHM\\0', got 0x{header.MagicValue:X16}");
         }
 

@@ -53,7 +53,7 @@ public class LinuxSmokeTests : TransportTestBase
             var serverStream = server.CreateStream();
             await serverStream.SendResponseHeadersAsync();
             var msg = Encoding.UTF8.GetBytes("Hello from server!");
-            await serverStream.SendMessageAsync(msg);
+            await serverStream.SendMessageAsync(LpmHelpers.WrapLpm(msg));
             await serverStream.SendTrailersAsync(StatusCode.OK, "Success");
         });
 
@@ -61,7 +61,7 @@ public class LinuxSmokeTests : TransportTestBase
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/SayHello", "localhost");
         var requestMsg = Encoding.UTF8.GetBytes("Hello from client!");
-        await clientStream.SendMessageAsync(requestMsg);
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(requestMsg));
         await clientStream.SendHalfCloseAsync();
 
         await serverTask;
@@ -87,7 +87,7 @@ public class LinuxSmokeTests : TransportTestBase
         // Client sends message using scatter-write (no intermediate copy)
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/ZeroCopy", "localhost");
-        await clientStream.SendMessageAsync(testData);
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(testData));
         await clientStream.SendHalfCloseAsync();
 
         // The server can verify messages arrive correctly by reading raw frames.
@@ -99,7 +99,7 @@ public class LinuxSmokeTests : TransportTestBase
         // Verify server can create streams independently
         var serverStream = server.CreateStream();
         await serverStream.SendResponseHeadersAsync();
-        await serverStream.SendMessageAsync(Encoding.UTF8.GetBytes("ServerResponse"));
+        await serverStream.SendMessageAsync(LpmHelpers.WrapLpmText("ServerResponse"));
         await serverStream.SendTrailersAsync(StatusCode.OK);
 
         Assert.That(serverStream.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.OK));
