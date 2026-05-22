@@ -131,7 +131,7 @@ public class ShmInterceptorTests
 
         for (int i = 0; i < 3; i++)
         {
-            await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Message {i}"));
+            await clientStream.SendMessageAsync(LpmHelpers.WrapLpmText($"Message {i}"));
         }
 
         await clientStream.SendHalfCloseAsync();
@@ -161,7 +161,7 @@ public class ShmInterceptorTests
 
             for (int i = 0; i < 5; i++)
             {
-                await serverStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Response {i}"));
+                await serverStream.SendMessageAsync(LpmHelpers.WrapLpmText($"Response {i}"));
             }
 
             await serverStream.SendTrailersAsync(StatusCode.OK);
@@ -201,7 +201,7 @@ public class ShmInterceptorTests
 
             for (int i = 0; i < 3; i++)
             {
-                await serverStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Echo {i}"));
+                await serverStream.SendMessageAsync(LpmHelpers.WrapLpmText($"Echo {i}"));
             }
 
             await serverStream.SendTrailersAsync(StatusCode.OK);
@@ -216,7 +216,7 @@ public class ShmInterceptorTests
 
         for (int i = 0; i < 3; i++)
         {
-            await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Request {i}"));
+            await clientStream.SendMessageAsync(LpmHelpers.WrapLpmText($"Request {i}"));
         }
 
         await clientStream.SendHalfCloseAsync();

@@ -128,7 +128,7 @@ public class ShmDiagnosticsTests
             
             for (int i = 0; i < messageCount; i++)
             {
-                await serverStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Message {i}"));
+                await serverStream.SendMessageAsync(LpmHelpers.WrapLpmText($"Message {i}"));
                 telemetry.RecordMessageSent();
             }
             
@@ -233,7 +233,7 @@ public class ShmDiagnosticsTests
         {
             var serverStream = server.CreateStream();
             await serverStream.SendResponseHeadersAsync();
-            await serverStream.SendMessageAsync(message);
+            await serverStream.SendMessageAsync(LpmHelpers.WrapLpm(message));
             telemetry.RecordBytesSent(messageSize);
             await serverStream.SendTrailersAsync(StatusCode.OK);
         });
@@ -241,7 +241,7 @@ public class ShmDiagnosticsTests
         // Client sends request
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/Size", "localhost");
-        await clientStream.SendMessageAsync(message);
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(message));
         telemetry.RecordBytesReceived(messageSize);
         await clientStream.SendHalfCloseAsync();
 

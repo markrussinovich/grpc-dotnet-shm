@@ -85,7 +85,7 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
                 }
 
                 // Validate CONNECT request
-                (ulong clientRingA, ulong clientRingB) clientPreferred;
+                (ulong clientRingA, ulong clientRingB, bool _) clientPreferred;
                 try
                 {
                     clientPreferred = ControlWire.DecodeConnectRequest(payload.Span);

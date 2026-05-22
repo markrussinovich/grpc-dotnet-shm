@@ -924,25 +924,29 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
                     if (messageAccumulator != null && messageAccumulator.Length > 0)
                     {
-                        // Last fragment of multi-fragment message
+                        // Last fragment of multi-fragment message.
+                        // Strip the 5-byte gRPC LPM header so the consumer
+                        // receives just the message body — same convention
+                        // as ReceiveMessageBuffersAsync.
                         messageAccumulator.Write(f.Memory.Span);
                         f.ReturnToPool();
                         var assembled = messageAccumulator.ToArray();
                         messageAccumulator.SetLength(0);
                         var endStream1 = (f.Flags & MessageFlags.EndStream) != 0;
                         if (endStream1) _halfCloseReceived = true;
-                        return (assembled, default, endStream1);
+                        return (assembled.AsMemory(5), default, endStream1);
                     }
 
-                    // Single-frame message: return zero-copy view.
-                    // Caller must hold onto 'f' and pass it back as previousFrame
-                    // on the next call so the pooled buffer can be released.
+                    // Single-frame message: return zero-copy view sliced past
+                    // the 5-byte LPM header. Caller must hold onto 'f' and
+                    // pass it back as previousFrame on the next call so the
+                    // pooled buffer can be released.
                     if ((f.Flags & MessageFlags.EndStream) != 0)
                     {
                         _halfCloseReceived = true;
-                        return (f.Memory, f, true);
+                        return (f.Memory.Slice(5), f, true);
                     }
-                    return (f.Memory, f, false);
+                    return (f.Memory.Slice(5), f, false);
 
                 case FrameType.HalfClose:
                     f.ReturnToPool();
@@ -1012,8 +1016,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
                             // Returning accumulated payload as owned memory avoids
                             // lifetime issues while still preventing many intermediate copies.
+                            // Strip the 5-byte gRPC LPM header so the consumer
+                            // receives just the message body.
                             previousFrame.ReturnToPool();
-                            yield return messageAccumulator.ToArray();
+                            var assembled = messageAccumulator.ToArray();
+                            yield return assembled.AsMemory(5);
                             messageAccumulator.SetLength(0);
                             if ((f.Flags & MessageFlags.EndStream) != 0) { _halfCloseReceived = true; yield break; }
                             break;
@@ -1024,7 +1031,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         previousFrame.ReturnToPool();
 
                         previousFrame = f;
-                        yield return f.Memory;
+                        // Strip the 5-byte gRPC LPM header — the H2 wire carries
+                        // each MESSAGE as `[compFlag(1)][len(4)][body]`; the
+                        // consumer (e.g. <see cref="ShmControlResponseContent"/>'s
+                        // SerializeToStreamAsync) re-frames around the body.
+                        yield return f.Memory.Slice(5);
                         if ((f.Flags & MessageFlags.EndStream) != 0) { _halfCloseReceived = true; yield break; }
                         break;
 

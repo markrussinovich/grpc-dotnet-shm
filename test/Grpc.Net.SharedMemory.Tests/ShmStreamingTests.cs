@@ -51,7 +51,7 @@ public class ShmStreamingTests
             
             await s.SendResponseHeadersAsync();
             
-            await foreach (var msg in s.ReceiveMessagesAsync())
+            await foreach (var msg in s.ReceiveLpmMessagesAsync())
             {
                 Interlocked.Add(ref serverReceivedTotal, msg.Length);
             }
@@ -71,14 +71,14 @@ public class ShmStreamingTests
             var chunk = new byte[writeCount];
             Array.Copy(data, sent, chunk, 0, writeCount);
             
-            await clientStream.SendMessageAsync(chunk);
+            await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(chunk));
             sent += writeCount;
         }
         
         await clientStream.SendHalfCloseAsync();
         
         await clientStream.ReceiveResponseHeadersAsync();
-        await foreach (var _ in clientStream.ReceiveMessagesAsync()) { }
+        await foreach (var _ in clientStream.ReceiveLpmMessagesAsync()) { }
         
         await serverTask;
         
@@ -111,7 +111,7 @@ public class ShmStreamingTests
             await serverStream!.SendResponseHeadersAsync();
             
             // Drain all incoming messages so WINDOW_UPDATE frames replenish the sender
-            await foreach (var msg in serverStream.ReceiveMessagesAsync())
+            await foreach (var msg in serverStream.ReceiveLpmMessagesAsync())
             {
                 receivedTotal += msg.Length;
             }
@@ -128,7 +128,7 @@ public class ShmStreamingTests
         {
             var writeCount = Math.Min(total - sent, data.Length);
             var chunk = writeCount == data.Length ? data : data.Take(writeCount).ToArray();
-            await clientStream.SendMessageAsync(chunk);
+            await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(chunk));
             sent += writeCount;
         }
         
@@ -163,7 +163,7 @@ public class ShmStreamingTests
             await s.SendResponseHeadersAsync();
             
             // Read all client messages
-            await foreach (var msg in s.ReceiveMessagesAsync())
+            await foreach (var msg in s.ReceiveLpmMessagesAsync())
             {
                 lock (serverReceived)
                     serverReceived.Add(Encoding.UTF8.GetString(msg));
@@ -172,7 +172,7 @@ public class ShmStreamingTests
             // Send server messages after reading
             for (int i = 0; i < messageCount; i++)
             {
-                await s.SendMessageAsync(Encoding.UTF8.GetBytes($"ServerMsg{i}"));
+                await s.SendMessageAsync(LpmHelpers.WrapLpmText($"ServerMsg{i}"));
             }
             
             await s.SendTrailersAsync(StatusCode.OK);
@@ -184,12 +184,12 @@ public class ShmStreamingTests
         
         for (int i = 0; i < messageCount; i++)
         {
-            await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes($"ClientMsg{i}"));
+            await clientStream.SendMessageAsync(LpmHelpers.WrapLpmText($"ClientMsg{i}"));
         }
         await clientStream.SendHalfCloseAsync();
         
         await clientStream.ReceiveResponseHeadersAsync();
-        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        await foreach (var msg in clientStream.ReceiveLpmMessagesAsync())
         {
             clientReceived.Add(Encoding.UTF8.GetString(msg));
         }
@@ -226,11 +226,11 @@ public class ShmStreamingTests
             await s.SendResponseHeadersAsync();
             
             // Drain client half-close
-            await foreach (var _ in s.ReceiveMessagesAsync()) { }
+            await foreach (var _ in s.ReceiveLpmMessagesAsync()) { }
             
             for (int i = 0; i < messageCount; i++)
             {
-                await s.SendMessageAsync(Encoding.UTF8.GetBytes($"Message {i}"));
+                await s.SendMessageAsync(LpmHelpers.WrapLpmText($"Message {i}"));
             }
             
             await s.SendTrailersAsync(StatusCode.OK);
@@ -242,7 +242,7 @@ public class ShmStreamingTests
         await clientStream.SendHalfCloseAsync();
         
         await clientStream.ReceiveResponseHeadersAsync();
-        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        await foreach (var msg in clientStream.ReceiveLpmMessagesAsync())
         {
             clientReceived.Add(Encoding.UTF8.GetString(msg));
         }
@@ -277,7 +277,7 @@ public class ShmStreamingTests
             
             await s.SendResponseHeadersAsync();
             
-            await foreach (var msg in s.ReceiveMessagesAsync())
+            await foreach (var msg in s.ReceiveLpmMessagesAsync())
             {
                 lock (serverReceived)
                     serverReceived.Add(Encoding.UTF8.GetString(msg));
@@ -292,13 +292,13 @@ public class ShmStreamingTests
         
         for (int i = 0; i < messageCount; i++)
         {
-            await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Client {i}"));
+            await clientStream.SendMessageAsync(LpmHelpers.WrapLpmText($"Client {i}"));
         }
         
         await clientStream.SendHalfCloseAsync();
         
         await clientStream.ReceiveResponseHeadersAsync();
-        await foreach (var _ in clientStream.ReceiveMessagesAsync()) { }
+        await foreach (var _ in clientStream.ReceiveLpmMessagesAsync()) { }
         
         await serverTask;
         
@@ -331,14 +331,14 @@ public class ShmStreamingTests
             
             await s.SendResponseHeadersAsync();
             
-            await foreach (var msg in s.ReceiveMessagesAsync())
+            await foreach (var msg in s.ReceiveLpmMessagesAsync())
             {
                 serverReceived.Add(Encoding.UTF8.GetString(msg));
             }
             
             for (int i = 0; i < rounds; i++)
             {
-                await s.SendMessageAsync(Encoding.UTF8.GetBytes($"Echo {i}"));
+                await s.SendMessageAsync(LpmHelpers.WrapLpmText($"Echo {i}"));
             }
             
             await s.SendTrailersAsync(StatusCode.OK);
@@ -350,13 +350,13 @@ public class ShmStreamingTests
         
         for (int i = 0; i < rounds; i++)
         {
-            await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Request {i}"));
+            await clientStream.SendMessageAsync(LpmHelpers.WrapLpmText($"Request {i}"));
         }
         
         await clientStream.SendHalfCloseAsync();
         
         await clientStream.ReceiveResponseHeadersAsync();
-        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        await foreach (var msg in clientStream.ReceiveLpmMessagesAsync())
         {
             clientReceived.Add(Encoding.UTF8.GetString(msg));
         }
@@ -392,24 +392,24 @@ public class ShmStreamingTests
             
             await s.SendResponseHeadersAsync();
             
-            await foreach (var msg in s.ReceiveMessagesAsync())
+            await foreach (var msg in s.ReceiveLpmMessagesAsync())
             {
                 serverReceivedMsg = msg;
             }
             
             // Echo back an empty message
-            await s.SendMessageAsync(Array.Empty<byte>());
+            await s.SendMessageAsync(LpmHelpers.WrapLpm(Array.Empty<byte>()));
             await s.SendTrailersAsync(StatusCode.OK);
         });
         
         // Client
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/Empty", "localhost");
-        await clientStream.SendMessageAsync(Array.Empty<byte>());
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(Array.Empty<byte>()));
         await clientStream.SendHalfCloseAsync();
         
         await clientStream.ReceiveResponseHeadersAsync();
-        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        await foreach (var msg in clientStream.ReceiveLpmMessagesAsync())
         {
             clientReceivedMsg = msg;
         }
@@ -449,7 +449,7 @@ public class ShmStreamingTests
                 
                 await s.SendResponseHeadersAsync();
                 
-                await foreach (var msg in s.ReceiveMessagesAsync())
+                await foreach (var msg in s.ReceiveLpmMessagesAsync())
                 {
                     serverReceivedMessages[idx] = Encoding.UTF8.GetString(msg);
                 }
@@ -466,11 +466,11 @@ public class ShmStreamingTests
             {
                 var clientStream = client.CreateStream();
                 await clientStream.SendRequestHeadersAsync($"/test/Parallel/{streamId}", "localhost");
-                await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes($"Stream {streamId}"));
+                await clientStream.SendMessageAsync(LpmHelpers.WrapLpmText($"Stream {streamId}"));
                 await clientStream.SendHalfCloseAsync();
                 
                 await clientStream.ReceiveResponseHeadersAsync();
-                await foreach (var _ in clientStream.ReceiveMessagesAsync()) { }
+                await foreach (var _ in clientStream.ReceiveLpmMessagesAsync()) { }
             }));
         }
         

@@ -62,7 +62,7 @@ public class FlowControlTests
             await s.SendResponseHeadersAsync();
 
             byte[]? received = null;
-            await foreach (var msg in s.ReceiveMessagesAsync())
+            await foreach (var msg in s.ReceiveLpmMessagesAsync())
                 received = msg;
 
             Assert.That(received, Is.Not.Null);
@@ -76,11 +76,11 @@ public class FlowControlTests
 
         // Stream should have initial window size available
         var smallMessage = new byte[1000];
-        await stream.SendMessageAsync(smallMessage);
+        await stream.SendMessageAsync(LpmHelpers.WrapLpm(smallMessage));
         await stream.SendHalfCloseAsync();
 
         await stream.ReceiveResponseHeadersAsync();
-        await foreach (var _ in stream.ReceiveMessagesAsync()) { }
+        await foreach (var _ in stream.ReceiveLpmMessagesAsync()) { }
 
         await serverTask;
     }
@@ -104,7 +104,7 @@ public class FlowControlTests
             await s.SendResponseHeadersAsync();
 
             byte[]? received = null;
-            await foreach (var msg in s.ReceiveMessagesAsync())
+            await foreach (var msg in s.ReceiveLpmMessagesAsync())
                 received = msg;
 
             Assert.That(received, Is.Not.Null);
@@ -118,11 +118,11 @@ public class FlowControlTests
 
         // Send message smaller than ring capacity — should not block on backpressure
         var message = new byte[10000];
-        await stream.SendMessageAsync(message);
+        await stream.SendMessageAsync(LpmHelpers.WrapLpm(message));
         await stream.SendHalfCloseAsync();
 
         await stream.ReceiveResponseHeadersAsync();
-        await foreach (var _ in stream.ReceiveMessagesAsync()) { }
+        await foreach (var _ in stream.ReceiveLpmMessagesAsync()) { }
 
         await serverTask;
     }
@@ -149,7 +149,7 @@ public class FlowControlTests
 
             await s.SendResponseHeadersAsync();
 
-            await foreach (var msg in s.ReceiveMessagesAsync())
+            await foreach (var msg in s.ReceiveLpmMessagesAsync())
             {
                 Assert.That(msg.Length, Is.EqualTo(messageSize));
                 serverReceivedCount++;
@@ -165,12 +165,12 @@ public class FlowControlTests
         var message = new byte[messageSize];
         for (int i = 0; i < messageCount; i++)
         {
-            await stream.SendMessageAsync(message);
+            await stream.SendMessageAsync(LpmHelpers.WrapLpm(message));
         }
         await stream.SendHalfCloseAsync();
 
         await stream.ReceiveResponseHeadersAsync();
-        await foreach (var _ in stream.ReceiveMessagesAsync()) { }
+        await foreach (var _ in stream.ReceiveLpmMessagesAsync()) { }
 
         await serverTask;
 
@@ -305,7 +305,7 @@ public class ConcurrentStreamTests
             var s = await server.AcceptStreamAsync();
             using var ss = s!;
             await ss.SendResponseHeadersAsync();
-            await foreach (var msg in ss.ReceiveMessagesAsync())
+            await foreach (var msg in ss.ReceiveLpmMessagesAsync())
                 serverReceived[0] = Encoding.UTF8.GetString(msg);
             await ss.SendTrailersAsync(Grpc.Core.StatusCode.OK);
         });
@@ -314,7 +314,7 @@ public class ConcurrentStreamTests
             var s = await server.AcceptStreamAsync();
             using var ss = s!;
             await ss.SendResponseHeadersAsync();
-            await foreach (var msg in ss.ReceiveMessagesAsync())
+            await foreach (var msg in ss.ReceiveLpmMessagesAsync())
                 serverReceived[1] = Encoding.UTF8.GetString(msg);
             await ss.SendTrailersAsync(Grpc.Core.StatusCode.OK);
         });
@@ -328,17 +328,17 @@ public class ConcurrentStreamTests
         // Send messages on both streams concurrently
         var task1 = Task.Run(async () =>
         {
-            await stream1.SendMessageAsync(Encoding.UTF8.GetBytes("message on stream 1"));
+            await stream1.SendMessageAsync(LpmHelpers.WrapLpmText("message on stream 1"));
             await stream1.SendHalfCloseAsync();
             await stream1.ReceiveResponseHeadersAsync();
-            await foreach (var _ in stream1.ReceiveMessagesAsync()) { }
+            await foreach (var _ in stream1.ReceiveLpmMessagesAsync()) { }
         });
         var task2 = Task.Run(async () =>
         {
-            await stream2.SendMessageAsync(Encoding.UTF8.GetBytes("message on stream 2"));
+            await stream2.SendMessageAsync(LpmHelpers.WrapLpmText("message on stream 2"));
             await stream2.SendHalfCloseAsync();
             await stream2.ReceiveResponseHeadersAsync();
-            await foreach (var _ in stream2.ReceiveMessagesAsync()) { }
+            await foreach (var _ in stream2.ReceiveLpmMessagesAsync()) { }
         });
 
         await Task.WhenAll(task1, task2, serverTask1, serverTask2);
@@ -372,7 +372,7 @@ public class ConcurrentStreamTests
                 var s = await server.AcceptStreamAsync();
                 using var ss = s!;
                 await ss.SendResponseHeadersAsync();
-                await foreach (var _ in ss.ReceiveMessagesAsync()) { }
+                await foreach (var _ in ss.ReceiveLpmMessagesAsync()) { }
                 Interlocked.Increment(ref serverReceivedCount);
                 await ss.SendTrailersAsync(Grpc.Core.StatusCode.OK);
             }));
@@ -386,10 +386,10 @@ public class ConcurrentStreamTests
             {
                 var stream = client.CreateStream();
                 await stream.SendRequestHeadersAsync($"/test/{idx}", "localhost");
-                await stream.SendMessageAsync(Encoding.UTF8.GetBytes($"msg{idx}"));
+                await stream.SendMessageAsync(LpmHelpers.WrapLpmText($"msg{idx}"));
                 await stream.SendHalfCloseAsync();
                 await stream.ReceiveResponseHeadersAsync();
-                await foreach (var _ in stream.ReceiveMessagesAsync()) { }
+                await foreach (var _ in stream.ReceiveLpmMessagesAsync()) { }
             }));
         }
 

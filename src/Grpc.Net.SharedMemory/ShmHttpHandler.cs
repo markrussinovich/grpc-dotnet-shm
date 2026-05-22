@@ -97,7 +97,7 @@ public sealed class ShmHttpHandler : DelegatingHandler
             switch (header.Type)
             {
                 case FrameType.Accept:
-                    var (dataSegmentName, _) = ControlWire.DecodeConnectResponse(payload.Span);
+                    var dataSegmentName = ControlWire.DecodeConnectResponse(payload.Span);
 
                     // Open the data segment
                     var dataSegment = Segment.Open(dataSegmentName);

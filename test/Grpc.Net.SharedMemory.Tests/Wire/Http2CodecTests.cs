@@ -31,7 +31,7 @@ public class Http2CodecTests
     private static ShmRing CreateRing()
     {
         var memory = new byte[ShmConstants.RingHeaderSize + RingCapacity];
-        return new ShmRing(memory, 0, RingCapacity) { Wire = WireFormat.Http2 };
+        return new ShmRing(memory, 0, RingCapacity);
     }
 
     [Test]

@@ -324,7 +324,7 @@ public class ShmConnectionPoolE2ETests
         try
         {
             // Read request message.
-            await foreach (var msg in stream.ReceiveMessagesAsync())
+            await foreach (var msg in stream.ReceiveLpmMessagesAsync())
             {
                 break; // unary — one message
             }
@@ -334,7 +334,7 @@ public class ShmConnectionPoolE2ETests
 
             // Send response message.
             var responseData = Encoding.UTF8.GetBytes("test response");
-            await stream.SendMessageAsync(responseData);
+            await stream.SendMessageAsync(LpmHelpers.WrapLpm(responseData));
 
             // Send trailers.
             await stream.SendTrailersAsync(StatusCode.OK, "OK");

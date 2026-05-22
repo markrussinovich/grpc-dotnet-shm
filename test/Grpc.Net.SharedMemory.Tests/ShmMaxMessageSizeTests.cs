@@ -55,7 +55,7 @@ public class ShmMaxMessageSizeTests
         {
             var serverStream = server.CreateStream();
             await serverStream.SendResponseHeadersAsync();
-            await serverStream.SendMessageAsync(responseMessage);
+            await serverStream.SendMessageAsync(LpmHelpers.WrapLpm(responseMessage));
             await serverStream.SendTrailersAsync(StatusCode.OK);
         });
 
@@ -93,7 +93,7 @@ public class ShmMaxMessageSizeTests
         {
             var serverStream = server.CreateStream();
             await serverStream.SendResponseHeadersAsync();
-            await serverStream.SendMessageAsync(largeMessage);
+            await serverStream.SendMessageAsync(LpmHelpers.WrapLpm(largeMessage));
             await serverStream.SendTrailersAsync(StatusCode.OK);
         });
 
@@ -138,7 +138,7 @@ public class ShmMaxMessageSizeTests
         // Low-level ShmGrpcStream does not enforce size limits — that is
         // handled by ShmGrpcServer (high-level API). This test verifies
         // the transport can carry oversized messages.
-        await clientStream.SendMessageAsync(largeMessage);
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(largeMessage));
         await clientStream.SendHalfCloseAsync();
 
         await serverTask;
@@ -163,14 +163,14 @@ public class ShmMaxMessageSizeTests
         {
             var serverStream = server.CreateStream();
             await serverStream.SendResponseHeadersAsync();
-            await serverStream.SendMessageAsync(emptyMessage);
+            await serverStream.SendMessageAsync(LpmHelpers.WrapLpm(emptyMessage));
             await serverStream.SendTrailersAsync(StatusCode.OK);
         });
 
         // Client sends request
         var clientStream = client.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/Empty", "localhost");
-        await clientStream.SendMessageAsync(emptyMessage);
+        await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(emptyMessage));
         await clientStream.SendHalfCloseAsync();
 
         await serverTask;
@@ -199,7 +199,7 @@ public class ShmMaxMessageSizeTests
         {
             var serverStream = server.CreateStream();
             await serverStream.SendResponseHeadersAsync();
-            await serverStream.SendMessageAsync(exactMessage);
+            await serverStream.SendMessageAsync(LpmHelpers.WrapLpm(exactMessage));
             await serverStream.SendTrailersAsync(StatusCode.OK);
         });
 
@@ -238,7 +238,7 @@ public class ShmMaxMessageSizeTests
             
             for (int i = 0; i < messageCount; i++)
             {
-                await serverStream.SendMessageAsync(message);
+                await serverStream.SendMessageAsync(LpmHelpers.WrapLpm(message));
             }
             
             await serverStream.SendTrailersAsync(StatusCode.OK);
@@ -277,7 +277,7 @@ public class ShmMaxMessageSizeTests
             {
                 var message = new byte[size];
                 new Random(size).NextBytes(message);
-                await serverStream.SendMessageAsync(message);
+                await serverStream.SendMessageAsync(LpmHelpers.WrapLpm(message));
             }
             
             await serverStream.SendTrailersAsync(StatusCode.OK);

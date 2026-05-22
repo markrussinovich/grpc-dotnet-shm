@@ -480,7 +480,7 @@ internal sealed class ShmFrameWriter : IDisposable
                     // the large message being written.
                     //
                     // Also exit batch mode for ANY message that may need to
-                    // chunk on the current ring (payload + 16-byte header
+                    // chunk on the current ring (payload + 9-byte H2 header
                     // bigger than ~half the ring). Otherwise a small ring +
                     // multi-frame message deadlocks: chunk N reserves, fills,
                     // commits silently (no OS signal under batch); the next
@@ -491,7 +491,7 @@ internal sealed class ShmFrameWriter : IDisposable
                     var willLikelyChunk = entry.Type == FrameType.Message
                         && payload.Length >= 65536
                         || (entry.Type == FrameType.Message
-                            && payload.Length + ShmConstants.FrameHeaderSize >= ringCap / 2);
+                            && payload.Length + Wire.Http2FrameHeader.Size >= ringCap / 2);
                     if (willLikelyChunk)
                     {
                         _ring.EndBatchWrite();
@@ -710,45 +710,36 @@ internal sealed class ShmFrameWriter : IDisposable
     }
 
     /// <summary>
-    /// On-wire frame header size for the active wire format on this writer's ring.
-    /// Custom16: 16 bytes; HTTP/2: 9 bytes.
+    /// On-wire frame header size for the H2 wire format used on every ring.
     /// </summary>
-    private int WireHeaderSize => _ring.Wire == Wire.WireFormat.Http2
-        ? Wire.Http2FrameHeader.Size
-        : ShmConstants.FrameHeaderSize;
+    private const int WireHeaderSize = Wire.Http2FrameHeader.Size;
 
     /// <summary>
     /// Encodes a MESSAGE/DATA wire-format frame header into <paramref name="dest"/>.
     /// <paramref name="internalFlags"/> uses the SHM-internal convention
     /// (<see cref="MessageFlags"/>): the H2 path translates to <c>END_STREAM</c>.
     /// </summary>
-    private void EncodeMessageWireHeader(Span<byte> dest, uint streamId, int payloadLen, byte internalFlags)
+    private static void EncodeMessageWireHeader(Span<byte> dest, uint streamId, int payloadLen, byte internalFlags)
     {
-        if (_ring.Wire == Wire.WireFormat.Http2)
+        // Defensive: callers (WriteInlineDirectMultiFrame, RingFrameStream)
+        // are expected to chunk so each call's payload fits in a 24-bit
+        // length field. Bail out loudly rather than silently truncating
+        // or corrupting the on-wire frame.
+        if ((uint)payloadLen > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
         {
-            // Defensive: callers (WriteInlineDirectMultiFrame, RingFrameStream)
-            // are expected to chunk so each call's payload fits in a 24-bit
-            // length field. Bail out loudly rather than silently truncating
-            // or corrupting the on-wire frame.
-            if ((uint)payloadLen > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
-            {
-                throw new InvalidOperationException(
-                    $"H2 wire frame payload {payloadLen} exceeds 24-bit limit. " +
-                    "Caller must apply Http2FrameHeader.MaxAllowedPayloadLength chunk cap.");
-            }
-            // Mirror Http2Codec.WriteH2Data: END_STREAM only on a final non-More chunk.
-            var isMore = (internalFlags & MessageFlags.More) != 0;
-            var isEndStream = (internalFlags & MessageFlags.EndStream) != 0 && !isMore;
-            Wire.Http2FrameHeader.Encode(
-                dest,
-                Wire.Http2FrameType.Data,
-                (byte)(isEndStream ? Wire.Http2Flags.EndStream : 0),
-                streamId,
-                payloadLen);
-            return;
+            throw new InvalidOperationException(
+                $"H2 wire frame payload {payloadLen} exceeds 24-bit limit. " +
+                "Caller must apply Http2FrameHeader.MaxAllowedPayloadLength chunk cap.");
         }
-        var header = new FrameHeader(FrameType.Message, streamId, (uint)payloadLen, internalFlags);
-        header.EncodeTo(dest);
+        // Mirror Http2Codec.WriteH2Data: END_STREAM only on a final non-More chunk.
+        var isMore = (internalFlags & MessageFlags.More) != 0;
+        var isEndStream = (internalFlags & MessageFlags.EndStream) != 0 && !isMore;
+        Wire.Http2FrameHeader.Encode(
+            dest,
+            Wire.Http2FrameType.Data,
+            (byte)(isEndStream ? Wire.Http2Flags.EndStream : 0),
+            streamId,
+            payloadLen);
     }
 
     /// <summary>
@@ -778,13 +769,10 @@ internal sealed class ShmFrameWriter : IDisposable
         // fit in 24 bits (≤ 2^24 - 1). Cap both thresholds below that so a
         // 16 MiB protobuf (which yields a 16 MiB + 5 B framePayloadSize) is
         // not handed to Http2FrameHeader.Encode where it would throw.
-        if (_ring.Wire == Wire.WireFormat.Http2)
-        {
-            if (singleFrameThreshold > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
-                singleFrameThreshold = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
-            if (chunkSize > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
-                chunkSize = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
-        }
+        if (singleFrameThreshold > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+            singleFrameThreshold = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
+        if (chunkSize > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+            chunkSize = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
 
         // The MESSAGE frame payload includes a 5-byte gRPC length-prefix
         // header (compression flag + big-endian uint32 length) followed by
@@ -802,7 +790,7 @@ internal sealed class ShmFrameWriter : IDisposable
             var reservation = _ring.ReserveWrite(totalSize, ct);
             if (reservation.Second.IsEmpty)
             {
-                // Wire-format-aware frame header (16 B Custom16 or 9 B H2).
+                // 9-byte HTTP/2 frame header.
                 var isLast = (extraFlags & MessageFlags.More) == 0;
                 var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
                 EncodeMessageWireHeader(reservation.First.Span, streamId, framePayloadSize, flags);
@@ -867,7 +855,7 @@ internal sealed class ShmFrameWriter : IDisposable
             _streamId = streamId;
             _maxFramePayload = maxFramePayload;
             _extraFlags = extraFlags;
-            _wireHeaderSize = owner.WireHeaderSize;
+            _wireHeaderSize = ShmFrameWriter.WireHeaderSize;
             _ct = ct;
             _remainingPayload = totalPayload;
             ReserveNextFrame();
@@ -882,7 +870,7 @@ internal sealed class ShmFrameWriter : IDisposable
             _currentFrameWritten = 0;
             _reservationActive = true;
 
-            // Wire-format-aware frame header.
+            // 9-byte HTTP/2 frame header.
             var isLastFrame = (chunkPayload >= _remainingPayload);
             var isLast = isLastFrame && (_extraFlags & MessageFlags.More) == 0;
             byte flags;
@@ -891,10 +879,8 @@ internal sealed class ShmFrameWriter : IDisposable
             else
                 flags = (byte)(MessageFlags.More | _extraFlags);
 
-            // Stack-allocate up to 16 B (Custom16); H2 only needs 9.
-            Span<byte> headerBytes = stackalloc byte[16];
-            headerBytes = headerBytes[.._wireHeaderSize];
-            _owner.EncodeMessageWireHeader(headerBytes, _streamId, chunkPayload, flags);
+            Span<byte> headerBytes = stackalloc byte[Wire.Http2FrameHeader.Size];
+            EncodeMessageWireHeader(headerBytes, _streamId, chunkPayload, flags);
 
             WriteToReservation(_currentReservation, 0, headerBytes);
         }
@@ -1057,11 +1043,9 @@ internal sealed class ShmFrameWriter : IDisposable
             {
                 try
                 {
-                    // Rewrite header with actual payload length, in the
-                    // wire format active on this ring.
-                    Span<byte> headerBytes = stackalloc byte[16];
-                    headerBytes = headerBytes[.._wireHeaderSize];
-                    _owner.EncodeMessageWireHeader(headerBytes, _streamId, _currentFrameWritten, _extraFlags);
+                    // Rewrite header with actual payload length.
+                    Span<byte> headerBytes = stackalloc byte[Wire.Http2FrameHeader.Size];
+                    EncodeMessageWireHeader(headerBytes, _streamId, _currentFrameWritten, _extraFlags);
                     WriteToReservation(_currentReservation, 0, headerBytes);
 
                     var written = _wireHeaderSize + _currentFrameWritten;

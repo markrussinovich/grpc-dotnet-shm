@@ -143,18 +143,4 @@ public sealed class ShmClientTransportOptions
     /// Default is <c>false</c>.
     /// </summary>
     public bool SingleStreamMode { get; set; }
-
-    /// <summary>
-    /// Gets or sets whether the client should request the HTTP/2 wire format
-    /// during the control-plane handshake. When <c>true</c>, the client advertises
-    /// <see cref="Wire.WireFormat.Http2"/> as its first preference and falls back
-    /// to <see cref="Wire.WireFormat.Custom16"/> if the server doesn't support it.
-    /// <para>
-    /// HTTP/2 framing aligns this transport with the gRPC-over-HTTP/2 specification
-    /// at the cost of HPACK encoding overhead on HEADERS / TRAILERS frames. DATA-frame
-    /// performance (the hot path) is identical to the legacy framing.
-    /// </para>
-    /// Default is <c>false</c> while the H2 codec is being qualified.
-    /// </summary>
-    public bool PreferHttp2 { get; set; }
 }

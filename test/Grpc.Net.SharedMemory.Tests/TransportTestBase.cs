@@ -159,30 +159,6 @@ public abstract class TransportTestBase
         return disposable;
     }
 
-    /// <summary>
-    /// Creates a connection pair and forces a specific wire format on both rings
-    /// (skipping control-plane negotiation). Useful for E2E tests that need to
-    /// exercise a specific wire format.
-    /// </summary>
-    protected (ShmConnection Server, ShmConnection Client) CreateConnectionPairWithWireFormat(
-        Grpc.Net.SharedMemory.Wire.WireFormat wireFormat,
-        ulong ringCapacity = 4096,
-        uint maxStreams = 100)
-    {
-        if (Transport == TransportKind.Tcp)
-        {
-            throw new NotSupportedException(
-                "TCP transport requires P6 (server-side ASP.NET Core integration).");
-        }
-
-        var segmentName = $"test_{Guid.NewGuid():N}";
-        var server = ShmConnection.CreateAsServer(segmentName, ringCapacity, maxStreams, wireFormat);
-        _disposables.Add(server);
-        var client = ShmConnection.ConnectAsClient(segmentName, wireFormat);
-        _disposables.Add(client);
-        return (server, client);
-    }
-
     [TearDown]
     public void CleanupConnections()
     {

@@ -22,7 +22,9 @@ using System.Runtime.InteropServices;
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
-/// Represents the 16-byte on-wire frame header.
+/// Represents the 16-byte control-plane on-wire frame header used during the
+/// CONNECT/ACCEPT handshake (see <see cref="ControlWire"/>). Data-plane
+/// frames use the 9-byte HTTP/2 header (<see cref="Wire.Http2FrameHeader"/>).
 /// Layout (little-endian):
 /// - Offset 0-3:   Length (uint32) - payload length in bytes, excludes 16-byte header
 /// - Offset 4-7:   StreamID (uint32) - client uses odd IDs, server uses even

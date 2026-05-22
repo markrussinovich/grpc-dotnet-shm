@@ -120,7 +120,12 @@ async Task HandleStreamAsync(ShmGrpcStream stream, CancellationToken ct)
                     {
                         Message = $"Hello {request.Name} from .NET!"
                     };
-                    await stream.SendMessageAsync(reply.ToByteArray());
+                    var replyBytes = reply.ToByteArray();
+                    var lpm = new byte[5 + replyBytes.Length];
+                    lpm[0] = 0; // uncompressed
+                    BinaryPrimitives.WriteUInt32BigEndian(lpm.AsSpan(1, 4), (uint)replyBytes.Length);
+                    replyBytes.CopyTo(lpm, 5);
+                    await stream.SendMessageAsync(lpm);
                     await stream.SendTrailersAsync(StatusCode.OK);
 
                     Console.WriteLine($"Sent response: {reply.Message}");

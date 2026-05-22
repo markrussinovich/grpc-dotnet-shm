@@ -161,21 +161,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="keepaliveOptions">Optional keepalive options.</param>
     /// <returns>A new client connection.</returns>
     public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null)
-        => ConnectAsClient(name, Wire.WireFormat.Custom16, keepaliveOptions);
-
-    /// <summary>
-    /// Creates a new client-side connection with the specified wire format.
-    /// </summary>
-    public static ShmConnection ConnectAsClient(string name, Wire.WireFormat wireFormat,
-        ShmKeepaliveOptions? keepaliveOptions = null)
     {
         var segment = Segment.Open(name);
         try
         {
-            // Apply wire format BEFORE constructing the connection so the
-            // FrameReaderLoop (started in the ctor) reads using the right codec.
-            segment.RingA.Wire = wireFormat;
-            segment.RingB.Wire = wireFormat;
             return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
         }
         catch
@@ -200,24 +189,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         uint maxStreams = 100,
         ShmKeepaliveOptions? keepaliveOptions = null,
         ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
-        => CreateAsServer(name, ringCapacity, maxStreams, Wire.WireFormat.Custom16, keepaliveOptions, enforcementPolicy);
-
-    /// <summary>
-    /// Creates a new server-side connection with the specified wire format.
-    /// </summary>
-    public static ShmConnection CreateAsServer(
-        string name,
-        ulong ringCapacity,
-        uint maxStreams,
-        Wire.WireFormat wireFormat,
-        ShmKeepaliveOptions? keepaliveOptions = null,
-        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
     {
         var segment = Segment.Create(name, ringCapacity, maxStreams);
         try
         {
-            segment.RingA.Wire = wireFormat;
-            segment.RingB.Wire = wireFormat;
             return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy);
         }
         catch
@@ -396,9 +371,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// Gets the ring buffer for receiving data (server→client for client, client→server for server).
     /// </summary>
     internal ShmRing RxRing => _isClient ? _segment.RingB : _segment.RingA;
-
-    /// <summary>Test-only helper exposing the wire format negotiated for the TX ring.</summary>
-    internal Wire.WireFormat GetTxRingWireFormatForTest() => TxRing.Wire;
 
     /// <summary>
     /// Sends a GoAway frame to initiate graceful shutdown.
@@ -582,30 +554,13 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 break;
 
             case FrameType.Ping:
-                try
-                {
-                    HandlePing(header, payloadMemory.Span);
-                }
-                finally
-                {
-                    payload.Release();
-                }
+                HandlePing(header, payloadMemory.Span);
+                payload.Release();
                 break;
 
             case FrameType.Pong:
-                // try/finally for symmetry with Ping above. <c>HandlePong</c>
-                // is currently a single field write and cannot throw, but a
-                // future BDP estimator / metrics hook on the pong path
-                // could; the cost on the no-throw path is zero (the JIT
-                // emits the finally inline before the normal break).
-                try
-                {
-                    HandlePong(header, payloadMemory.Span);
-                }
-                finally
-                {
-                    payload.Release();
-                }
+                HandlePong(header, payloadMemory.Span);
+                payload.Release();
                 break;
 
             case FrameType.GoAway:
@@ -626,16 +581,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                     break;
                 }
 
-                try
-                {
-                    var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
-                        payloadMemory.Span.Slice(0, payloadLength));
-                    AddSendQuota(header.StreamId, increment);
-                }
-                finally
-                {
-                    payload.Release();
-                }
+                var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+                    payloadMemory.Span.Slice(0, payloadLength));
+                AddSendQuota(header.StreamId, increment);
+                payload.Release();
                 break;
 
             default:

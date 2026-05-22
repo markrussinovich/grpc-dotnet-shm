@@ -55,11 +55,8 @@ internal static class HpackHeadersAdapter
     /// <see cref="TrailersV1"/> models always carry the RAW bytes;
     /// base64 conversion happens exactly at the HPACK adapter boundary.
     /// <para>
-    /// Custom16 wire skips this entirely — it transports metadata as
-    /// raw bytes end-to-end inside our process boundary, which is fine
-    /// because both peers use the same SHM transport. H2 wire MUST
-    /// match the spec for cross-implementation interop and to avoid
-    /// confusing tooling (Wireshark, gRPC tracing, debug proxies).
+    /// H2 wire MUST match the spec for cross-implementation interop and
+    /// to avoid confusing tooling (Wireshark, gRPC tracing, debug proxies).
     /// </para>
     /// </remarks>
     private static bool IsBinaryHeader(string name)

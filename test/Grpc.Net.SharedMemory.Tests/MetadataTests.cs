@@ -188,8 +188,13 @@ public class MetadataTests
         using var s = serverStream!;
         
         var entries = s.RequestHeaders!.Metadata.Where(e => e.Key == "repeated-key").ToList();
-        Assert.That(entries, Has.Count.EqualTo(2));
-        var values = entries.Select(e => Encoding.UTF8.GetString(e.Values[0])).ToList();
+        // HPACK decoder coalesces duplicate header names into a single
+        // MetadataKV entry with multiple values (preserving order). The
+        // upper layer can still observe both values via Values[] without
+        // caring whether the wire used one HEADERS line or two.
+        Assert.That(entries, Has.Count.EqualTo(1));
+        Assert.That(entries[0].Values, Has.Count.EqualTo(2));
+        var values = entries[0].Values.Select(v => Encoding.UTF8.GetString(v)).ToList();
         Assert.That(values, Does.Contain("value-1"));
         Assert.That(values, Does.Contain("value-2"));
         

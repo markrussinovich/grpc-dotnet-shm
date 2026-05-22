@@ -39,13 +39,13 @@ public class StreamingEdgeCaseTests
         
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/empty", "localhost");
-        await stream.SendMessageAsync(Array.Empty<byte>());
+        await stream.SendMessageAsync(LpmHelpers.WrapLpm(Array.Empty<byte>()));
         await stream.SendHalfCloseAsync();
 
         // Server verifies receipt
         var serverStream = await server.AcceptStreamAsync();
         byte[]? received = null;
-        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+        await foreach (var m in serverStream!.ReceiveLpmMessagesAsync())
             received = m;
         
         Assert.That(received, Is.Not.Null);
@@ -64,12 +64,12 @@ public class StreamingEdgeCaseTests
         
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/single", "localhost");
-        await stream.SendMessageAsync(new byte[] { 0x42 });
+        await stream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { 0x42 }));
         await stream.SendHalfCloseAsync();
 
         var serverStream = await server.AcceptStreamAsync();
         byte[]? received = null;
-        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+        await foreach (var m in serverStream!.ReceiveLpmMessagesAsync())
             received = m;
         
         Assert.That(received, Is.Not.Null);
@@ -92,12 +92,12 @@ public class StreamingEdgeCaseTests
         
         var largeMessage = new byte[1024 * 1024];
         new Random(42).NextBytes(largeMessage);
-        await stream.SendMessageAsync(largeMessage);
+        await stream.SendMessageAsync(LpmHelpers.WrapLpm(largeMessage));
         await stream.SendHalfCloseAsync();
 
         var serverStream = await server.AcceptStreamAsync();
         byte[]? received = null;
-        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+        await foreach (var m in serverStream!.ReceiveLpmMessagesAsync())
             received = m;
         
         Assert.That(received, Is.Not.Null);
@@ -119,12 +119,12 @@ public class StreamingEdgeCaseTests
         await stream.SendRequestHeadersAsync("/test/multi-empty", "localhost");
         
         for (int i = 0; i < 5; i++)
-            await stream.SendMessageAsync(Array.Empty<byte>());
+            await stream.SendMessageAsync(LpmHelpers.WrapLpm(Array.Empty<byte>()));
         await stream.SendHalfCloseAsync();
 
         var serverStream = await server.AcceptStreamAsync();
         int count = 0;
-        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+        await foreach (var m in serverStream!.ReceiveLpmMessagesAsync())
         {
             Assert.That(m.Length, Is.EqualTo(0));
             count++;
@@ -146,12 +146,12 @@ public class StreamingEdgeCaseTests
         await stream.SendRequestHeadersAsync("/test/rapid", "localhost");
         
         for (int i = 0; i < 100; i++)
-            await stream.SendMessageAsync(Encoding.UTF8.GetBytes($"msg{i}"));
+            await stream.SendMessageAsync(LpmHelpers.WrapLpmText($"msg{i}"));
         await stream.SendHalfCloseAsync();
 
         var serverStream = await server.AcceptStreamAsync();
         int count = 0;
-        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+        await foreach (var m in serverStream!.ReceiveLpmMessagesAsync())
         {
             Assert.That(Encoding.UTF8.GetString(m), Is.EqualTo($"msg{count}"));
             count++;
@@ -177,13 +177,13 @@ public class StreamingEdgeCaseTests
         {
             var size = (i % 2 == 0) ? 10 : 1000;
             expected.Add(size);
-            await stream.SendMessageAsync(new byte[size]);
+            await stream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[size]));
         }
         await stream.SendHalfCloseAsync();
 
         var serverStream = await server.AcceptStreamAsync();
         int idx = 0;
-        await foreach (var m in serverStream!.ReceiveMessagesAsync())
+        await foreach (var m in serverStream!.ReceiveLpmMessagesAsync())
         {
             Assert.That(m.Length, Is.EqualTo(expected[idx]), $"Message {idx} size mismatch");
             idx++;
@@ -246,7 +246,7 @@ public class StreamingEdgeCaseTests
         // Trying to send message before headers should throw
         Assert.ThrowsAsync<InvalidOperationException>(async () =>
         {
-            await stream.SendMessageAsync(new byte[] { 1, 2, 3 });
+            await stream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { 1, 2, 3 }));
         });
     }
 
@@ -310,7 +310,7 @@ public class StreamingEdgeCaseTests
         
         Assert.ThrowsAsync<InvalidOperationException>(async () =>
         {
-            await serverStream.SendMessageAsync(new byte[] { 1 });
+            await serverStream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { 1 }));
         });
     }
 

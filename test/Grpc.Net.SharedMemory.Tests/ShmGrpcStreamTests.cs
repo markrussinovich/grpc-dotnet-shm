@@ -199,7 +199,7 @@ public class ShmGrpcStreamTests
 
                 // Read request messages
                 byte[]? receivedMsg = null;
-                await foreach (var msg in s.ReceiveMessagesAsync())
+                await foreach (var msg in s.ReceiveLpmMessagesAsync())
                 {
                     receivedMsg = msg;
                 }
@@ -208,20 +208,20 @@ public class ShmGrpcStreamTests
                 Assert.That(receivedMsg!.Length, Is.EqualTo(payloadSize), $"RPC {rpc}: server message length mismatch");
 
                 // Echo back the same data
-                await s.SendMessageAsync(receivedMsg);
+                await s.SendMessageAsync(LpmHelpers.WrapLpm(receivedMsg));
                 await s.SendTrailersAsync(StatusCode.OK);
             });
 
             // Client side
             using var clientStream = clientConn.CreateStream();
             await clientStream.SendRequestHeadersAsync("/test/Echo", "localhost");
-            await clientStream.SendMessageAsync(requestPayload);
+            await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(requestPayload));
             await clientStream.SendHalfCloseAsync();
 
             var responseHeaders = await clientStream.ReceiveResponseHeadersAsync();
 
             byte[]? responseMsg = null;
-            await foreach (var msg in clientStream.ReceiveMessagesAsync())
+            await foreach (var msg in clientStream.ReceiveLpmMessagesAsync())
             {
                 responseMsg = msg;
             }
@@ -257,21 +257,21 @@ public class ShmGrpcStreamTests
                 await s.SendResponseHeadersAsync();
 
                 byte[]? msg = null;
-                await foreach (var m in s.ReceiveMessagesAsync())
+                await foreach (var m in s.ReceiveLpmMessagesAsync())
                     msg = m;
 
-                await s.SendMessageAsync(msg!);
+                await s.SendMessageAsync(LpmHelpers.WrapLpm(msg!));
                 await s.SendTrailersAsync(StatusCode.OK);
             });
 
             using var cs = clientConn.CreateStream();
             await cs.SendRequestHeadersAsync("/test/Echo", "localhost");
-            await cs.SendMessageAsync(requestPayload);
+            await cs.SendMessageAsync(LpmHelpers.WrapLpm(requestPayload));
             await cs.SendHalfCloseAsync();
             await cs.ReceiveResponseHeadersAsync();
 
             byte[]? resp = null;
-            await foreach (var m in cs.ReceiveMessagesAsync())
+            await foreach (var m in cs.ReceiveLpmMessagesAsync())
                 resp = m;
 
             await serverTask;
@@ -302,21 +302,21 @@ public class ShmGrpcStreamTests
             using var s = stream!;
             await s.SendResponseHeadersAsync();
             byte[]? msg = null;
-            await foreach (var m in s.ReceiveMessagesAsync())
+            await foreach (var m in s.ReceiveLpmMessagesAsync())
                 msg = m;
             // Echo back the same 256MB
-            await s.SendMessageAsync(msg!);
+            await s.SendMessageAsync(LpmHelpers.WrapLpm(msg!));
             await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
         });
 
         using var cs = clientConn.CreateStream();
         await cs.SendRequestHeadersAsync("/test/Echo256M", "localhost");
-        await cs.SendMessageAsync(requestPayload);
+        await cs.SendMessageAsync(LpmHelpers.WrapLpm(requestPayload));
         await cs.SendHalfCloseAsync();
         await cs.ReceiveResponseHeadersAsync();
 
         byte[]? resp = null;
-        await foreach (var m in cs.ReceiveMessagesAsync())
+        await foreach (var m in cs.ReceiveLpmMessagesAsync())
             resp = m;
 
         await serverTask;
@@ -349,10 +349,10 @@ public class ShmGrpcStreamTests
                     using var s = stream!;
                     await s.SendResponseHeadersAsync();
                     byte[]? msg = null;
-                    await foreach (var m in s.ReceiveMessagesAsync())
+                    await foreach (var m in s.ReceiveLpmMessagesAsync())
                         msg = m;
                     if (msg != null)
-                        await s.SendMessageAsync(msg);
+                        await s.SendMessageAsync(LpmHelpers.WrapLpm(msg));
                     await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
                 });
             }
@@ -369,12 +369,12 @@ public class ShmGrpcStreamTests
 
                 using var cs = clientConn.CreateStream();
                 await cs.SendRequestHeadersAsync($"/test/Echo{idx}", "localhost");
-                await cs.SendMessageAsync(payload);
+                await cs.SendMessageAsync(LpmHelpers.WrapLpm(payload));
                 await cs.SendHalfCloseAsync();
                 await cs.ReceiveResponseHeadersAsync();
 
                 byte[]? resp = null;
-                await foreach (var m in cs.ReceiveMessagesAsync())
+                await foreach (var m in cs.ReceiveLpmMessagesAsync())
                     resp = m;
 
                 Assert.That(resp, Is.Not.Null, $"Stream {idx}: no response");
@@ -429,12 +429,12 @@ public class ShmGrpcStreamTests
                                     await stream.SendResponseHeadersAsync();
                                     if (msg != null)
                                     {
-                                        // ReceiveMessagesAsync returns raw ring payload
-                                        // which now includes the 5-byte gRPC LPM header.
-                                        // SendMessageAsync will add its own header, so
-                                        // strip the received header to avoid double-wrapping.
-                                        var body = msg.AsMemory(5);
-                                        await stream.SendMessageAsync(body);
+                                        // ReceiveMessagesAsync returns the raw ring
+                                        // payload (which under H2 includes the 5-byte
+                                        // gRPC LPM header). Unwrap with full validation
+                                        // (compFlag/length check) then echo back.
+                                        var body = LpmHelpers.UnwrapLpm(msg);
+                                        await stream.SendMessageAsync(LpmHelpers.WrapLpm(body));
                                     }
                                     await stream.SendTrailersAsync(StatusCode.OK);
                                 }
@@ -514,7 +514,7 @@ public class ShmGrpcStreamTests
 
                 // Use ReceiveMessagesAsync — exercises the yield-based EndStream path
                 byte[]? receivedMsg = null;
-                await foreach (var msg in s.ReceiveMessagesAsync())
+                await foreach (var msg in s.ReceiveLpmMessagesAsync())
                 {
                     receivedMsg = msg;
                 }
@@ -523,19 +523,19 @@ public class ShmGrpcStreamTests
                 Assert.That(receivedMsg!.Length, Is.EqualTo(payloadSize), $"RPC {rpc}: server message length mismatch");
 
                 // Echo back using the same combined send
-                await s.SendMessageAndHalfCloseAsync(receivedMsg);
+                await s.SendMessageAndHalfCloseAsync(LpmHelpers.WrapLpm(receivedMsg));
                 await s.SendTrailersAsync(StatusCode.OK);
             });
 
             using var cs = clientConn.CreateStream();
             await cs.SendRequestHeadersAsync("/test/Echo", "localhost");
             // Combined message + half-close — no separate SendHalfCloseAsync
-            await cs.SendMessageAndHalfCloseAsync(requestPayload);
+            await cs.SendMessageAndHalfCloseAsync(LpmHelpers.WrapLpm(requestPayload));
 
             await cs.ReceiveResponseHeadersAsync();
 
             byte[]? responseMsg = null;
-            await foreach (var msg in cs.ReceiveMessagesAsync())
+            await foreach (var msg in cs.ReceiveLpmMessagesAsync())
             {
                 responseMsg = msg;
             }

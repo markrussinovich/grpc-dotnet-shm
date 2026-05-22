@@ -147,22 +147,6 @@ public sealed class ShmRing : IDisposable
     public ulong Capacity => _capacity;
 
     /// <summary>
-    /// Gets or sets the wire-level frame encoding used on this ring.
-    /// Set once during connection establishment (after control-plane
-    /// negotiation) and read on every frame I/O via <see cref="FrameProtocol"/>.
-    /// Default is <see cref="Grpc.Net.SharedMemory.Wire.WireFormat.Custom16"/>.
-    /// </summary>
-    /// <remarks>
-    /// The setter is <c>internal</c> on purpose: the wire format is part of
-    /// the ring's contract for its lifetime. Changing it after frames have
-    /// flowed would corrupt both the writer's and reader's view of the
-    /// on-wire layout. Only the connection-establishment code in
-    /// <see cref="ShmConnection"/>, <see cref="ShmControlListener"/> and
-    /// <see cref="ShmControlHandler"/> may set it.
-    /// </remarks>
-    public Grpc.Net.SharedMemory.Wire.WireFormat Wire { get; internal set; } = Grpc.Net.SharedMemory.Wire.WireFormat.Custom16;
-
-    /// <summary>
     /// Whether the owning connection negotiated single-stream (ping-pong)
     /// mode. Set once during connection establishment and read by
     /// <see cref="ChainZcBudget"/> to decide how aggressively a multi-frame
@@ -371,10 +355,9 @@ public sealed class ShmRing : IDisposable
             {
                 return (long)(_capacity / 2);
             }
-            // Reserve enough for a worst-case 4-frame Custom16 chain
-            // (4 × 16 B header) + the 5-byte gRPC LPM prefix, rounded up
-            // to 1 KiB for breathing room and to keep the budget aligned
-            // when adding/removing wire formats.
+            // Reserve enough for a worst-case 4-frame H2 chain
+            // (4 × 9 B header) + the 5-byte gRPC LPM prefix, rounded up
+            // to 1 KiB for breathing room.
             const ulong SmallReserve = 1024UL;
             return _capacity > SmallReserve
                 ? (long)(_capacity - SmallReserve)
@@ -558,9 +541,8 @@ public sealed class ShmRing : IDisposable
     }
 
     /// <summary>
-    /// Centralised speculative-ZC eligibility check, applied identically by
-    /// every wire-format reader (Custom16 + HTTP/2). Single source of truth
-    /// for the heuristic so the two code paths cannot drift.
+    /// Centralised speculative-ZC eligibility check used by the HTTP/2
+    /// wire-format reader.
     /// </summary>
     /// <param name="payloadLength">Byte length of the candidate frame payload (excluding wire headers).</param>
     /// <param name="contiguous"><c>true</c> if the payload reservation is contiguous (no ring wrap).</param>

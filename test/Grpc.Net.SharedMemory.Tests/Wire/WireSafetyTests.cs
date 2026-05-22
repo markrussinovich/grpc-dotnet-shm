@@ -43,15 +43,16 @@ public class WireSafetyTests
             0,0,0,0,0,0,0,0,           // ringB
             0,                          // flags
             2,                          // declares 2 formats
-            0,                          // only one format byte
+            1,                          // only one format byte
         };
         var ex = Assert.Throws<InvalidDataException>(() => ControlWire.DecodeConnectRequest(bad));
         Assert.That(ex!.Message, Does.Contain("truncated"));
     }
 
     [Test]
-    public void DecodeConnectRequest_UnknownWireFormat_Throws()
+    public void DecodeConnectRequest_NoH2Advertisement_Throws()
     {
+        // Peer advertises only Custom16 (legacy, value 0). Server must reject.
         var bad = new byte[]
         {
             ShmConstants.ControlWireVersion,
@@ -59,29 +60,42 @@ public class WireSafetyTests
             0,0,0,0,0,0,0,0,
             0,
             1,
-            0xFF,                       // unknown format byte
+            0,                          // Custom16 only
         };
         var ex = Assert.Throws<InvalidDataException>(() => ControlWire.DecodeConnectRequest(bad));
-        Assert.That(ex!.Message, Does.Contain("unknown wire format"));
+        Assert.That(ex!.Message, Does.Contain("HTTP/2"));
     }
 
     [Test]
-    public void DecodeConnectRequest_ValidAdvertisement_Roundtrips()
+    public void DecodeConnectRequest_MissingExtension_Throws()
+    {
+        // Legacy v1 payload (just version + ring + flags), no wire-format byte.
+        var bad = new byte[]
+        {
+            ShmConstants.ControlWireVersion,
+            0,0,0,0,0,0,0,0,
+            0,0,0,0,0,0,0,0,
+            0,
+        };
+        var ex = Assert.Throws<InvalidDataException>(() => ControlWire.DecodeConnectRequest(bad));
+        Assert.That(ex!.Message, Does.Contain("HTTP/2"));
+    }
+
+    [Test]
+    public void DecodeConnectRequest_ValidH2Advertisement_Roundtrips()
     {
         var encoded = ControlWire.EncodeConnectRequest(
-            ringA: 4096, ringB: 4096, singleStreamMode: true,
-            supportedWireFormats: new[] { WireFormat.Http2, WireFormat.Custom16 });
-        var (a, b, ss, formats) = ControlWire.DecodeConnectRequest(encoded);
+            ringA: 4096, ringB: 4096, singleStreamMode: true);
+        var (a, b, ss) = ControlWire.DecodeConnectRequest(encoded);
         Assert.That(a, Is.EqualTo(4096UL));
         Assert.That(b, Is.EqualTo(4096UL));
         Assert.That(ss, Is.True);
-        Assert.That(formats, Is.EqualTo(new[] { WireFormat.Http2, WireFormat.Custom16 }));
     }
 
     // ---- ControlWire ACCEPT response validation ----
 
     [Test]
-    public void DecodeConnectResponse_UnknownWireFormat_Throws()
+    public void DecodeConnectResponse_NonHttp2WireFormat_Throws()
     {
         // version + nameLen(4=1) + 'X' + 0xFE
         var bad = new byte[]
@@ -92,17 +106,30 @@ public class WireSafetyTests
             0xFE,
         };
         var ex = Assert.Throws<InvalidDataException>(() => ControlWire.DecodeConnectResponse(bad));
-        Assert.That(ex!.Message, Does.Contain("unknown wire format"));
+        Assert.That(ex!.Message, Does.Contain("HTTP/2"));
     }
 
     [Test]
-    public void DecodeConnectResponse_LegacyClient_NoExtension_DefaultsToCustom16()
+    public void DecodeConnectResponse_NoExtension_Throws()
     {
-        // No trailing format byte → backward compatible default Custom16.
+        // No trailing format byte. Legacy responses are no longer accepted —
+        // a server that does not announce H2 is a protocol error.
+        var bad = new byte[]
+        {
+            ShmConstants.ControlWireVersion,
+            3,0,0,0,
+            (byte)'s', (byte)'e', (byte)'g',
+        };
+        var ex = Assert.Throws<InvalidDataException>(() => ControlWire.DecodeConnectResponse(bad));
+        Assert.That(ex!.Message, Does.Contain("missing wire-format byte"));
+    }
+
+    [Test]
+    public void DecodeConnectResponse_Http2_Roundtrips()
+    {
         var encoded = ControlWire.EncodeConnectResponse("seg");
-        var (name, wf) = ControlWire.DecodeConnectResponse(encoded);
+        var name = ControlWire.DecodeConnectResponse(encoded);
         Assert.That(name, Is.EqualTo("seg"));
-        Assert.That(wf, Is.EqualTo(WireFormat.Custom16));
     }
 
     // ---- LPM body length DoS guard ----
@@ -112,7 +139,7 @@ public class WireSafetyTests
     {
         const int RingCap = 64 * 1024;
         var memory = new byte[ShmConstants.RingHeaderSize + RingCap];
-        using var ring = new ShmRing(memory, 0, RingCap) { Wire = WireFormat.Http2 };
+        using var ring = new ShmRing(memory, 0, RingCap);
 
         // Craft a DATA frame containing exactly 5 bytes (the LPM header) declaring
         // a 2 GiB body. The accumulator path will see a partial LPM and try to

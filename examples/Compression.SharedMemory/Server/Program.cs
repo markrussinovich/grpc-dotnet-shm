@@ -19,6 +19,7 @@
 using Grpc.Core;
 using Grpc.Net.SharedMemory;
 using Grpc.Net.SharedMemory.Compression;
+using System.Buffers.Binary;
 using System.Text;
 
 const string SegmentName = "compression_example_shm";
@@ -99,7 +100,9 @@ async Task HandleStreamAsync(ShmGrpcStream stream)
 
         if (frameType == FrameType.Message && payload != null)
         {
-            var requestMessage = Encoding.UTF8.GetString(payload);
+            // H2 DATA frame body is a gRPC LPM blob: [compFlag(1)][len(4 BE)][body].
+            // Strip the 5-byte prefix to recover the application-level bytes.
+            var requestMessage = Encoding.UTF8.GetString(UnwrapLpm(payload));
             Console.WriteLine($"Received message ({payload.Length} bytes): {requestMessage.Substring(0, Math.Min(50, requestMessage.Length))}...");
 
             // Create a response with some data that benefits from compression
@@ -117,7 +120,7 @@ async Task HandleStreamAsync(ShmGrpcStream stream)
 
             // Send the (possibly compressed) response
             // Note: For real compression, the message framing would include the compression flag
-            await stream.SendMessageAsync(responseBytes);
+            await stream.SendMessageAsync(WrapLpm(responseBytes));
         }
 
         // Send trailers
@@ -134,4 +137,24 @@ async Task HandleStreamAsync(ShmGrpcStream stream)
     {
         Console.WriteLine($"Error handling stream: {ex.Message}");
     }
+}
+
+// gRPC length-prefixed message helpers. H2 DATA frame body is
+// [compFlag(1)][len(4 BE)][body]; both sides must agree.
+static byte[] WrapLpm(byte[] body)
+{
+    var buf = new byte[5 + body.Length];
+    buf[0] = 0; // uncompressed
+    BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(1, 4), (uint)body.Length);
+    body.CopyTo(buf, 5);
+    return buf;
+}
+
+static ReadOnlySpan<byte> UnwrapLpm(byte[] framed)
+{
+    if (framed.Length < 5) throw new InvalidDataException($"LPM blob too short: {framed.Length}");
+    if (framed[0] != 0) throw new InvalidDataException($"Compressed LPM not supported (flag=0x{framed[0]:X2})");
+    var len = (int)BinaryPrimitives.ReadUInt32BigEndian(framed.AsSpan(1, 4));
+    if (5 + len > framed.Length) throw new InvalidDataException($"LPM declares {len} bytes, only {framed.Length - 5} available");
+    return framed.AsSpan(5, len);
 }

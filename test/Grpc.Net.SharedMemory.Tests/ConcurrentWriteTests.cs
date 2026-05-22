@@ -57,7 +57,7 @@ public class ConcurrentWriteTests
 
         // Act
         await stream.SendRequestHeadersAsync("/test/Method", "localhost");
-        await stream.SendMessageAsync(new byte[] { 1, 2, 3, 4 });
+        await stream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { 1, 2, 3, 4 }));
         await stream.SendHalfCloseAsync();
 
         // Assert — connection is still healthy.
@@ -81,11 +81,13 @@ public class ConcurrentWriteTests
 
         await clientStream.SendRequestHeadersAsync("/test/ZeroCopy", "localhost");
 
-        // Allocate a buffer and send via zero-copy.
-        var buf = System.Buffers.ArrayPool<byte>.Shared.Rent(64);
-        expectedPayload.CopyTo(buf, 0);
+        // Wrap with gRPC LPM header so the H2 codec on the server side
+        // can parse the DATA frame as a complete LPM message.
+        var wrapped = LpmHelpers.WrapLpm(expectedPayload);
+        var buf = System.Buffers.ArrayPool<byte>.Shared.Rent(wrapped.Length);
+        wrapped.CopyTo(buf, 0);
         await clientStream.SendMessageZeroCopyAsync(
-            buf.AsMemory(0, expectedPayload.Length),
+            buf.AsMemory(0, wrapped.Length),
             buf);
         await clientStream.SendHalfCloseAsync();
 
@@ -98,7 +100,7 @@ public class ConcurrentWriteTests
         Assert.That(sd.RequestHeaders?.Method, Is.EqualTo("/test/ZeroCopy"));
 
         var receivedMessages = new List<byte[]>();
-        await foreach (var msg in sd.ReceiveMessagesAsync(TestContext.CurrentContext.CancellationToken))
+        await foreach (var msg in sd.ReceiveLpmMessagesAsync(TestContext.CurrentContext.CancellationToken))
         {
             receivedMessages.Add(msg);
         }
@@ -137,7 +139,7 @@ public class ConcurrentWriteTests
 
                     for (var m = 0; m < messagesPerStream; m++)
                     {
-                        await stream.SendMessageAsync(new byte[] { (byte)m });
+                        await stream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { (byte)m }));
                     }
 
                     await stream.SendHalfCloseAsync();
@@ -179,7 +181,7 @@ public class ConcurrentWriteTests
             for (var m = 0; m < messagesPerThread; m++)
             {
                 cts.Token.ThrowIfCancellationRequested();
-                await stream.SendMessageAsync(new byte[] { (byte)i, (byte)m });
+                await stream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { (byte)i, (byte)m }));
             }
 
             await stream.SendHalfCloseAsync();
@@ -218,7 +220,7 @@ public class ConcurrentWriteTests
 
                     for (var m = 0; m < 10; m++)
                     {
-                        await stream.SendMessageAsync(new byte[] { (byte)m });
+                        await stream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { (byte)m }));
                     }
 
                     await stream.SendTrailersAsync(StatusCode.OK);
@@ -286,7 +288,7 @@ public class ConcurrentWriteTests
                 {
                     try
                     {
-                        await stream.SendMessageAsync(new byte[] { (byte)i });
+                        await stream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { (byte)i }));
                     }
                     catch (ObjectDisposedException)
                     {
@@ -342,7 +344,7 @@ public class ConcurrentWriteTests
         const int messageCount = 100;
         for (var i = 0; i < messageCount; i++)
         {
-            await clientStream.SendMessageAsync(new byte[] { (byte)(i & 0xFF) });
+            await clientStream.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { (byte)(i & 0xFF) }));
         }
 
         await clientStream.SendHalfCloseAsync();
@@ -354,7 +356,7 @@ public class ConcurrentWriteTests
         using var ____ = serverStream!;
 
         var index = 0;
-        await foreach (var msg in serverStream!.ReceiveMessagesAsync(ct))
+        await foreach (var msg in serverStream!.ReceiveLpmMessagesAsync(ct))
         {
             Assert.That(msg[0], Is.EqualTo((byte)(index & 0xFF)),
                 $"Message {index} arrived out of order");
@@ -390,7 +392,7 @@ public class ConcurrentWriteTests
 
                 for (var m = 0; m < messagesPerStream; m++)
                 {
-                    await s.SendMessageAsync(new byte[] { (byte)i, (byte)m });
+                    await s.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { (byte)i, (byte)m }));
                 }
 
                 await s.SendHalfCloseAsync();
@@ -428,7 +430,7 @@ public class ConcurrentWriteTests
                 using var d = s;
                 await s.SendRequestHeadersAsync($"/test/Bidi{i}", "localhost");
                 for (var m = 0; m < 20; m++)
-                    await s.SendMessageAsync(new byte[] { (byte)i, (byte)m });
+                    await s.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { (byte)i, (byte)m }));
                 await s.SendHalfCloseAsync();
             }
             catch (Exception ex) { errors.Add(ex); }
@@ -443,7 +445,7 @@ public class ConcurrentWriteTests
                 using var d = s;
                 await s.SendResponseHeadersAsync();
                 for (var m = 0; m < 20; m++)
-                    await s.SendMessageAsync(new byte[] { (byte)(i + 100), (byte)m });
+                    await s.SendMessageAsync(LpmHelpers.WrapLpm(new byte[] { (byte)(i + 100), (byte)m }));
                 await s.SendTrailersAsync(StatusCode.OK);
             }
             catch (Exception ex) { errors.Add(ex); }
@@ -490,7 +492,7 @@ public class ConcurrentWriteTests
 
                 for (var m = 0; m < messagesPerStream; m++)
                 {
-                    await s.SendMessageAsync(payload);
+                    await s.SendMessageAsync(LpmHelpers.WrapLpm(payload));
                 }
 
                 await s.SendHalfCloseAsync();
@@ -533,7 +535,7 @@ public class ConcurrentWriteTests
             {
                 try
                 {
-                    stream.SendMessageAsync(payload).Wait(TimeSpan.FromMilliseconds(500));
+                    stream.SendMessageAsync(LpmHelpers.WrapLpm(payload)).Wait(TimeSpan.FromMilliseconds(500));
                 }
                 catch
                 {

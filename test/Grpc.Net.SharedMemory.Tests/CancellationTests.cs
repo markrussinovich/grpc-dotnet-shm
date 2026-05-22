@@ -191,7 +191,7 @@ public class CancellationTests
         
         var stream = client.CreateStream();
         await stream.SendRequestHeadersAsync("/test/Cancel", "localhost");
-        await stream.SendMessageAsync(Encoding.UTF8.GetBytes("test message"));
+        await stream.SendMessageAsync(LpmHelpers.WrapLpmText("test message"));
         
         // Cancel after sending message
         await stream.CancelAsync();
@@ -237,7 +237,7 @@ public class CancellationTests
         // Sending after cancel should throw
         Assert.ThrowsAsync<InvalidOperationException>(async () =>
         {
-            await stream.SendMessageAsync(Encoding.UTF8.GetBytes("test"));
+            await stream.SendMessageAsync(LpmHelpers.WrapLpmText("test"));
         });
     }
 
@@ -260,7 +260,7 @@ public class CancellationTests
         // Operations with cancelled token should throw
         Assert.That(async () =>
         {
-            await stream.SendMessageAsync(Encoding.UTF8.GetBytes("test"), cts.Token);
+            await stream.SendMessageAsync(LpmHelpers.WrapLpmText("test"), cts.Token);
         }, Throws.InstanceOf<OperationCanceledException>());
     }
 
@@ -314,17 +314,17 @@ public class CancellationTests
         Assert.That(stream3.IsCancelled, Is.False);
         
         // Other streams should still work — send and verify on server
-        await stream1.SendMessageAsync(Encoding.UTF8.GetBytes("still works"));
+        await stream1.SendMessageAsync(LpmHelpers.WrapLpmText("still works"));
         await stream1.SendHalfCloseAsync();
         byte[]? recv1 = null;
-        await foreach (var m in ss1!.ReceiveMessagesAsync())
+        await foreach (var m in ss1!.ReceiveLpmMessagesAsync())
             recv1 = m;
         Assert.That(Encoding.UTF8.GetString(recv1!), Is.EqualTo("still works"));
 
-        await stream3.SendMessageAsync(Encoding.UTF8.GetBytes("also works"));
+        await stream3.SendMessageAsync(LpmHelpers.WrapLpmText("also works"));
         await stream3.SendHalfCloseAsync();
         byte[]? recv3 = null;
-        await foreach (var m in ss3!.ReceiveMessagesAsync())
+        await foreach (var m in ss3!.ReceiveLpmMessagesAsync())
             recv3 = m;
         Assert.That(Encoding.UTF8.GetString(recv3!), Is.EqualTo("also works"));
     }
