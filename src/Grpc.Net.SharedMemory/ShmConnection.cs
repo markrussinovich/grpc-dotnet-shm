@@ -49,12 +49,23 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     // in creating streams, exceeding the server's maxConcurrentStreams limit.
     private int _clientStreamCount;
 
-    // Connection-level flow control is disabled (_sendWindow = unlimited).
-    // Ring WaitForSpace is the only back-pressure needed.
-    // Fields retained (commented out) for potential future restoration.
-    // private long _connWindowDebt;
-    // private static readonly long ConnWindowUpdateThreshold =
-    //     Math.Min(1_048_576, ShmConstants.InitialWindowSize / 4);
+    // Connection-level and stream-level HTTP/2 flow control are
+    // ELIDED in ALL modes, matching grpc-go-shmem's v3.4+ no-WU
+    // baseline (will be specified normatively in the gRFC):
+    //
+    //   - Senders never emit WINDOW_UPDATE frames.
+    //   - Receivers parse incoming WINDOW_UPDATE for RFC 7540 §6.9.1
+    //     validation at the H2 codec layer, then discard the
+    //     increment (AddSendQuota is an unconditional no-op).
+    //   - Per-stream and per-connection windows are not tracked.
+    //   - Ring WaitForSpace is the canonical SHM back-pressure primitive.
+    //
+    // The opt-in SHM_FAIR_STREAM_WINDOW / SHM_FAIR_MAX_FRAME
+    // env vars only affect wire-format parity for benchmarking against
+    // TCP+HTTP/2 (smaller DATA frame payload, disabled coalescing); they
+    // do NOT re-enable flow control. Both endpoints (.NET and
+    // grpc-go-shmem) are no-WU in every mode, so there is no interop
+    // restriction.
 
     // Write lock: the SPSC ring buffer requires single-producer semantics.
     // All writes to TxRing are serialised through the ShmFrameWriter's
@@ -106,6 +117,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// Gets the connection name (shared memory segment name).
     /// </summary>
     public string Name { get; }
+
+    /// <summary>
+    /// Gets the authentication info produced by the security handshake,
+    /// or <c>null</c> if no handshaker was configured (insecure local
+    /// SHM). When non-null the <see cref="ShmAuthInfo.RemoteIdentity"/>
+    /// carries the peer's verified identity token, as exchanged during
+    /// the data-segment HandshakeInit/Resp/Ack sequence. Mirrors
+    /// grpc-go-shmem's <c>ShmAuthInfo</c> surfaced via
+    /// <c>credentials/shm</c>.
+    /// </summary>
+    public ShmAuthInfo? AuthInfo { get; internal set; }
 
     /// <summary>
     /// Gets whether this is a client-side connection.
@@ -183,6 +205,15 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="keepaliveOptions">Optional keepalive options.</param>
     /// <param name="enforcementPolicy">Optional enforcement policy for server.</param>
     /// <returns>A new server connection.</returns>
+    /// <remarks>
+    /// This is a low-level direct API intended for in-process tests and
+    /// embedded scenarios. It does NOT perform the control-segment
+    /// handshake (<c>WaitForClient</c> + <c>FinalizeDataSegWaker</c>)
+    /// that <see cref="ShmControlListener"/> uses on production paths.
+    /// If you cross processes with <c>SHM_EVENTFD_WAKE=1</c>, prefer the
+    /// listener API — otherwise the eventfd negotiation step is bypassed
+    /// and a peer with a different wake primitive may deadlock.
+    /// </remarks>
     public static ShmConnection CreateAsServer(
         string name,
         ulong ringCapacity = 64 * 1024 * 1024,
@@ -263,7 +294,20 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // can process inbound frames immediately (e.g., Ping) which trigger
         // SendFrame → _frameWriter.Enqueue. If the writer isn't initialized
         // yet, that's a NullReferenceException.
-        _frameWriter = new ShmFrameWriter(TxRing, _disposeCts);
+        //
+        // StreamMap routing: passed into the writer at construction so a
+        // future flow-control hook can look up per-stream state without
+        // a global table. Currently unused at runtime (no fair-window
+        // enforcement — see ShmGrpcStream.FairAwaitWindow no-op).
+        _frameWriter = new ShmFrameWriter(TxRing, _disposeCts, _streams);
+
+        // No-WU design (matches grpc-go-shmem shmNoWU mode, gRFC SHM
+        // alignment v3.4+): never emit WINDOW_UPDATE frames; incoming
+        // WU frames are validated by the H2 codec for spec compliance
+        // (RFC 7540 §6.9.1 increment != 0, length == 4) then their
+        // increment is discarded in AddSendQuota. The SHM ring's
+        // WaitForSpace backpressure is the sole flow control.
+        // Hence no OnDataFrameConsumed callback is wired here.
 
         // Start background frame reader
         _frameReaderTask = FrameReaderLoopAsync();
@@ -447,13 +491,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _frameWriter!.EnqueueZeroCopyAndWait(type, streamId, flags, payload, cancellationToken);
     }
 
-    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822")]
-    internal void SendStreamWindowUpdate(uint streamId, uint increment)
-    {
-        // No-op: _sendWindow is unlimited (long.MaxValue/2). The ring's
-        // WaitForSpace provides back-pressure. Sending WindowUpdate frames
-        // would only waste ~500ns per frame in control queue overhead.
-    }
+    // Regression guard: SHM is no-WU in all modes (gRFC SHM alignment with
+    // grpc-go-shmem v3.4+ shmNoWU). Incremented inside the H2 codec's
+    // WriteH2WindowUpdate — the single structural emission point — so any
+    // future code path that puts a WINDOW_UPDATE frame on the wire
+    // automatically trips the EndToEndTests.NoWindowUpdate_EmittedInDefault
+    // Mode_GrpcGoInteropAlignment assertion without further wiring.
+    private static long s_wuFramesEmitted;
+    internal static long WindowUpdateFramesEmittedForTest()
+        => Volatile.Read(ref s_wuFramesEmitted);
+    internal static void RecordWindowUpdateEmission()
+        => Interlocked.Increment(ref s_wuFramesEmitted);
 
     private Task FrameReaderLoopAsync()
     {
@@ -546,11 +594,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                     payload.Release();
                 }
 
-                // Connection-level window update: no-op since _sendWindow is
-                // unlimited. Ring WaitForSpace is the only back-pressure needed.
-                // Keeping the debt accumulation commented out to avoid the
-                // Interlocked.Add overhead on the hot path.
-                // if (header.Type == FrameType.Message && payloadLength > 0) { ... }
+                // Connection-level back-pressure: none. SHM is no-WU in all
+                // modes (gRFC SHM alignment with grpc-go-shmem shmNoWU);
+                // the ring's WaitForSpace is the sole flow control.
                 break;
 
             case FrameType.Ping:
@@ -755,20 +801,28 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     #region Connection-Level Flow Control
 
     /// <summary>
-    /// Routes a WINDOW_UPDATE frame to the appropriate stream.
-    /// Connection-level updates (streamId=0) are accepted but not enforced
-    /// locally — the ring buffer's physical capacity provides natural
-    /// backpressure. We still send connection-level WINDOW_UPDATEs to the
-    /// remote side (see ProcessFrame) for interop with implementations
-    /// that enforce connection-level send quota.
+    /// Handler for incoming WINDOW_UPDATE frames. No-op in all modes: SHM
+    /// is no-WU (gRFC SHM alignment with grpc-go-shmem v3.4+ shmNoWU);
+    /// the H2 codec layer has already validated the frame per RFC 7540
+    /// §6.9.1 (increment != 0, length == 4) by the time the dispatcher
+    /// routes it here, and the increment is then discarded. We never
+    /// emit WINDOW_UPDATE either — see
+    /// <see cref="WindowUpdateFramesEmittedForTest"/> and the structural
+    /// counter inside <c>Http2Codec.Write.WriteH2WindowUpdate</c>.
     /// </summary>
-    internal static void AddSendQuota(uint streamId, uint delta)
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822", Justification = "No-op stub kept instance-method for API stability and interop with the WINDOW_UPDATE dispatch path.")]
+    internal void AddSendQuota(uint streamId, uint delta)
     {
-        // No-op: per-stream flow control is disabled.
-        // Ring WaitForSpace provides back-pressure.
+        // No-op (all modes). Aligns with grpc-go-shmem shmNoWU design:
+        // SHM ring's WaitForSpace backpressure is the sole flow control;
+        // per-stream H2 windows are not enforced over shared memory.
+        // Incoming WINDOW_UPDATE frames are still parsed for spec
+        // compliance (RFC 7540 §6.9.1) and validated by the H2 codec,
+        // but their increment is discarded here.
+        _ = streamId;
+        _ = delta;
     }
 
-    /// <summary>
     #endregion
 
     #region Keepalive
@@ -918,8 +972,25 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _incomingStreamsChannel.Writer.TryComplete();
         _disposeCts.Cancel();
 
-        try { _frameReaderTask.Wait(TimeSpan.FromMilliseconds(500)); }
+        // Wait for the reader thread to fully exit BEFORE disposing the
+        // Segment (which unmaps the ring header pages). If the reader is
+        // still inside ShmRing.WaitForDataAfter when the unmap happens it
+        // will AccessViolation on its next Volatile.Read of header.WriteIdx.
+        // The Linux FUTEX_WAIT path now wires the CT to FUTEX_WAKE so the
+        // reader unparks within microseconds; 5 s is a generous safety
+        // budget that mostly covers extremely slow CI scheduling.
+        try { _frameReaderTask.Wait(TimeSpan.FromSeconds(5)); }
         catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.Dispose: frame reader: {ex.Message}"); }
+        if (!_frameReaderTask.IsCompleted)
+        {
+            // The reader did not honour cancellation in time. Skip the
+            // Segment.Dispose (it would munmap memory the reader is
+            // about to touch). This leaks the segment file/handles but
+            // keeps the process alive. Log so operators notice.
+            System.Diagnostics.Debug.WriteLine(
+                "ShmConnection.Dispose: frame reader did not exit in 5 s; " +
+                "leaking Segment to avoid use-after-free.");
+        }
 
         if (_keepaliveTask != null)
         {
@@ -934,7 +1005,12 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
         _streams.Clear();
 
-        _segment.Dispose();
+        // Only dispose the Segment if the reader has confirmed it is
+        // outside any header.WriteIdx read.
+        if (_frameReaderTask.IsCompleted)
+        {
+            _segment.Dispose();
+        }
         _disposeCts.Dispose();
     }
 
@@ -964,8 +1040,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _incomingStreamsChannel.Writer.TryComplete();
         _disposeCts.Cancel();
 
-        try { await _frameReaderTask.WaitAsync(TimeSpan.FromMilliseconds(500)); }
+        // See sync Dispose for rationale on the 5 s timeout + leak-on-
+        // timeout policy.
+        try { await _frameReaderTask.WaitAsync(TimeSpan.FromSeconds(5)); }
         catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.DisposeAsync: frame reader: {ex.Message}"); }
+        var readerExited = _frameReaderTask.IsCompleted;
+        if (!readerExited)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                "ShmConnection.DisposeAsync: frame reader did not exit in 5 s; " +
+                "leaking Segment to avoid use-after-free.");
+        }
 
         if (_keepaliveTask != null)
         {
@@ -980,7 +1065,12 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
         _streams.Clear();
 
-        _segment.Dispose();
+        // Only dispose the Segment if the reader has confirmed it is
+        // outside any header.WriteIdx read.
+        if (readerExited)
+        {
+            _segment.Dispose();
+        }
         _disposeCts.Dispose();
     }
 }

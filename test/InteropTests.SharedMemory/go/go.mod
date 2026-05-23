@@ -1,6 +1,6 @@
 module interop-shm
 
-go 1.24.0
+go 1.25.0
 
 require (
 	google.golang.org/grpc v1.60.0
@@ -8,11 +8,15 @@ require (
 )
 
 require (
-	golang.org/x/net v0.49.0 // indirect
-	golang.org/x/sys v0.40.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260120221211-b8f7ae30c516 // indirect
+	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 )
 
-// Use local clone for development
-replace google.golang.org/grpc => c:\src\grpc-go-shmem
+// Local-clone dev override: the grpc-go-shmem fork is expected to be
+// checked out alongside grpc-dotnet-shm (sibling repos). Adjust this
+// path or use `go work` to override locally if the fork lives elsewhere.
+// The interop suite is dev-only; production consumers do not pick up
+// this go.mod.
+replace google.golang.org/grpc => ../../../../grpc-go-shmem

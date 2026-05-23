@@ -87,8 +87,9 @@ public sealed class ShmRing : IDisposable
     private readonly ulong _capMask;
     private readonly int _headerOffset;
     private readonly int _dataOffset;
-    private readonly IRingSync? _sync;
+    private IRingSync? _sync;
     private readonly bool _isOwner;
+    private bool _skipSpinWait;
 
     private volatile bool _localClosed;
     private ulong _pendingReadIdx;
@@ -102,8 +103,9 @@ public sealed class ShmRing : IDisposable
     private int _batchWriteDepth;
 
     // Callback invoked during WaitForSpace before blocking, allowing the
-    // WriterLoop to drain control frames (e.g. WindowUpdate) that can
-    // free space on the remote side and break bidirectional deadlocks.
+    // WriterLoop to flush priority control frames (Ping/Pong keepalive)
+    // so they are not stalled behind the blocked message write while the
+    // ring is full.
     internal Action? WaitForSpaceDrainCallback;
     private int _drainRecursionDepth;
 
@@ -135,10 +137,32 @@ public sealed class ShmRing : IDisposable
         _capMask = capacity - 1;
         _sync = sync;
         _isOwner = isOwner;
+        _skipSpinWait = sync?.SkipSpinWait ?? false;
 
         // Initialize pending read index from current shared read index
         ref var header = ref GetHeader();
         _pendingReadIdx = Volatile.Read(ref header.ReadIdx);
+    }
+
+    /// <summary>
+    /// Header offset within the segment. Exposed so that
+    /// <see cref="Segment.FinalizeDataSegWaker"/> can reconstruct a
+    /// futex-backed <see cref="IRingSync"/> when the eventfd waker
+    /// must be dropped to converge with the peer.
+    /// </summary>
+    public int HeaderOffset => _headerOffset;
+
+    /// <summary>
+    /// Atomically swaps the ring's synchronization primitive. Intended
+    /// for use during the handshake phase (BEFORE any concurrent ring
+    /// traffic) when the wake-mode negotiation drops the eventfd path
+    /// and reverts to the futex fallback. The previous sync is disposed.
+    /// </summary>
+    internal void ReplaceSync(IRingSync? newSync)
+    {
+        var old = Interlocked.Exchange(ref _sync, newSync);
+        _skipSpinWait = newSync?.SkipSpinWait ?? false;
+        old?.Dispose();
     }
 
     /// <summary>
@@ -950,6 +974,76 @@ public sealed class ShmRing : IDisposable
     }
 
     /// <summary>
+    /// Combined batch-end + signal-data + wait pattern. Closes the batch
+    /// (decrements <c>_batchWriteDepth</c> to 0) and, if a waiter is
+    /// parked, signals data AND atomically waits on <paramref name="localHandle"/>
+    /// — on Windows via <c>SignalObjectAndWait</c> (saves one kernel
+    /// transition per RT on the writer-loop hot path). Caller must
+    /// fall back to a regular wait if this returns false (either no
+    /// waiters were parked so no signal was sent, or the underlying
+    /// sync primitive does not implement the combined primitive).
+    /// </summary>
+    /// <returns>True iff <paramref name="localHandle"/> was signaled by
+    /// the combined wait.</returns>
+    internal bool EndBatchWriteAndWaitForLocal(IntPtr localHandle, TimeSpan? timeout, CancellationToken ct)
+    {
+        if (--_batchWriteDepth > 0) return false;
+        _batchWriteDepth = 0;
+        ref var header = ref GetHeader();
+        if (Volatile.Read(ref header.DataWaiters) == 0) return false;
+        return _sync?.TrySignalDataAndWaitForLocal(localHandle, timeout, ct) ?? false;
+    }
+
+    /// <summary>
+    /// Decrements <c>_batchWriteDepth</c> WITHOUT firing the deferred
+    /// <see cref="IRingSync.SignalData"/>. Used by the SAW-WriterLoop
+    /// path that wants to combine the signal with a subsequent wait
+    /// via <see cref="TryFireDeferredSignalAndWaitForLocal"/>.
+    /// Caller MUST eventually fire the signal (directly or via SAW)
+    /// or peer waiters will hang.
+    /// </summary>
+    internal void EndBatchWriteSuppressSignal()
+    {
+        if (--_batchWriteDepth <= 0)
+        {
+            _batchWriteDepth = 0;
+            // Suppress the SignalData. Caller owns the signal.
+        }
+    }
+
+    /// <summary>
+    /// Fires the deferred <see cref="IRingSync.SignalData"/> AND waits
+    /// on <paramref name="localHandle"/> atomically via
+    /// <see cref="IRingSync.TrySignalDataAndWaitForLocal"/> — collapses
+    /// the writer-loop "signal peer + wait next work" 2-syscall
+    /// sequence into 1 kernel transition on Windows. Returns false if
+    /// no peer is parked (no signal needed) OR the underlying primitive
+    /// does not implement the combined wait (Linux eventfd today).
+    /// Caller MUST fall back to its own wait when this returns false.
+    /// </summary>
+    internal bool TryFireDeferredSignalAndWaitForLocal(IntPtr localHandle, TimeSpan? timeout, CancellationToken ct)
+    {
+        ref var header = ref GetHeader();
+        if (Volatile.Read(ref header.DataWaiters) == 0) return false;
+        return _sync?.TrySignalDataAndWaitForLocal(localHandle, timeout, ct) ?? false;
+    }
+
+    /// <summary>
+    /// Fires <see cref="IRingSync.SignalData"/> immediately if a peer
+    /// is parked on the data condition. Used by the SAW-WriterLoop
+    /// fallback path when <see cref="TryFireDeferredSignalAndWaitForLocal"/>
+    /// returned false but a deferred signal still needs to be delivered.
+    /// </summary>
+    internal void FireDeferredSignalIfWaiters()
+    {
+        ref var header = ref GetHeader();
+        if (Volatile.Read(ref header.DataWaiters) > 0)
+        {
+            _sync?.SignalData();
+        }
+    }
+
+    /// <summary>
     /// Reserves bytes for reading, returning slices for zero-copy reads.
     /// The reservation must be committed via CommitRead.
     /// </summary>
@@ -1228,37 +1322,47 @@ public sealed class ShmRing : IDisposable
 
     private void WaitForSpace(ref RingHeader header, ulong needed, CancellationToken cancellationToken)
     {
-        // Adaptive spin before blocking
-        var spinLimit = Volatile.Read(ref _spaceSpinCutoff);
-        for (var i = 0; i < spinLimit; i++)
+        // Adaptive spin before blocking (skipped when the sync primitive
+        // self-identifies as low-latency, e.g. eventfd whose blocking
+        // read is ~5-10 us and beats spinning).
+        if (!_skipSpinWait)
         {
-            var writeIdx = Volatile.Read(ref header.WriteIdx);
-            var readIdx = Volatile.Read(ref header.ReadIdx);
-            if (_capacity - (writeIdx - readIdx) >= needed)
+            var spinLimit = Volatile.Read(ref _spaceSpinCutoff);
+            for (var i = 0; i < spinLimit; i++)
             {
-                // Success - adapt spin limit: maintain or raise when we
-                // waited longer than 75% of the limit.
-                if (i > 0)
+                var writeIdxS = Volatile.Read(ref header.WriteIdx);
+                var readIdxS = Volatile.Read(ref header.ReadIdx);
+                if (_capacity - (writeIdxS - readIdxS) >= needed)
                 {
-                    var newCutoff = i > (spinLimit * 3 / 4)
-                        ? Math.Min(ShmConstants.SpinIterationsMax, spinLimit + spinLimit / 8)
-                        : spinLimit;
-                    Volatile.Write(ref _spaceSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, newCutoff));
+                    // Success - adapt spin limit: maintain or raise when we
+                    // waited longer than 75% of the limit.
+                    if (i > 0)
+                    {
+                        var newCutoff = i > (spinLimit * 3 / 4)
+                            ? Math.Min(ShmConstants.SpinIterationsMax, spinLimit + spinLimit / 8)
+                            : spinLimit;
+                        Volatile.Write(ref _spaceSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, newCutoff));
+                    }
+                    return;
                 }
-                return;
+
+                if (header.Closed != 0 || _localClosed)
+                {
+                    throw new RingClosedException();
+                }
+
+                Thread.SpinWait(1);
             }
 
-            if (header.Closed != 0 || _localClosed)
-            {
-                throw new RingClosedException();
-            }
-
-            Thread.SpinWait(1);
+            // Spin failed - adapt downward and fall back to blocking
+            var reducedCutoff = (7 * spinLimit + ShmConstants.SpinIterationsMin) / 8;
+            Volatile.Write(ref _spaceSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, reducedCutoff));
         }
 
-        // Spin failed - adapt downward and fall back to blocking
-        var reducedCutoff = (7 * spinLimit + ShmConstants.SpinIterationsMin) / 8;
-        Volatile.Write(ref _spaceSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, reducedCutoff));
+        if (header.Closed != 0 || _localClosed)
+        {
+            throw new RingClosedException();
+        }
 
         // Distinguish full vs partial: if ring is completely full, wait on spaceSeq
         // (bumped only when transitioning from full to not-full). If ring has some
@@ -1268,10 +1372,11 @@ public sealed class ShmRing : IDisposable
         var readIdx2 = Volatile.Read(ref header.ReadIdx);
         var free = _capacity - (writeIdx2 - readIdx2);
 
-        // Before blocking, drain any pending control frames (WindowUpdate)
-        // so the remote side can free ring space. Without this, both sides'
-        // WriterLoops can block waiting for space while WindowUpdates sit
-        // unreachable in the queue.
+        // Before blocking, flush any pending priority control frames
+        // (Ping, Pong keepalive). Keeps keepalive responsive even when
+        // the ring is full and the message-frame queue would otherwise
+        // wait for the peer to drain. (WindowUpdate is included in the
+        // priority enum slot but never enqueued under SHM no-WU.)
         // Guard against recursion: DrainControlFrames → WriteFrame → WaitForSpace → drain.
         // Depth 1 is enough — control frames are tiny and always fit if any space exists.
         if (_drainRecursionDepth == 0)
@@ -1309,6 +1414,21 @@ public sealed class ShmRing : IDisposable
             }
 
             _sync?.WaitForSpace(seq, timeout: null, cancellationToken);
+
+            // Layer-3 cascade for shared-fd wake primitives (eventfd):
+            // if our condition is STILL unmet after the wake the kernel
+            // probably handed the wake to a wrong parker on the shared
+            // eventfd. Re-fire the local edge so the other parker (in
+            // this ring OR the sibling ring on the same waker) gets to
+            // recheck. The implementation gates internally on whether
+            // any OTHER parker is currently in Wait (Parkers > 0); no-op
+            // on futex / Windows-events.
+            var wi2 = Volatile.Read(ref header.WriteIdx);
+            var ri2 = Volatile.Read(ref header.ReadIdx);
+            if (_capacity - (wi2 - ri2) < needed)
+            {
+                _sync?.RewakeLocal();
+            }
         }
         finally
         {
@@ -1353,39 +1473,47 @@ public sealed class ShmRing : IDisposable
     /// </remarks>
     private void WaitForDataAfter(ref RingHeader header, ulong watermark, CancellationToken cancellationToken)
     {
-        var spinLimit = Volatile.Read(ref _dataSpinCutoff);
-        for (var i = 0; i < spinLimit; i++)
+        if (!_skipSpinWait)
         {
-            var writeIdx = Volatile.Read(ref header.WriteIdx);
-            if (writeIdx > watermark)
+            var spinLimit = Volatile.Read(ref _dataSpinCutoff);
+            for (var i = 0; i < spinLimit; i++)
             {
-                // Success - adapt spin limit: if we found data within the
-                // spin window, keep the cutoff at least at the current level.
-                // Previous formula (7*limit + i*2)/8 would reduce the cutoff
-                // when i < 3*limit/8, causing unnecessary kernel waits.
-                if (i > 0)
+                var writeIdxS = Volatile.Read(ref header.WriteIdx);
+                if (writeIdxS > watermark)
                 {
-                    // Maintain current cutoff or raise slightly if we waited
-                    // longer than 75% of the limit.
-                    var newCutoff = i > (spinLimit * 3 / 4)
-                        ? Math.Min(ShmConstants.SpinIterationsMax, spinLimit + spinLimit / 8)
-                        : spinLimit;
-                    Volatile.Write(ref _dataSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, newCutoff));
+                    // Success - adapt spin limit: if we found data within the
+                    // spin window, keep the cutoff at least at the current level.
+                    // Previous formula (7*limit + i*2)/8 would reduce the cutoff
+                    // when i < 3*limit/8, causing unnecessary kernel waits.
+                    if (i > 0)
+                    {
+                        // Maintain current cutoff or raise slightly if we waited
+                        // longer than 75% of the limit.
+                        var newCutoff = i > (spinLimit * 3 / 4)
+                            ? Math.Min(ShmConstants.SpinIterationsMax, spinLimit + spinLimit / 8)
+                            : spinLimit;
+                        Volatile.Write(ref _dataSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, newCutoff));
+                    }
+                    return;
                 }
-                return;
+
+                if (header.Closed != 0 || _localClosed)
+                {
+                    throw new RingClosedException();
+                }
+
+                Thread.SpinWait(1);
             }
 
-            if (header.Closed != 0 || _localClosed)
-            {
-                throw new RingClosedException();
-            }
-
-            Thread.SpinWait(1);
+            // Spin failed - adapt downward and fall back to blocking
+            var reducedCutoff = (7 * _dataSpinCutoff + ShmConstants.SpinIterationsMin) / 8;
+            Volatile.Write(ref _dataSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, reducedCutoff));
         }
 
-        // Spin failed - adapt downward and fall back to blocking
-        var reducedCutoff = (7 * _dataSpinCutoff + ShmConstants.SpinIterationsMin) / 8;
-        Volatile.Write(ref _dataSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, reducedCutoff));
+        if (header.Closed != 0 || _localClosed)
+        {
+            throw new RingClosedException();
+        }
 
         // Block on sync primitive
         Interlocked.Increment(ref header.DataWaiters);
@@ -1407,6 +1535,13 @@ public sealed class ShmRing : IDisposable
             }
 
             _sync?.WaitForData(seq, timeout: null, cancellationToken);
+
+            // Layer-3 cascade (see WaitForSpace for details).
+            var writeIdxPost = Volatile.Read(ref header.WriteIdx);
+            if (writeIdxPost <= watermark)
+            {
+                _sync?.RewakeLocal();
+            }
         }
         finally
         {

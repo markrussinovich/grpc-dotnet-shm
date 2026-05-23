@@ -123,7 +123,16 @@ public static class FrameProtocol
     /// Writes a MESSAGE frame, automatically chunking if the payload exceeds
     /// the ring capacity. Matches grpc-go-shmem's writeFrameBuffersChunked.
     /// </summary>
-    public static void WriteMessage(ShmRing ring, uint streamId, ReadOnlySpan<byte> data, bool isLast, CancellationToken cancellationToken = default, byte extraFlags = 0)
+    /// <param name="preChunkDrain">
+    /// Optional pre-chunk control-frame drain hook. Writers pass their
+    /// <c>DrainControlFrames</c> here so any pending Ping/Pong control
+    /// traffic is flushed to the ring before each message chunk. With
+    /// SHM no-WU alignment this no longer prevents a deadlock (the ring's
+    /// <c>WaitForSpace</c> is the sole flow control and per-stream H2
+    /// window simulation has been removed), but the drain still keeps
+    /// keepalive responsiveness tight under sustained streaming.
+    /// </param>
+    public static void WriteMessage(ShmRing ring, uint streamId, ReadOnlySpan<byte> data, bool isLast, CancellationToken cancellationToken = default, byte extraFlags = 0, ShmGrpcStream? fairStream = null, Action? preChunkDrain = null)
     {
         var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
 
@@ -147,8 +156,20 @@ public static class FrameProtocol
             maxFramePayload = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
         }
 
+        // Strict-fair bench cap (SHM_FAIR_MAX_FRAME): force same multi-frame
+        // splitting as TCP/UDS gRPC. No-op when env var is unset.
+        if (ShmConstants.FairMaxFramePayload < maxFramePayload)
+        {
+            maxFramePayload = ShmConstants.FairMaxFramePayload;
+        }
+
         if (data.Length <= maxFramePayload)
         {
+            // Flush pending Ping/Pong control frames before the message
+            // write so keepalive stays responsive. FairAwaitWindow is a
+            // no-op under SHM no-WU alignment; retained for API stability.
+            preChunkDrain?.Invoke();
+            fairStream?.FairAwaitWindow(data.Length, preChunkDrain);
             var header = new FrameHeader(FrameType.Message, streamId, (uint)data.Length, flags);
             WriteFrame(ring, header, data, cancellationToken);
             return;
@@ -170,6 +191,12 @@ public static class FrameProtocol
             {
                 chunkFlags = flags;
             }
+
+            // Flush pending Ping/Pong control frames before each chunk
+            // for keepalive responsiveness. FairAwaitWindow is a no-op
+            // under SHM no-WU alignment; retained for API stability.
+            preChunkDrain?.Invoke();
+            fairStream?.FairAwaitWindow(chunkSize, preChunkDrain);
 
             var header = new FrameHeader(FrameType.Message, streamId, (uint)chunkSize, chunkFlags);
             WriteFrame(ring, header, chunk, cancellationToken);

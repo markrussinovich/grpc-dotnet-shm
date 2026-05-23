@@ -137,6 +137,13 @@ internal sealed class ShmConnectionListenerAdapter : IConnectionListener
                     continue;
                 }
 
+                // Linux eventfd negotiation: after the opener has signalled
+                // it mapped the segment, drop our eventfd waker if the opener
+                // did not establish one (peer using a futex-only build, or
+                // its SCM_RIGHTS handoff failed). No-op on Windows / when
+                // eventfd wake is disabled.
+                dataSegment.FinalizeDataSegWaker();
+
                 // Server reads from RingA (client→server), writes to RingB (server→client).
                 // Transfer segment ownership to ShmStream so the segment is disposed
                 // when the connection closes.  DisposeAsync uses _connectionId to

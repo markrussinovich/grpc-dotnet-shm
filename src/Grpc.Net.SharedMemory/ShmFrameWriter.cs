@@ -84,6 +84,19 @@ internal sealed class ShmFrameWriter : IDisposable
     private readonly ConcurrentQueue<FrameEntry> _queue;
     private readonly ConcurrentQueue<FrameEntry> _controlQueue; // WindowUpdate/Ping/Pong bypass Messages
     private readonly ManualResetEventSlim _readySignal;
+    // Parallel kernel handle for SAW-WriterLoop (env SHM_SAW_WRITERLOOP=1).
+    private readonly EventWaitHandle _kernelReadySignal;
+    private readonly IntPtr _kernelReadyHandle;
+
+    // Bench-only: lookup from streamId → ShmGrpcStream, used by WriterLoop to
+    // route per-chunk fair-window gating into the right stream when the
+    // strict-fair mode is enabled. Constructor-injected by ShmConnection so
+    // the field publication is happens-before the writer task starts.
+    // Null = no fair-window enforcement (production default).
+    internal readonly System.Collections.Concurrent.ConcurrentDictionary<uint, ShmGrpcStream>? StreamMap;
+    // SAW-WriterLoop state: set true when FlushBatch wrote data with
+    // signal deferred; consumed at Phase 3 wait entry.
+    private bool _pendingDeferredSignal;
     internal int _waiting; // 1 if writer thread is blocked in Wait; accessed via Volatile.Read/Write
     private volatile bool _completed;
     private readonly Task _writerTask;
@@ -104,17 +117,73 @@ internal sealed class ShmFrameWriter : IDisposable
     private volatile bool _idleInWait;
     private volatile bool _singleStreamMode;
 
-    public ShmFrameWriter(ShmRing ring, CancellationTokenSource cts)
+    // Diagnostic counters (env-gated SHM_DIAG_WRITERLOOP=1) for assessing
+    // how often the WriterLoop reaches Phase 3 kernel wait — needed to
+    // estimate the potential benefit of SAW signal+wait combining.
+    private static readonly bool s_diagWriterLoop =
+        string.Equals(Environment.GetEnvironmentVariable("SHM_DIAG_WRITERLOOP"),
+            "1", StringComparison.Ordinal);
+    private static long s_phase3Waits;
+    internal static long GetPhase3Waits() => Volatile.Read(ref s_phase3Waits);
+
+    /// <summary>
+    /// Opens an inline "wake-coalescing" batch. While this batch is open
+    /// any inline writes will fill the ring without firing an OS-level
+    /// data-signal on the peer waker. The batch MUST be paired with
+    /// <see cref="EndInlineBatch"/> which fires a single coalesced signal
+    /// if any data was written and a parker is waiting.
+    ///
+    /// This is layered on top of <see cref="ShmRing.BeginBatchWrite"/> so
+    /// it correctly nests with the WriterLoop's own batch-flush logic —
+    /// but in practice the WriterLoop is paused via
+    /// <see cref="TryPauseWriterLoop"/> for the duration of the inline
+    /// session, so the two callers never collide.
+    /// </summary>
+    internal void BeginInlineBatch() => _ring.BeginBatchWrite();
+
+    /// <summary>
+    /// Closes an inline batch opened with <see cref="BeginInlineBatch"/>.
+    /// Fires a single deferred SignalData if any waiter is parked.
+    /// </summary>
+    internal void EndInlineBatch() => _ring.EndBatchWrite();
+
+    /// <summary>
+    /// Capacity (in bytes) of the underlying TX ring buffer. Used by
+    /// callers of <see cref="BeginInlineBatch"/> to decide whether the
+    /// message they are about to write is small enough to wake-coalesce
+    /// safely. Coalescing a multi-chunk message that exceeds
+    /// <c>Capacity / 2</c> deadlocks: the chunks fill the ring before the
+    /// batch closes (so no peer wake fires), the peer cannot drain, and
+    /// the next <c>ReserveWrite</c> blocks in <c>WaitForSpace</c>.
+    /// Matches the <c>willLikelyChunk</c> threshold inside
+    /// <see cref="FlushBatch"/>.
+    /// </summary>
+    internal int RingCapacity => (int)_ring.Capacity;
+
+
+    public ShmFrameWriter(ShmRing ring, CancellationTokenSource cts,
+        System.Collections.Concurrent.ConcurrentDictionary<uint, ShmGrpcStream>? streamMap = null)
     {
         _ring = ring;
         _cts = cts;
         _ct = cts.Token;
+        StreamMap = streamMap;
         _queue = new ConcurrentQueue<FrameEntry>();
         _controlQueue = new ConcurrentQueue<FrameEntry>();
         _readySignal = new ManualResetEventSlim(false);
 
+        // Parallel kernel handle used only on the SAW-WriterLoop path
+        // (env SHM_SAW_WRITERLOOP=1). Lets WriterLoop's Phase 3 wait
+        // be combined with the deferred peer SignalData via Windows
+        // SignalObjectAndWait — 1 kernel transition instead of 2.
+        // Enqueue Set's both _readySignal AND _kernelReadySignal so the
+        // legacy MRES path remains correct when SAW is off.
+        _kernelReadySignal = new EventWaitHandle(false, EventResetMode.AutoReset);
+        _kernelReadyHandle = _kernelReadySignal.SafeWaitHandle.DangerousGetHandle();
+
         // Register drain callback so WaitForSpace can flush control frames
-        // (WindowUpdate) before blocking, preventing bidirectional deadlock.
+        // (Ping/Pong keepalive) before blocking when the ring fills, keeping
+        // keepalive responsive even under sustained back-pressure.
         _ring.WaitForSpaceDrainCallback = DrainControlFrames;
 
         _writerTask = Task.Factory.StartNew(
@@ -122,6 +191,18 @@ internal sealed class ShmFrameWriter : IDisposable
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
     }
+
+    /// <summary>
+    /// Opt-in SAW-WriterLoop optimization: when set, the writer-loop
+    /// defers <see cref="ShmRing.SignalData"/> from <c>FlushBatch</c>
+    /// to the next Phase 3 wait point, then issues both via Windows
+    /// <c>SignalObjectAndWait</c> for 1 kernel transition instead of 2.
+    /// Saves ~5-10 µs per server-side RT under no-spin operation.
+    /// No effect on Linux eventfd path (no equivalent atomic primitive).
+    /// </summary>
+    private static readonly bool s_sawWriterLoop =
+        string.Equals(Environment.GetEnvironmentVariable("SHM_SAW_WRITERLOOP"),
+            "1", StringComparison.Ordinal);
 
     /// <summary>
     /// Enables singleStreamMode: ResumeWriterLoop won't wake WriterLoop,
@@ -178,9 +259,11 @@ internal sealed class ShmFrameWriter : IDisposable
 
         // Control frames (WindowUpdate, Ping, Pong) go to a priority queue
         // so DrainControlFrames can always reach them without scanning past
-        // queued Messages. This prevents deadlock when 32+ concurrent streams
-        // fill the WriterLoop's batch with large Messages that block on
-        // WaitForSpace — WindowUpdate must still be deliverable.
+        // queued Messages. WindowUpdate is included for completeness (the
+        // enum value is still routed) even though SHM is no-WU and the
+        // production writer never enqueues it; Ping/Pong keepalive must
+        // remain responsive when the WriterLoop is busy draining large
+        // Messages.
         if (type == FrameType.WindowUpdate || type == FrameType.Ping || type == FrameType.Pong)
             _controlQueue.Enqueue(entry);
         else
@@ -192,7 +275,7 @@ internal sealed class ShmFrameWriter : IDisposable
         // accidentally consuming another thread's frame from the queue head.
         if (Volatile.Read(ref _waiting) != 0 && _disposed == 0)
         {
-            try { _readySignal.Set(); } catch (ObjectDisposedException) { }
+            try { _readySignal.Set(); _kernelReadySignal.Set(); } catch (ObjectDisposedException) { }
         }
     }
 
@@ -224,7 +307,7 @@ internal sealed class ShmFrameWriter : IDisposable
 
         if (Volatile.Read(ref _waiting) != 0 && _disposed == 0)
         {
-            try { _readySignal.Set(); } catch (ObjectDisposedException) { }
+            try { _readySignal.Set(); _kernelReadySignal.Set(); } catch (ObjectDisposedException) { }
         }
     }
 
@@ -254,7 +337,7 @@ internal sealed class ShmFrameWriter : IDisposable
 
         if (Volatile.Read(ref _waiting) != 0 && _disposed == 0)
         {
-            try { _readySignal.Set(); } catch (ObjectDisposedException) { }
+            try { _readySignal.Set(); _kernelReadySignal.Set(); } catch (ObjectDisposedException) { }
         }
 
         // Block until WriterLoop has written the data to the ring.
@@ -387,6 +470,18 @@ internal sealed class ShmFrameWriter : IDisposable
                 Volatile.Write(ref _waiting, 1);
                 _readySignal.Reset();
 
+                // SAW-WriterLoop safety: if we have a pending deferred
+                // signal and we're about to enter a path that does NOT
+                // go through the SAW combine point (inline action / pause
+                // branches), fire the signal eagerly so peer waiters
+                // aren't stranded waiting on our suppressed signal.
+                if (s_sawWriterLoop && _pendingDeferredSignal
+                    && (_inlineAction != null || _paused))
+                {
+                    _pendingDeferredSignal = false;
+                    _ring.FireDeferredSignalIfWaiters();
+                }
+
                 // Re-check inline action: handler may have set _inlineAction
                 // between Phase 2 exit and here. If so, execute it now.
                 if (_inlineAction != null)
@@ -425,7 +520,40 @@ internal sealed class ShmFrameWriter : IDisposable
                 _idleInWait = true;
                 try
                 {
-                    _readySignal.Wait(_ct);
+                    if (s_diagWriterLoop) Interlocked.Increment(ref s_phase3Waits);
+
+                    // SAW-WriterLoop path: if we have a deferred SignalData,
+                    // combine it with the wait via SignalObjectAndWait — 1
+                    // kernel transition instead of 2 (saves ~5-10 µs per RT
+                    // on Windows no-spin server side). The kernel-handle
+                    // event was Set() by every Enqueue path that touched
+                    // _readySignal, so it's race-safe with respect to wakes
+                    // arriving between Reset() above and the wait here.
+                    if (s_sawWriterLoop && _pendingDeferredSignal)
+                    {
+                        _pendingDeferredSignal = false;
+                        // _kernelReadySignal is AutoReset: if a producer
+                        // already Set() it (a wake between Phase 2 and here)
+                        // SAW returns immediately, we loop, see queue data,
+                        // and process — one harmless extra iteration. We do
+                        // NOT explicitly Reset here because Reset() is a
+                        // kernel call (~3-5 µs) that would offset most of
+                        // the SAW savings we're trying to gain.
+                        var saw = _ring.TryFireDeferredSignalAndWaitForLocal(
+                            _kernelReadyHandle, timeout: null, _ct);
+                        if (!saw)
+                        {
+                            // SAW unsupported or no peer waiter: fire the
+                            // deferred signal manually (if waiters appeared),
+                            // then fall back to the legacy MRES wait.
+                            _ring.FireDeferredSignalIfWaiters();
+                            _readySignal.Wait(_ct);
+                        }
+                    }
+                    else
+                    {
+                        _readySignal.Wait(_ct);
+                    }
                 }
                 finally
                 {
@@ -444,6 +572,15 @@ internal sealed class ShmFrameWriter : IDisposable
                 FlushBatch(batch, count);
             }
             DrainControlFrames();
+
+            // SAW-WriterLoop shutdown safety: ensure any signals
+            // deferred by the final FlushBatch are actually delivered
+            // so peer readers see the last bytes before we exit.
+            if (s_sawWriterLoop && _pendingDeferredSignal)
+            {
+                _pendingDeferredSignal = false;
+                _ring.FireDeferredSignalIfWaiters();
+            }
         }
         catch (OperationCanceledException) { }
         catch (RingClosedException) { }
@@ -462,22 +599,21 @@ internal sealed class ShmFrameWriter : IDisposable
                     ref var entry = ref batch[i];
 
                     // Skip entries cancelled by the caller (e.g. OperationCanceledException
-                    // in EnqueueZeroCopyAndWait). Writing a cancelled entry would cause
-                    // flow-control skew since the caller already restored _sendWindow.
+                    // in EnqueueZeroCopyAndWait). The caller is responsible for
+                    // releasing any pooled buffer; writing a cancelled entry
+                    // would produce duplicate/out-of-order data on the wire.
                     if (entry.CancelFlag != null && Volatile.Read(ref entry.CancelFlag.Value))
                         continue;
 
                     var payload = entry.Payload.Span;
 
                     // Before writing a large message that may block in
-                    // WaitForSpace, drain any newly queued control frames
-                    // (WindowUpdate, Ping, Pong). These are tiny (20-30 bytes)
-                    // and always fit. WindowUpdate is critical: it tells the
-                    // remote side to advance its ReadIdx, freeing ring space
-                    // that this write needs. Without this drain, 16+ concurrent
-                    // streams can deadlock: both sides' WriterLoops block on
-                    // WaitForSpace while WindowUpdates sit in the queue behind
-                    // the large message being written.
+                    // WaitForSpace, drain any newly queued priority control
+                    // frames (Ping, Pong; WindowUpdate is a no-op slot under
+                    // SHM no-WU). These are tiny (20-30 bytes) and always
+                    // fit. Keeping keepalive responsive matters when 16+
+                    // concurrent streams compete for the WriterLoop and a
+                    // large Message would otherwise stall the queue head.
                     //
                     // Also exit batch mode for ANY message that may need to
                     // chunk on the current ring (payload + 9-byte H2 header
@@ -487,11 +623,24 @@ internal sealed class ShmFrameWriter : IDisposable
                     // ReserveWrite blocks because reader is asleep waiting for
                     // a signal that won't fire until EndBatchWrite — which
                     // never runs because we're stuck in WaitForSpace.
+                    //
+                    // Strict-fair mode (SHM_FAIR_MAX_FRAME): the cap forces
+                    // chunking at 16 KiB, well below the 64 KiB
+                    // willLikelyChunk threshold. If we stayed in batch
+                    // mode, already-written chunks would not have signalled
+                    // the peer reader, stalling progress until EndBatchWrite.
+                    // Drop out of batch for ANY multi-frame Message in fair
+                    // mode.
                     var ringCap = (int)_ring.Capacity;
-                    var willLikelyChunk = entry.Type == FrameType.Message
-                        && payload.Length >= 65536
+                    var hdrSize = Wire.Http2FrameHeader.Size;
+                    var fairChunking = entry.Type == FrameType.Message
+                        && ShmConstants.FairMaxFramePayload != int.MaxValue
+                        && payload.Length > ShmConstants.FairMaxFramePayload;
+                    var willLikelyChunk = fairChunking
                         || (entry.Type == FrameType.Message
-                            && payload.Length + Wire.Http2FrameHeader.Size >= ringCap / 2);
+                            && payload.Length >= 65536)
+                        || (entry.Type == FrameType.Message
+                            && payload.Length + hdrSize >= ringCap / 2);
                     if (willLikelyChunk)
                     {
                         _ring.EndBatchWrite();
@@ -502,7 +651,15 @@ internal sealed class ShmFrameWriter : IDisposable
                     {
                         var isLast = (entry.Flags & MessageFlags.More) == 0;
                         var extraFlags = (byte)(entry.Flags & ~MessageFlags.More);
-                        FrameProtocol.WriteMessage(_ring, entry.StreamId, payload, isLast, _ct, extraFlags);
+                        ShmGrpcStream? fairStream = null;
+                        StreamMap?.TryGetValue(entry.StreamId, out fairStream);
+                        // Pass DrainControlFrames as preChunkDrain so each
+                        // chunk write flushes pending Ping/Pong control
+                        // traffic; keeps keepalive responsive during long
+                        // chunked sends. (FairAwaitWindow is a no-op under
+                        // SHM no-WU alignment — see ShmGrpcStream.)
+                        FrameProtocol.WriteMessage(_ring, entry.StreamId, payload, isLast, _ct, extraFlags, fairStream,
+                            fairStream != null ? DrainControlFrames : null);
                         // Re-enter batch mode after large messages to coalesce
                         // OS signals for the rest of the batch (previously
                         // removed due to suspected deadlock, but trace confirmed
@@ -520,7 +677,20 @@ internal sealed class ShmFrameWriter : IDisposable
             }
             finally
             {
-                _ring.EndBatchWrite();
+                if (s_sawWriterLoop)
+                {
+                    // SAW-WriterLoop: defer the SignalData so Phase 3 wait
+                    // can combine it with the wait via SignalObjectAndWait.
+                    // _pendingDeferredSignal flag is set so Phase 3 knows
+                    // to fire (or fall back to immediate signal on
+                    // shutdown / pause / continue-with-queue-nonempty).
+                    _ring.EndBatchWriteSuppressSignal();
+                    _pendingDeferredSignal = true;
+                }
+                else
+                {
+                    _ring.EndBatchWrite();
+                }
             }
         }
         finally
@@ -592,7 +762,7 @@ internal sealed class ShmFrameWriter : IDisposable
         // re-checks _inlineAction before Wait).
         if (_disposed == 0)
         {
-            try { _readySignal.Set(); } catch (ObjectDisposedException) { }
+            try { _readySignal.Set(); _kernelReadySignal.Set(); } catch (ObjectDisposedException) { }
         }
 
         // Wait for WriterLoop to pick up and execute the action.
@@ -649,7 +819,7 @@ internal sealed class ShmFrameWriter : IDisposable
         if (_singleStreamMode && _queue.IsEmpty && _controlQueue.IsEmpty)
             return;
 
-        try { _readySignal.Set(); } catch (ObjectDisposedException) { }
+        try { _readySignal.Set(); _kernelReadySignal.Set(); } catch (ObjectDisposedException) { }
     }
 
     /// <summary>
@@ -657,11 +827,15 @@ internal sealed class ShmFrameWriter : IDisposable
     /// Caller MUST have called PauseWriterLoop first.
     /// Drains ALL queued frames first (including Headers) to preserve ordering.
     /// </summary>
-    internal void WriteInline(uint streamId, ReadOnlySpan<byte> payload, byte extraFlags, CancellationToken ct)
+    internal void WriteInline(uint streamId, ReadOnlySpan<byte> payload, byte extraFlags, CancellationToken ct, ShmGrpcStream? fairStream = null)
     {
         DrainAllQueued();
         var isLast = (extraFlags & MessageFlags.More) == 0;
-        FrameProtocol.WriteMessage(_ring, streamId, payload, isLast, ct, extraFlags);
+        // Pass DrainControlFrames as preChunkDrain so each chunk write
+        // keeps Ping/Pong keepalive responsive. (FairAwaitWindow is a
+        // no-op under SHM no-WU alignment.)
+        FrameProtocol.WriteMessage(_ring, streamId, payload, isLast, ct, extraFlags, fairStream,
+            fairStream != null ? DrainControlFrames : null);
     }
 
     /// <summary>
@@ -752,7 +926,7 @@ internal sealed class ShmFrameWriter : IDisposable
     /// single-frame and multi-frame are handled uniformly.
     /// Caller MUST have called TryPauseWriterLoop first.
     /// </summary>
-    internal void WriteInlineDirectMultiFrame(uint streamId, int payloadSize, IMessage message, byte extraFlags, CancellationToken ct)
+    internal void WriteInlineDirectMultiFrame(uint streamId, int payloadSize, IMessage message, byte extraFlags, CancellationToken ct, ShmGrpcStream? fairStream = null)
     {
         DrainAllQueued();
 
@@ -774,6 +948,13 @@ internal sealed class ShmFrameWriter : IDisposable
         if (chunkSize > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
             chunkSize = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
 
+        // Strict-fair bench cap (SHM_FAIR_MAX_FRAME): force same multi-frame
+        // splitting as TCP/UDS gRPC. No-op when env var is unset.
+        if (ShmConstants.FairMaxFramePayload < singleFrameThreshold)
+            singleFrameThreshold = ShmConstants.FairMaxFramePayload;
+        if (ShmConstants.FairMaxFramePayload < chunkSize)
+            chunkSize = ShmConstants.FairMaxFramePayload;
+
         // The MESSAGE frame payload includes a 5-byte gRPC length-prefix
         // header (compression flag + big-endian uint32 length) followed by
         // the protobuf bytes. This is required for cross-language interop.
@@ -786,6 +967,12 @@ internal sealed class ShmFrameWriter : IDisposable
         // protobuf fields to ring memory.
         if (framePayloadSize <= singleFrameThreshold)
         {
+            // Flush pending Ping/Pong control frames before the message
+            // write so keepalive stays responsive during long batches.
+            // FairAwaitWindow is a no-op under SHM no-WU alignment (kept
+            // for API stability).
+            if (fairStream != null) DrainControlFrames();
+            fairStream?.FairAwaitWindow(framePayloadSize, fairStream != null ? DrainControlFrames : null);
             var totalSize = wireHdrSize + framePayloadSize;
             var reservation = _ring.ReserveWrite(totalSize, ct);
             if (reservation.Second.IsEmpty)
@@ -815,7 +1002,7 @@ internal sealed class ShmFrameWriter : IDisposable
 
         // Multi-frame or wrap-around: prepend 5-byte gRPC header, then
         // WriteTo(IBufferWriter) through RingFrameStream.
-        using var rfs = new RingFrameStream(this, streamId, framePayloadSize, chunkSize, extraFlags, ct);
+        using var rfs = new RingFrameStream(this, streamId, framePayloadSize, chunkSize, extraFlags, ct, fairStream);
         // Write gRPC header as first 5 bytes
         Span<byte> grpcHeader = stackalloc byte[GrpcHeaderSize];
         grpcHeader[0] = 0; // no compression
@@ -841,6 +1028,7 @@ internal sealed class ShmFrameWriter : IDisposable
         private readonly byte _extraFlags;
         private readonly int _wireHeaderSize;
         private readonly CancellationToken _ct;
+        private readonly ShmGrpcStream? _fairStream;
         private int _remainingPayload;     // total protobuf bytes left to write
         private int _currentFrameCapacity; // payload capacity of current frame
         private int _currentFrameWritten;  // bytes written into current frame payload
@@ -848,7 +1036,7 @@ internal sealed class ShmFrameWriter : IDisposable
         private bool _reservationActive;
 
         public RingFrameStream(ShmFrameWriter owner, uint streamId, int totalPayload,
-            int maxFramePayload, byte extraFlags, CancellationToken ct)
+            int maxFramePayload, byte extraFlags, CancellationToken ct, ShmGrpcStream? fairStream = null)
         {
             _owner = owner;
             _ring = owner._ring;
@@ -857,6 +1045,7 @@ internal sealed class ShmFrameWriter : IDisposable
             _extraFlags = extraFlags;
             _wireHeaderSize = ShmFrameWriter.WireHeaderSize;
             _ct = ct;
+            _fairStream = fairStream;
             _remainingPayload = totalPayload;
             ReserveNextFrame();
         }
@@ -864,6 +1053,11 @@ internal sealed class ShmFrameWriter : IDisposable
         private void ReserveNextFrame()
         {
             var chunkPayload = Math.Min(_maxFramePayload, _remainingPayload);
+            // Flush pending Ping/Pong control traffic before each chunk
+            // for keepalive responsiveness. FairAwaitWindow is a no-op
+            // under SHM no-WU alignment; retained for API stability.
+            if (_fairStream != null) _owner.DrainControlFrames();
+            _fairStream?.FairAwaitWindow(chunkPayload, _fairStream != null ? _owner.DrainControlFrames : null);
             var totalSize = _wireHeaderSize + chunkPayload;
             _currentReservation = _ring.ReserveWrite(totalSize, _ct);
             _currentFrameCapacity = chunkPayload;
@@ -1073,11 +1267,12 @@ internal sealed class ShmFrameWriter : IDisposable
     }
 
     /// <summary>
-    /// Drain control frames (WindowUpdate, Ping, Pong) from the priority queue.
-    /// These are routed to _controlQueue at enqueue time so they are always
-    /// reachable regardless of how many Message frames are queued in _queue.
-    /// Critical for preventing deadlock when WriterLoop's WaitForSpace needs
-    /// the remote side to advance ReadIdx via WindowUpdate.
+    /// Drain priority-queue control frames (Ping, Pong; WindowUpdate
+    /// retained as a legacy enum value but never emitted under SHM no-WU).
+    /// Control frames are routed to <c>_controlQueue</c> at enqueue time so
+    /// they are reachable regardless of how many Message frames are queued
+    /// in <c>_queue</c>. Called before message writes to keep Ping/Pong
+    /// keepalive responsive during long batches.
     /// </summary>
     private void DrainControlFrames()
     {
@@ -1119,7 +1314,13 @@ internal sealed class ShmFrameWriter : IDisposable
             {
                 var isLast = (entry.Flags & MessageFlags.More) == 0;
                 var extraFlags = (byte)(entry.Flags & ~MessageFlags.More);
-                FrameProtocol.WriteMessage(_ring, entry.StreamId, entry.Payload.Span, isLast, _ct, extraFlags);
+                ShmGrpcStream? fairStream = null;
+                StreamMap?.TryGetValue(entry.StreamId, out fairStream);
+                // preChunkDrain not threaded through DrainAllQueued: this path
+                // is only taken from WriteInline's pre-pause drain where
+                // _controlQueue is empty by construction (caller paused
+                // WriterLoop after observing both queues drained).
+                FrameProtocol.WriteMessage(_ring, entry.StreamId, entry.Payload.Span, isLast, _ct, extraFlags, fairStream);
             }
             else
             {
@@ -1141,6 +1342,7 @@ internal sealed class ShmFrameWriter : IDisposable
             // 1. Stop accepting new entries and wake the writer thread.
             _completed = true;
             _readySignal.Set();
+            _kernelReadySignal.Set();
 
             // 2. Give the writer thread a chance to flush remaining entries.
             var writerDone = false;
@@ -1164,6 +1366,7 @@ internal sealed class ShmFrameWriter : IDisposable
             {
                 _cts.Cancel();
                 _readySignal.Set(); // unblock if waiting again
+                _kernelReadySignal.Set();
                 try
                 {
                     writerDone = _writerTask.Wait(TimeSpan.FromMilliseconds(500));
@@ -1197,6 +1400,11 @@ internal sealed class ShmFrameWriter : IDisposable
             }
 
             _readySignal.Dispose();
+            // _kernelReadySignal is allocated alongside _readySignal in the
+            // ctor (used by the SAW-WriterLoop opt-in path via Win32
+            // SignalObjectAndWait); dispose it here too to avoid leaking the
+            // EventWaitHandle when the WriterLoop is torn down.
+            _kernelReadySignal.Dispose();
 
             // 5. Final drain: catch any frames enqueued between step 4 and
             //    _readySignal.Dispose(). Concurrent Enqueue calls that passed

@@ -150,37 +150,68 @@ internal sealed partial class LinuxRingSync : IRingSync
             return true; // Value already changed, no need to wait
         }
 
-        if (timeout.HasValue)
+        // Cancellation hook: if the caller's CTS fires while we are parked
+        // inside futex(FUTEX_WAIT, ...), the kernel has no view of the
+        // managed token and the thread stays parked indefinitely. Register
+        // a callback that issues FUTEX_WAKE on the same address so the
+        // parked thread wakes up, observes IsCancellationRequested via
+        // the post-syscall recheck, and unwinds cleanly.
+        //
+        // The callback also bumps the futex word so a sleep-after-cancel
+        // race (cancellation arrives between the IsCancellationRequested
+        // check above and entering the syscall) is closed by the EAGAIN
+        // path inside futex().
+        var addrPtr = (IntPtr)addr;
+        CancellationTokenRegistration? ctReg = null;
+        if (cancellationToken.CanBeCanceled)
         {
-            var ts = new Timespec
+            ctReg = cancellationToken.UnsafeRegister(static state =>
             {
-                tv_sec = (long)timeout.Value.TotalSeconds,
-                tv_nsec = (long)((timeout.Value.TotalMilliseconds % 1000) * 1_000_000)
-            };
-
-            var result = futex(addr, FUTEX_WAIT, expectedVal, &ts, null, 0);
-            if (result == -1)
-            {
-                var errno = Marshal.GetLastWin32Error();
-                // EAGAIN (11) means the value changed - this is success
-                if (errno == EAGAIN) return true;
-                // ETIMEDOUT (110) means timeout
-                if (errno == ETIMEDOUT) return false;
-                // EINTR (4) means interrupted - retry or return based on cancellation
-                if (errno == EINTR) return !cancellationToken.IsCancellationRequested;
-            }
-            return result == 0;
+                var p = (uint*)(IntPtr)state!;
+                // FUTEX_WAKE on the same address as our FUTEX_WAIT.
+                // Wake up to int.MaxValue waiters — should only be one
+                // (the registering thread), but extra wakes are harmless.
+                futex(p, FUTEX_WAKE, int.MaxValue, null, null, 0);
+            }, addrPtr);
         }
-        else
+        try
         {
-            var result = futex(addr, FUTEX_WAIT, expectedVal, null, null, 0);
-            if (result == -1)
+            if (timeout.HasValue)
             {
-                var errno = Marshal.GetLastWin32Error();
-                if (errno == EAGAIN) return true;  // EAGAIN - value changed
-                if (errno == EINTR) return !cancellationToken.IsCancellationRequested; // EINTR
+                var ts = new Timespec
+                {
+                    tv_sec = (long)timeout.Value.TotalSeconds,
+                    tv_nsec = (long)((timeout.Value.TotalMilliseconds % 1000) * 1_000_000)
+                };
+
+                var result = futex(addr, FUTEX_WAIT, expectedVal, &ts, null, 0);
+                if (result == -1)
+                {
+                    var errno = Marshal.GetLastWin32Error();
+                    // EAGAIN (11) means the value changed - this is success
+                    if (errno == EAGAIN) return true;
+                    // ETIMEDOUT (110) means timeout
+                    if (errno == ETIMEDOUT) return false;
+                    // EINTR (4) means interrupted - retry or return based on cancellation
+                    if (errno == EINTR) return !cancellationToken.IsCancellationRequested;
+                }
+                return result == 0 && !cancellationToken.IsCancellationRequested;
             }
-            return result == 0;
+            else
+            {
+                var result = futex(addr, FUTEX_WAIT, expectedVal, null, null, 0);
+                if (result == -1)
+                {
+                    var errno = Marshal.GetLastWin32Error();
+                    if (errno == EAGAIN) return true;  // EAGAIN - value changed
+                    if (errno == EINTR) return !cancellationToken.IsCancellationRequested; // EINTR
+                }
+                return result == 0 && !cancellationToken.IsCancellationRequested;
+            }
+        }
+        finally
+        {
+            ctReg?.Dispose();
         }
     }
 

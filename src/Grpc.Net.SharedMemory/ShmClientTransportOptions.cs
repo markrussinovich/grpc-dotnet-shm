@@ -143,4 +143,27 @@ public sealed class ShmClientTransportOptions
     /// Default is <c>false</c>.
     /// </summary>
     public bool SingleStreamMode { get; set; }
+
+    /// <summary>
+    /// Gets or sets the optional security handshaker. When non-null, the
+    /// client performs a process-level identity handshake on the data
+    /// segment immediately after the control-segment CONNECT/ACCEPT
+    /// completes; the resulting <see cref="ShmAuthInfo"/> is surfaced on
+    /// the returned <see cref="ShmConnection.AuthInfo"/>. Mirrors
+    /// grpc-go-shmem's <c>credentials/shm</c> <c>Options{Identity,
+    /// VerifyIdentity}</c>: the wire-level handshake frames
+    /// (HandshakeInit 0x20 / HandshakeResp 0x21 / HandshakeAck 0x22 /
+    /// HandshakeFail 0x23) and the identity-token + nonce payload
+    /// encoding are bit-identical across the two implementations.
+    /// <para>
+    /// When <c>null</c> (default) the client skips the handshake and
+    /// surfaces no <c>AuthInfo</c> — equivalent to insecure local SHM,
+    /// matching the Go default behaviour when no <c>credentials/shm</c>
+    /// is supplied. Insecure mode is interop-compatible with Go peers
+    /// that also lack a handshaker; mixed modes (one side with a
+    /// handshaker, the other without) will hang waiting for the
+    /// HandshakeInit frame the silent peer never sends.
+    /// </para>
+    /// </summary>
+    public IShmSecurityHandshaker? Handshaker { get; set; }
 }

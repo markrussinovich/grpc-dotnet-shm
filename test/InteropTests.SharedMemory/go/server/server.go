@@ -15,6 +15,7 @@ import (
 	pb "interop-shm/greetpb"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/experimental/shm"
 )
 
 var (
@@ -38,25 +39,25 @@ func main() {
 	fmt.Println("Go Greeter Server - Shared Memory")
 	fmt.Printf("Segment: %s\n", *segment)
 
-	lis, err := grpc.NewShmListener(*segment, nil)
+	lis, err := shm.NewListener(*segment, nil)
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 	defer lis.Close()
 
-s := grpc.NewServer()
-pb.RegisterGreeterServer(s, &server{})
+	s := grpc.NewServer()
+	pb.RegisterGreeterServer(s, &server{})
 
-go func() {
-sigCh := make(chan os.Signal, 1)
-signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-<-sigCh
-fmt.Println("\nShutting down...")
-s.GracefulStop()
-}()
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		fmt.Println("\nShutting down...")
+		s.GracefulStop()
+	}()
 
-fmt.Println("Server ready. Ctrl+C to stop.")
-if err := s.Serve(lis); err != nil {
-log.Fatalf("Failed to serve: %v", err)
-}
+	fmt.Println("Server ready. Ctrl+C to stop.")
+	if err := s.Serve(lis); err != nil {
+		log.Fatalf("Failed to serve: %v", err)
+	}
 }

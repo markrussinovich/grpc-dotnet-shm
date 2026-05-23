@@ -460,4 +460,66 @@ public class EndToEndTests
         Assert.That(stream2.StreamId, Is.EqualTo(1));
         Assert.That(client1.Name, Is.Not.EqualTo(client2.Name));
     }
+
+    /// <summary>
+    /// Verifies the gRFC no-WU alignment (matches grpc-go-shmem v3.4+
+    /// shmNoWU=true default): a full unary RPC in DEFAULT mode (no
+    /// SHM_FAIR_STREAM_WINDOW) MUST NOT emit any WINDOW_UPDATE wire
+    /// frames. Ring WaitForSpace is the canonical back-pressure
+    /// primitive on SHM; H2 stream-window machinery is elided.
+    ///
+    /// This test guards interop with Go peers in their default mode:
+    /// neither side emits WU, neither expects to receive WU. If a
+    /// future change accidentally re-enables WU emission here, this
+    /// test fails and signals an interop break.
+    /// </summary>
+    [Test]
+    [NonParallelizable] // Uses process-global s_wuFramesEmitted counter.
+    [CancelAfter(10000)]
+    public async Task NoWindowUpdate_EmittedInDefaultMode_GrpcGoInteropAlignment()
+    {
+        // Snapshot before
+        var before = ShmConnection.WindowUpdateFramesEmittedForTest();
+
+        // Repeat the standard E2E unary RPC (same shape as
+        // UnaryCall_SimpleRequestResponse_Works above).
+        var segmentName = $"grpc_no_wu_{Guid.NewGuid():N}";
+        using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 4096, maxStreams: 100);
+        using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
+
+        var requestData = Encoding.UTF8.GetBytes("GreeterClient");
+        var responseData = Encoding.UTF8.GetBytes("Hello, World!");
+
+        var serverTask = Task.Run(async () =>
+        {
+            var stream = await serverConnection.AcceptStreamAsync();
+            using var s = stream!;
+            byte[]? received = null;
+            await foreach (var m in s.ReceiveLpmMessagesAsync()) received = m;
+            await s.SendResponseHeadersAsync();
+            await s.SendMessageAsync(LpmHelpers.WrapLpm(responseData));
+            await s.SendTrailersAsync(StatusCode.OK, "Success");
+            return received;
+        });
+
+        using var cs = clientConnection.CreateStream();
+        await cs.SendRequestHeadersAsync("/greet.Greeter/SayHello", "localhost");
+        await cs.SendMessageAsync(LpmHelpers.WrapLpm(requestData));
+        await cs.SendHalfCloseAsync();
+        await cs.ReceiveResponseHeadersAsync();
+        byte[]? resp = null;
+        await foreach (var m in cs.ReceiveLpmMessagesAsync()) resp = m;
+        var serverReceived = await serverTask;
+
+        Assert.That(serverReceived, Is.EqualTo(requestData), "request body interop");
+        Assert.That(resp, Is.EqualTo(responseData), "response body interop");
+        Assert.That(cs.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.OK));
+
+        // The actual no-WU assertion.
+        var after = ShmConnection.WindowUpdateFramesEmittedForTest();
+        Assert.That(after, Is.EqualTo(before),
+            "gRFC SHM alignment: SHM MUST NOT emit WINDOW_UPDATE frames in any mode " +
+            "(must match grpc-go-shmem shmNoWU=true). The opt-in SHM_FAIR_STREAM_WINDOW " +
+            "env var only affects wire-format parity (chunking, coalescing), not flow control.");
+    }
 }

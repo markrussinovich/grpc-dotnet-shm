@@ -460,4 +460,125 @@ public class ShmSecurityTests
             Throws.InstanceOf<ShmHandshakeException>()
                 .With.Property("Code").EqualTo(HandshakeErrorCode.Internal));
     }
+
+    // ============================================================
+    // End-to-end integration through ShmControlListener / Handler
+    // ============================================================
+
+    [Test]
+    [CancelAfter(15000)]
+    public async Task Integration_HandshakeWired_SurfacesAuthInfoOnBothSides()
+    {
+        var baseName = $"grpc_sec_e2e_{Guid.NewGuid():N}";
+
+        using var listener = new ShmControlListener(baseName, ringCapacity: 65536, maxStreams: 100)
+        {
+            Handshaker = new ShmSecurityHandshaker("server-identity")
+        };
+
+        var serverConnTask = Task.Run(() => listener.AcceptAsync());
+
+        using var handler = new ShmControlHandler(baseName, new ShmClientTransportOptions
+        {
+            Handshaker = new ShmSecurityHandshaker("client-identity")
+        });
+        var clientConn = await handler.ConnectForTest(default);
+        var serverConn = await serverConnTask;
+
+        try
+        {
+            Assert.That(clientConn.AuthInfo, Is.Not.Null, "client AuthInfo");
+            Assert.That(clientConn.AuthInfo!.LocalIdentity, Is.EqualTo("client-identity"));
+            Assert.That(clientConn.AuthInfo.RemoteIdentity, Is.EqualTo("server-identity"));
+
+            Assert.That(serverConn.AuthInfo, Is.Not.Null, "server AuthInfo");
+            Assert.That(serverConn.AuthInfo!.LocalIdentity, Is.EqualTo("server-identity"));
+            Assert.That(serverConn.AuthInfo.RemoteIdentity, Is.EqualTo("client-identity"));
+        }
+        finally
+        {
+            clientConn.Dispose();
+            serverConn.Dispose();
+        }
+    }
+
+    [Test]
+    [CancelAfter(15000)]
+    public async Task Integration_NoHandshaker_AuthInfoIsNull_BackwardCompat()
+    {
+        var baseName = $"grpc_sec_e2e_none_{Guid.NewGuid():N}";
+
+        using var listener = new ShmControlListener(baseName, ringCapacity: 65536, maxStreams: 100);
+        var serverConnTask = Task.Run(() => listener.AcceptAsync());
+
+        using var handler = new ShmControlHandler(baseName, new ShmClientTransportOptions());
+        var clientConn = await handler.ConnectForTest(default);
+        var serverConn = await serverConnTask;
+
+        try
+        {
+            Assert.That(clientConn.AuthInfo, Is.Null);
+            Assert.That(serverConn.AuthInfo, Is.Null);
+        }
+        finally
+        {
+            clientConn.Dispose();
+            serverConn.Dispose();
+        }
+    }
+
+    [Test]
+    [CancelAfter(15000)]
+    public async Task Integration_ServerRejectsClientIdentity_ClientThrows()
+    {
+        var baseName = $"grpc_sec_reject_{Guid.NewGuid():N}";
+
+        using var listenerCts = new CancellationTokenSource();
+        using var listener = new ShmControlListener(baseName, ringCapacity: 65536, maxStreams: 100)
+        {
+            Handshaker = new ShmSecurityHandshaker("server")
+            {
+                VerifyIdentity = remote =>
+                {
+                    if (remote != "trusted-client")
+                        throw new InvalidOperationException($"untrusted: {remote}");
+                    return Task.CompletedTask;
+                }
+            }
+        };
+        // Server loops in AcceptAsync after handshake failure (it continues
+        // accepting). Bound it by a separate cancellation token so the
+        // test does not hang once the client has thrown.
+        var serverTask = Task.Run(async () =>
+        {
+            try { await listener.AcceptAsync(listenerCts.Token); }
+            catch (OperationCanceledException) { /* expected on cleanup */ }
+            catch { /* handshake failure surfaces; ignore */ }
+        });
+
+        using var handler = new ShmControlHandler(baseName, new ShmClientTransportOptions
+        {
+            Handshaker = new ShmSecurityHandshaker("not-trusted")
+        });
+
+        Assert.That(async () => await handler.ConnectForTest(default),
+            Throws.InstanceOf<ShmHandshakeException>()
+                .With.Property("Code").EqualTo(HandshakeErrorCode.IdentityInvalid));
+
+        listenerCts.Cancel();
+        await serverTask;
+    }
+
+    [Test]
+    [CancelAfter(15000)]
+    public void Listener_DuplicateStart_OnSameSegment_Throws()
+    {
+        var baseName = $"grpc_dup_listener_{Guid.NewGuid():N}";
+        using var first = new ShmControlListener(baseName, ringCapacity: 65536, maxStreams: 100);
+
+        Assert.That(
+            () => new ShmControlListener(baseName, ringCapacity: 65536, maxStreams: 100),
+            Throws.InstanceOf<InvalidOperationException>()
+                .With.Message.Contain("already listening"));
+    }
 }

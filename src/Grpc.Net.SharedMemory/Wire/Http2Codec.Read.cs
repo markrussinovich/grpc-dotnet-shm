@@ -312,6 +312,10 @@ internal static partial class Http2Codec
         ShmRing ring, ulong baseCommitReadIdx, uint streamId, byte h2Flags, int payloadLen,
         bool zeroCopy, Http2DecoderState state, CancellationToken ct)
     {
+        // SHM is no-WU in all modes (gRFC SHM alignment with grpc-go-shmem
+        // shmNoWU). DATA frame consumption does not trigger WINDOW_UPDATE
+        // emission; the ring's WaitForSpace backpressure is the sole flow
+        // control.
         var endStream = (h2Flags & Http2Flags.EndStream) != 0;
         var padded = (h2Flags & Http2Flags.Padded) != 0;
 

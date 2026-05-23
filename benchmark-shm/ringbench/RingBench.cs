@@ -1,4 +1,4 @@
-// gRPC-level benchmark: SHM vs TCP transport, matching grpc-go-shmem/benchmark/shmemtcp/main.go.
+// gRPC-level benchmark: SHM vs TCP vs UDS transport, matching grpc-go-shmem/benchmark/shmemtcp/main.go.
 //
 // Runs actual gRPC UnaryCall and StreamingCall (bidi ping-pong) through the full
 // gRPC stack — protobuf serialization, framing, transport — exactly as an
@@ -8,7 +8,9 @@
 //   measureUnary()     → MeasureUnary()      — client.UnaryCall() in a timed loop
 //   measureStreaming()  → MeasureStreaming()   — client.StreamingCall() send+recv ping-pong
 //   startBenchEnv(tcp) → StartTcpEnv()        — Kestrel HTTP/2 h2c server
-//   startBenchEnv(shm) → StartShmEnv()        — ShmGrpcServer
+//   startBenchEnv(uds) → StartUdsEnv()        — Kestrel HTTP/2 over AF_UNIX (Linux + Win10+)
+//   startBenchEnv(shm) → StartShmEnv()        — ShmGrpcServer (Custom16 framing)
+//   startBenchEnv(shm-h2) → StartShmH2Env()   — ShmGrpcServer (HTTP/2 framing)
 
 using System.Diagnostics;
 using System.Globalization;
@@ -42,9 +44,13 @@ bool serverMode = false;
 string? serverTransport = null;
 int serverPort = 0;
 string? serverSegment = null;
+string? serverUdsPath = null;
 int parentPid = 0;
 string? onlyTransport = null;
 string? onlySizes = null;
+bool runConcurrent = false;
+int[] concurrentLevels = new[] { 10, 100, 1000 };
+int[] concurrentSizes = new[] { 64, 4096, 65536, 262144, 1048576 };
 // Static field so static local functions can access it.
 // Controlled by --no-single-stream CLI flag.
 ShmBenchConfig.SingleStream = true;
@@ -63,6 +69,8 @@ for (int i = 0; i < args.Length; i++)
         serverPort = int.Parse(args[++i], CultureInfo.InvariantCulture);
     if (args[i] == "--segment")
         serverSegment = args[++i];
+    if (args[i] == "--uds-path")
+        serverUdsPath = args[++i];
     if (args[i] == "--parent-pid")
         parentPid = int.Parse(args[++i], CultureInfo.InvariantCulture);
     if (args[i] == "--only")
@@ -71,16 +79,55 @@ for (int i = 0; i < args.Length; i++)
         onlySizes = args[++i];
     if (args[i] == "--no-single-stream")
         ShmBenchConfig.SingleStream = false;
+    if (args[i] == "--fair")
+    {
+        ShmBenchConfig.FairMode = true;
+        // Library-side flag honored by ShmControlResponseContent
+        // (client) so SetPooledDeserializer becomes a no-op.
+        Environment.SetEnvironmentVariable("SHM_DISABLE_POOLED_DESER", "1");
+        // Cap per-frame payload to match HTTP/2 spec default
+        // SETTINGS_MAX_FRAME_SIZE (= grpc-go's `fair-default` profile).
+        // Forces large messages (>16 KiB) to be split into the same
+        // multi-DATA-frame sequences as TCP/UDS gRPC.
+        Environment.SetEnvironmentVariable("SHM_FAIR_MAX_FRAME", "16384");
+        // Set SHM_FAIR_STREAM_WINDOW to HTTP/2 spec default
+        // SETTINGS_INITIAL_WINDOW_SIZE = 65535 as a wire-format parity
+        // signal: disables HEADERS+DATA+Trailers coalescing on the
+        // server and bypasses the single-stream send fast-path so each
+        // H2 frame is dispatched separately, mirroring TCP/UDS.
+        // Does NOT enable per-stream flow control — SHM is no-WU in
+        // all modes (gRFC SHM alignment with grpc-go-shmem shmNoWU);
+        // the ring's WaitForSpace remains the sole back-pressure
+        // primitive. The numeric value 65535 is not used as a window
+        // cap; only the presence of the env var matters. Lets the
+        // reviewer verify SHM's perf wins are not from a coarser
+        // wire format.
+        //
+        // Interop: --fair is compatible with peers in any mode (both
+        // .NET and grpc-go-shmem are no-WU in every mode).
+        //
+        // Note: enabling these env vars BEFORE the library reads its
+        // static config means SHM_CHANNEL_INLINE auto-downgrades to
+        // false in fair mode (multi-frame messages + sync continuations
+        // + LazyChainRos sync-pull = reader-thread self-deadlock).
+        Environment.SetEnvironmentVariable("SHM_FAIR_STREAM_WINDOW", "65535");
+    }
+    if (args[i] == "--concurrent")
+        runConcurrent = true;
+    if (args[i] == "--streams")
+        concurrentLevels = args[++i].Split(',').Select(s => int.Parse(s.Trim(), CultureInfo.InvariantCulture)).ToArray();
+    if (args[i] == "--concurrent-sizes")
+        concurrentSizes = args[++i].Split(',').Select(s => int.Parse(s.Trim(), CultureInfo.InvariantCulture)).ToArray();
 }
 
 if (serverMode)
 {
     if (string.IsNullOrWhiteSpace(serverTransport))
     {
-        throw new InvalidOperationException("Server mode requires --transport tcp|shm");
+        throw new InvalidOperationException("Server mode requires --transport tcp|shm|uds");
     }
 
-    await RunServerModeAsync(serverTransport!, serverPort, serverSegment, parentPid);
+    await RunServerModeAsync(serverTransport!, serverPort, serverSegment, serverUdsPath, parentPid);
     return;
 }
 
@@ -111,14 +158,16 @@ string runtime = RuntimeInformation.FrameworkDescription;
 Console.WriteLine($"CPU: {cpu}");
 Console.WriteLine($"Runtime: {runtime}");
 Console.WriteLine($"SHM SingleStreamMode: {ShmBenchConfig.SingleStream}");
+Console.WriteLine($"SHM FairMode: {ShmBenchConfig.FairMode}");
 Console.WriteLine();
 
 var unaryResults = new List<BenchResult>();
 var streamingResults = new List<BenchResult>();
+var concurrentResults = new List<ConcurrentBenchResult>();
 
 // Run each transport independently to avoid idle-spin stack buildup in SHM frame reader
 #pragma warning disable CS8321
-foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv })
+foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartUdsEnv, StartShmEnv })
 {
     // Force GC between transport tests to avoid cross-test interference
     // (TCP 256MB tests leave hundreds of MB on LOH that can cause GC pauses
@@ -142,34 +191,222 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv }
     Console.WriteLine();
 
     Console.WriteLine("  Unary ping-pong:");
-    Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
-    Console.WriteLine("  " + new string('-', 76));
+    Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18} {"CPU µs/op",-12} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
+    Console.WriteLine("  " + new string('-', 90));
 
     foreach (var size in sizes)
     {
         int iters = IterationsForSize(size);
         Console.WriteLine($"  -> running {FormatSize(size),-8} ({iters} iters)...");
         int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
+        var cpuBefore = CaptureCpu(env.ServerProcess);
         var (avgUs, throughputMBps) = await MeasureUnary(env.Client, size, iters, measurementTimeout);
+        var cpuAfter = CaptureCpu(env.ServerProcess);
         int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
-        unaryResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
-        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+        double cpuUsPerOp = (cpuAfter - cpuBefore) / Math.Max(iters, 1);
+        unaryResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps, cpuUsPerOp));
+        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {cpuUsPerOp,-12:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
     }
     Console.WriteLine();
 
     Console.WriteLine("  Streaming ping-pong:");
-    Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
-    Console.WriteLine("  " + new string('-', 76));
+    Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18} {"CPU µs/op",-12} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
+    Console.WriteLine("  " + new string('-', 90));
 
     foreach (var size in sizes)
     {
         int iters = IterationsForSize(size);
         Console.WriteLine($"  -> running {FormatSize(size),-8} ({iters} iters)...");
         int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
+        var cpuBefore = CaptureCpu(env.ServerProcess);
         var (avgUs, throughputMBps) = await MeasureStreaming(env.Client, size, iters, measurementTimeout);
+        var cpuAfter = CaptureCpu(env.ServerProcess);
         int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
-        streamingResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
-        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+        double cpuUsPerOp = (cpuAfter - cpuBefore) / Math.Max(iters, 1);
+        streamingResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps, cpuUsPerOp));
+        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {cpuUsPerOp,-12:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+    }
+    Console.WriteLine();
+
+    if (runConcurrent)
+    {
+        // Concurrent-streams scaling — port of Go-side
+        // BenchmarkGRPC{Tcp,Shm}Concurrent in
+        // benchmark/shmemtcp/bench_concurrent_test.go. Opens N
+        // long-lived streaming RPCs against the SAME connection /
+        // segment and runs ping-pong rounds in parallel. Reports
+        // per-stream latency under contention plus aggregate
+        // throughput across all streams.
+        Console.WriteLine("  Concurrent streams (ping-pong, same connection):");
+        Console.WriteLine($"  {"Streams",-8} {"Payload",-10} {"Rounds",-8} {"Avg µs/RT",-14} {"AggMB/s",-12} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
+        Console.WriteLine("  " + new string('-', 76));
+        foreach (var streams in concurrentLevels)
+        {
+            foreach (var size in concurrentSizes)
+            {
+                int rounds = ConcurrentRoundsForLoad(streams, size);
+                Console.WriteLine($"  -> running streams={streams} size={FormatSize(size)} rounds={rounds}...");
+                int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
+                var (avgUs, aggMBps) = await MeasureConcurrentStreams(env.Client, streams, size, rounds, measurementTimeout);
+                int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
+                concurrentResults.Add(new ConcurrentBenchResult(env.Transport, streams, size, rounds, avgUs, aggMBps));
+                Console.WriteLine($"  {streams,-8} {FormatSize(size),-10} {rounds,-8} {avgUs,-14:F3} {aggMBps,-12:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+            }
+        }
+        Console.WriteLine();
+    }
+
+    // PR #19 removed FrameProtocol.GetCodecCounters along with Custom16
+    // (HTTP/2 is now the only wire format) so the per-codec breakdown
+    // print no longer applies. Diag counters that DO survive follow.
+    if (OperatingSystem.IsWindows() &&
+        string.Equals(Environment.GetEnvironmentVariable("SHM_WIN_DIAG"), "1", StringComparison.Ordinal))
+    {
+        try
+        {
+            var asm = typeof(Grpc.Net.SharedMemory.ShmConstants).Assembly;
+            var t = asm.GetType("Grpc.Net.SharedMemory.Synchronization.WindowsRingSync");
+            var m = t?.GetMethod("GetWinDiag", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (m != null)
+            {
+                var tup = m.Invoke(null, null);
+                if (tup != null)
+                {
+                    var ty = tup.GetType();
+                    long sd = (long)ty.GetField("Item1")!.GetValue(tup)!;
+                    long ss = (long)ty.GetField("Item2")!.GetValue(tup)!;
+                    long sc = (long)ty.GetField("Item3")!.GetValue(tup)!;
+                    long wd = (long)ty.GetField("Item4")!.GetValue(tup)!;
+                    long ws = (long)ty.GetField("Item5")!.GetValue(tup)!;
+                    long wc = (long)ty.GetField("Item6")!.GetValue(tup)!;
+                    Console.WriteLine($"  client win-diag: sigData={sd} sigSpace={ss} sigContig={sc} waitData={wd} waitSpace={ws} waitContig={wc}");
+                }
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"  win-diag failed: {ex.Message}"); }
+    }
+
+    // WriterLoop diag (env SHM_DIAG_WRITERLOOP=1): how often does the
+    // writer thread enter Phase 3 kernel wait? Quantifies the potential
+    // upside of SignalObjectAndWait combining.
+    if (string.Equals(Environment.GetEnvironmentVariable("SHM_DIAG_WRITERLOOP"), "1", StringComparison.Ordinal))
+    {
+        try
+        {
+            var asm = typeof(Grpc.Net.SharedMemory.ShmConstants).Assembly;
+            var t = asm.GetType("Grpc.Net.SharedMemory.ShmFrameWriter");
+            var m = t?.GetMethod("GetPhase3Waits", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            if (m != null)
+            {
+                long count = (long)(m.Invoke(null, null) ?? 0L);
+                Console.WriteLine($"  client writerloop-diag: phase3-waits={count}");
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"  writerloop-diag failed: {ex.Message}"); }
+    }
+    if (string.Equals(Environment.GetEnvironmentVariable("SHM_DIAG_HOPTIMING"), "1", StringComparison.Ordinal))
+    {
+        try
+        {
+            var asm = typeof(Grpc.Net.SharedMemory.ShmConstants).Assembly;
+            var t = asm.GetType("Grpc.Net.SharedMemory.ShmGrpcStream");
+            var m = t?.GetMethod("GetHopDiag", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            if (m != null)
+            {
+                var tuple = m.Invoke(null, null);
+                if (tuple != null)
+                {
+                    var tp = tuple.GetType();
+                    long slowTicks = (long)(tp.GetField("Item1")?.GetValue(tuple) ?? 0L);
+                    long slowCnt = (long)(tp.GetField("Item2")?.GetValue(tuple) ?? 0L);
+                    long fastTicks = (long)(tp.GetField("Item3")?.GetValue(tuple) ?? 0L);
+                    long fastCnt = (long)(tp.GetField("Item4")?.GetValue(tuple) ?? 0L);
+                    double freq = System.Diagnostics.Stopwatch.Frequency;
+                    double slowMeanUs = slowCnt > 0 ? (slowTicks * 1_000_000.0 / freq) / slowCnt : 0;
+                    double fastMeanUs = fastCnt > 0 ? (fastTicks * 1_000_000.0 / freq) / fastCnt : 0;
+                    Console.WriteLine($"  client hop-diag SLOW (user awaited): count={slowCnt} mean={slowMeanUs:F2}µs");
+                    Console.WriteLine($"  client hop-diag FAST (reader ahead): count={fastCnt} mean={fastMeanUs:F2}µs");
+                }
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"  hop-diag failed: {ex.Message}"); }
+    }
+    if (OperatingSystem.IsLinux() &&
+        string.Equals(Environment.GetEnvironmentVariable("SHM_EVENTFD_DIAG"), "1", StringComparison.Ordinal))
+    {
+        // LinuxDataSegWaker is internal; reach it by reflection so the
+        // bench doesn't have to depend on InternalsVisibleTo.
+        try
+        {
+            var asm = typeof(Grpc.Net.SharedMemory.ShmConstants).Assembly;
+            var t = asm.GetType("Grpc.Net.SharedMemory.Synchronization.LinuxDataSegWaker");
+            var m = t?.GetMethod("GetDiag", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (m != null)
+            {
+                var tup = m.Invoke(null, null);
+                if (tup != null)
+                {
+                    var ty = tup.GetType();
+                    long wakeCalls = (long)ty.GetField("Item1")!.GetValue(tup)!;
+                    long wakeSyscalls = (long)ty.GetField("Item2")!.GetValue(tup)!;
+                    long waitCalls = (long)ty.GetField("Item3")!.GetValue(tup)!;
+                    long waitZero = (long)ty.GetField("Item4")!.GetValue(tup)!;
+                    long readUs = (long)ty.GetField("Item5")!.GetValue(tup)!;
+                    Console.WriteLine($"  client eventfd-diag: wake-calls={wakeCalls} wake-syscalls={wakeSyscalls} wait-calls={waitCalls} wait-zero={waitZero} read-counter-us-total={readUs}");
+                    if (waitCalls > 0)
+                    {
+                        Console.WriteLine($"  client eventfd avg read-syscall us = {(double)readUs / waitCalls:F2}");
+                    }
+
+                    // Per-signal-type breakdown (SignalData vs Space vs Contig).
+                    var sigT = asm.GetType("Grpc.Net.SharedMemory.Synchronization.LinuxEventfdRingSync");
+                    var sigM = sigT?.GetMethod("GetSignalDiag", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                    if (sigM != null)
+                    {
+                        var stup = sigM.Invoke(null, null);
+                        if (stup != null)
+                        {
+                            var sty = stup.GetType();
+                            long sd = (long)sty.GetField("Item1")!.GetValue(stup)!;
+                            long ss = (long)sty.GetField("Item2")!.GetValue(stup)!;
+                            long sc = (long)sty.GetField("Item3")!.GetValue(stup)!;
+                            Console.WriteLine($"  client signal-breakdown: data={sd} space={ss} contig={sc}");
+                        }
+                    }
+
+                    // Wake-coalescing diag (unary Headers→HalfClose batch).
+                    var coT = asm.GetType("Grpc.Net.SharedMemory.ShmGrpcStream");
+                    var coM = coT?.GetMethod("GetCoalesceDiag", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                    if (coM != null)
+                    {
+                        var ctup = coM.Invoke(null, null);
+                        if (ctup != null)
+                        {
+                            var cty = ctup.GetType();
+                            long opened = (long)cty.GetField("Item1")!.GetValue(ctup)!;
+                            long closed = (long)cty.GetField("Item2")!.GetValue(ctup)!;
+                            Console.WriteLine($"  client coalesce-diag: opened={opened} closed={closed}");
+                        }
+                    }
+
+                    // Request-kind diag (unary vs streaming detected by handler).
+                    var rkT = asm.GetType("Grpc.Net.SharedMemory.ShmControlHandler");
+                    var rkM = rkT?.GetMethod("GetRequestKindDiag", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                    if (rkM != null)
+                    {
+                        var rktup = rkM.Invoke(null, null);
+                        if (rktup != null)
+                        {
+                            var rkty = rktup.GetType();
+                            long u = (long)rkty.GetField("Item1")!.GetValue(rktup)!;
+                            long s = (long)rkty.GetField("Item2")!.GetValue(rktup)!;
+                            Console.WriteLine($"  client request-kind: unary={u} streaming={s}");
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"  diag failed: {ex.Message}"); }
     }
     Console.WriteLine();
 }
@@ -187,7 +424,8 @@ var results = new
         size_bytes = r.SizeBytes,
         iterations = r.Iterations,
         avg_latency_us = Math.Round(r.AvgLatencyUs, 3),
-        throughput_mb_per_s = Math.Round(r.ThroughputMBps, 3)
+        throughput_mb_per_s = Math.Round(r.ThroughputMBps, 3),
+        cpu_us_per_op = Math.Round(r.CpuUsPerOp, 3)
     }),
     streaming = streamingResults.Select(r => new
     {
@@ -195,7 +433,17 @@ var results = new
         size_bytes = r.SizeBytes,
         iterations = r.Iterations,
         avg_latency_us = Math.Round(r.AvgLatencyUs, 3),
-        throughput_mb_per_s = Math.Round(r.ThroughputMBps, 3)
+        throughput_mb_per_s = Math.Round(r.ThroughputMBps, 3),
+        cpu_us_per_op = Math.Round(r.CpuUsPerOp, 3)
+    }),
+    concurrent = concurrentResults.Select(r => new
+    {
+        transport = r.Transport,
+        streams = r.Streams,
+        size_bytes = r.SizeBytes,
+        rounds_per_stream = r.RoundsPerStream,
+        avg_latency_us_per_round = Math.Round(r.AvgLatencyUsPerRound, 3),
+        aggregate_throughput_mb_per_s = Math.Round(r.AggregateThroughputMBps, 3)
     }),
     notes = "BenchmarkService protobuf payloads; client and server in separate processes"
 };
@@ -205,7 +453,7 @@ File.WriteAllText(jsonPath, JsonSerializer.Serialize(results, new JsonSerializer
 Console.WriteLine($"Results written to: {jsonPath}");
 
 var csvPath = Path.Combine(outDir, "results.csv");
-WriteCsv(csvPath, unaryResults, streamingResults);
+WriteCsv(csvPath, unaryResults, streamingResults, concurrentResults);
 Console.WriteLine($"CSV written to: {csvPath}");
 
 // Generate SVG plots (matching Go's output)
@@ -262,13 +510,74 @@ async Task<BenchEnv> StartTcpEnv()
         {
             channel.Dispose();
             await StopServerProcessAsync(serverProcess).ConfigureAwait(false);
-        });
+        }, serverProcess);
     }
     catch
     {
         await StopServerProcessAsync(serverProcess).ConfigureAwait(false);
         throw;
     }
+}
+
+// Unix-domain socket transport — Kestrel HTTP/2 over AF_UNIX. Available on
+// Linux and on Windows 10+ (Windows added AF_UNIX support in 2018). Used as
+// the apples-to-apples baseline for the SHM transport: same gRPC stack +
+// protobuf + framing, just a different kernel-side transport.
+async Task<BenchEnv> StartUdsEnv()
+{
+    string sockPath = GetUdsPath();
+    try { if (File.Exists(sockPath)) File.Delete(sockPath); } catch { }
+
+    var serverProcess = StartServerProcess("uds", udsPath: sockPath);
+
+    try
+    {
+        // Wait briefly for Kestrel to bind the socket before we dial.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+        while (!File.Exists(sockPath) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(20).ConfigureAwait(false);
+        }
+
+        var handler = new System.Net.Http.SocketsHttpHandler
+        {
+            ConnectCallback = async (ctx, ct) =>
+            {
+                var sock = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                await sock.ConnectAsync(new UnixDomainSocketEndPoint(sockPath), ct).ConfigureAwait(false);
+                return new NetworkStream(sock, ownsSocket: true);
+            },
+        };
+        var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
+        {
+            HttpHandler = handler,
+            DisposeHttpClient = true,
+            MaxReceiveMessageSize = 512 * 1024 * 1024,
+            MaxSendMessageSize = 512 * 1024 * 1024,
+        });
+        var client = new BenchmarkService.BenchmarkServiceClient(channel);
+
+        await WaitForServerReadyAsync(client, TimeSpan.FromSeconds(20));
+
+        return new BenchEnv("uds", client, channel, async () =>
+        {
+            channel.Dispose();
+            await StopServerProcessAsync(serverProcess).ConfigureAwait(false);
+            try { if (File.Exists(sockPath)) File.Delete(sockPath); } catch { }
+        }, serverProcess);
+    }
+    catch
+    {
+        await StopServerProcessAsync(serverProcess).ConfigureAwait(false);
+        try { if (File.Exists(sockPath)) File.Delete(sockPath); } catch { }
+        throw;
+    }
+}
+
+static string GetUdsPath()
+{
+    var dir = OperatingSystem.IsWindows() ? Path.GetTempPath() : "/tmp";
+    return Path.Combine(dir, $"ringbench_{Environment.ProcessId}_{Guid.NewGuid():N}.sock");
 }
 
 async Task<BenchEnv> StartShmEnv()
@@ -304,7 +613,7 @@ async Task<BenchEnv> StartShmEnv()
             await StopServerProcessAsync(serverProcess).ConfigureAwait(false);
             Segment.TryRemoveSegment(segmentName);
             Segment.TryRemoveSegment(segmentName + "_ctl");
-        });
+        }, serverProcess);
     }
     catch
     {
@@ -322,7 +631,7 @@ static int GetAvailablePort()
     return ((IPEndPoint)listener.LocalEndpoint).Port;
 }
 
-static Process StartServerProcess(string transport, int? port = null, string? segmentName = null)
+static Process StartServerProcess(string transport, int? port = null, string? segmentName = null, string? udsPath = null)
 {
     int currentPid = Environment.ProcessId;
     var assemblyPath = typeof(BenchmarkServiceImpl).Assembly.Location;
@@ -348,9 +657,20 @@ static Process StartServerProcess(string transport, int? port = null, string? se
         argParts.Add(segmentName!);
     }
 
+    if (!string.IsNullOrWhiteSpace(udsPath))
+    {
+        argParts.Add("--uds-path");
+        argParts.Add(udsPath!);
+    }
+
     if (!ShmBenchConfig.SingleStream)
     {
         argParts.Add("--no-single-stream");
+    }
+
+    if (ShmBenchConfig.FairMode)
+    {
+        argParts.Add("--fair");
     }
 
     var psi = new ProcessStartInfo
@@ -445,7 +765,7 @@ static async Task WaitForServerReadyAsync(BenchmarkService.BenchmarkServiceClien
     throw new TimeoutException($"Server was not ready within {timeout.TotalSeconds:F0}s.", lastError);
 }
 
-static async Task RunServerModeAsync(string transport, int port, string? segmentName, int parentPid)
+static async Task RunServerModeAsync(string transport, int port, string? segmentName, string? udsPath, int parentPid)
 {
     using var cts = new CancellationTokenSource();
     Console.CancelKeyPress += (_, e) =>
@@ -507,6 +827,11 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
             k.Limits.MaxRequestBodySize = 512L * 1024 * 1024;
             k.Limits.Http2.InitialConnectionWindowSize = 128 * 1024 * 1024;
             k.Limits.Http2.InitialStreamWindowSize = 128 * 1024 * 1024;
+            // Raise the per-connection stream cap so the concurrent
+            // matrix (up to 1000 simultaneous streams) fits in one
+            // HTTP/2 connection. Kestrel's default 100 would queue the
+            // 101st stream and deadlock the warm-up loop.
+            k.Limits.Http2.MaxStreamsPerConnection = 10_000;
         });
 
         var app = builder.Build();
@@ -528,6 +853,55 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
         return;
     }
 
+    if (transport.Equals("uds", StringComparison.OrdinalIgnoreCase))
+    {
+        if (string.IsNullOrWhiteSpace(udsPath))
+        {
+            throw new InvalidOperationException("UDS server mode requires --uds-path");
+        }
+
+        // Best-effort cleanup of stale socket (created by an earlier crashed
+        // run). Kestrel ListenUnixSocket fails if the path already exists.
+        try { if (File.Exists(udsPath)) File.Delete(udsPath); } catch { }
+
+        var builder = WebApplication.CreateBuilder(Array.Empty<string>());
+        builder.Logging.ClearProviders();
+        builder.Services.AddGrpc(o =>
+        {
+            o.MaxReceiveMessageSize = 512 * 1024 * 1024;
+            o.MaxSendMessageSize = 512 * 1024 * 1024;
+        });
+        builder.WebHost.ConfigureKestrel(k =>
+        {
+            k.ListenUnixSocket(udsPath!, lo => lo.Protocols = HttpProtocols.Http2);
+            k.Limits.MaxRequestBodySize = 512L * 1024 * 1024;
+            k.Limits.Http2.InitialConnectionWindowSize = 128 * 1024 * 1024;
+            k.Limits.Http2.InitialStreamWindowSize = 128 * 1024 * 1024;
+            // See TCP server above — 1000-stream concurrent matrix
+            // requires a high per-connection stream cap.
+            k.Limits.Http2.MaxStreamsPerConnection = 10_000;
+        });
+
+        var app = builder.Build();
+        app.MapGrpcService<BenchmarkServiceImpl>();
+
+        await app.StartAsync(cts.Token).ConfigureAwait(false);
+        Console.WriteLine($"[SERVER] UDS ready on {udsPath}");
+
+        try
+        {
+            await app.WaitForShutdownAsync(cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        await app.StopAsync().ConfigureAwait(false);
+        await app.DisposeAsync().ConfigureAwait(false);
+        try { if (File.Exists(udsPath)) File.Delete(udsPath); } catch { }
+        return;
+    }
+
     if (!transport.Equals("shm", StringComparison.OrdinalIgnoreCase))
     {
         throw new InvalidOperationException($"Unknown transport '{transport}'");
@@ -541,7 +915,7 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
     Segment.TryRemoveSegment(segmentName);
     Segment.TryRemoveSegment(segmentName + "_ctl");
 
-    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, singleStreamMode: ShmBenchConfig.SingleStream, pooledDeserialization: true,
+    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, singleStreamMode: ShmBenchConfig.SingleStream, pooledDeserialization: !ShmBenchConfig.FairMode,
         maxReceiveMessageSize: 0); // unlimited for benchmark
 
     server.MapUnary<SimpleRequest, SimpleResponse>(
@@ -574,6 +948,28 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
         await server.DisposeAsync().ConfigureAwait(false);
         Segment.TryRemoveSegment(segmentName);
         Segment.TryRemoveSegment(segmentName + "_ctl");
+
+        // Server-side WriterLoop diag: lets us see how often the server's
+        // WriterLoop hits Phase 3 kernel wait. This quantifies the upside
+        // of SignalObjectAndWait combining on the server (the client is
+        // already on the inline-writer fast path so its WriterLoop barely
+        // runs in SingleStreamMode bench).
+        if (string.Equals(Environment.GetEnvironmentVariable("SHM_DIAG_WRITERLOOP"), "1", StringComparison.Ordinal))
+        {
+            try
+            {
+                var asm = typeof(Grpc.Net.SharedMemory.ShmConstants).Assembly;
+                var t = asm.GetType("Grpc.Net.SharedMemory.ShmFrameWriter");
+                var m = t?.GetMethod("GetPhase3Waits",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                if (m != null)
+                {
+                    long count = (long)(m.Invoke(null, null) ?? 0L);
+                    Console.Error.WriteLine($"[SERVER-DIAG] writerloop phase3-waits={count}");
+                }
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[SERVER-DIAG] writerloop-diag failed: {ex.Message}"); }
+        }
     }
 }
 
@@ -659,6 +1055,109 @@ static async Task<(double avgUs, double throughputMBps)> MeasureStreaming(
     return (avgUs, throughputMBps);
 }
 
+// Concurrent-streams scaling — port of Go's benchConcurrentStreams in
+// benchmark/shmemtcp/bench_concurrent_test.go. Opens <paramref
+// name="numStreams"/> long-lived bidi streams against the SAME
+// connection (single SHM segment / single TCP / UDS socket), warms
+// each, then runs <paramref name="roundsPerStream"/> ping-pong rounds
+// in parallel via one <see cref="Task"/> per stream.
+//
+// Returns (avg µs per round per stream, aggregate MB/s across all
+// streams). Per-stream throughput = aggregate / numStreams.
+//
+// Notes:
+//   - Wall-clock per round is divided by roundsPerStream (NOT by
+//     roundsPerStream*numStreams) because the streams run in parallel.
+//     A perfectly-scaling transport reports the same per-round latency
+//     as the single-stream benchmark at the same payload size.
+//   - The aggregate-MB/s metric tells you whether the transport
+//     pipelines requests or serializes them: a transport that can
+//     overlap N streams reports ~N x single-stream throughput.
+static async Task<(double avgUs, double aggMBps)> MeasureConcurrentStreams(
+    BenchmarkService.BenchmarkServiceClient client,
+    int numStreams,
+    int payloadSize,
+    int roundsPerStream,
+    TimeSpan timeout)
+{
+    ArgumentOutOfRangeException.ThrowIfNegativeOrZero(numStreams);
+    ArgumentOutOfRangeException.ThrowIfNegativeOrZero(roundsPerStream);
+
+    var payload = MakePayload(payloadSize);
+    var req = new SimpleRequest { ResponseSize = payloadSize, Payload = payload };
+    var stepTimeout = TimeSpan.FromSeconds(120);
+
+    // Open all streams up-front; warm each with a single round so the
+    // timed loop measures steady-state per-round latency rather than
+    // per-stream setup. Matches Go's "warm-up Send/Recv" prelude.
+    var calls = new AsyncDuplexStreamingCall<SimpleRequest, SimpleResponse>[numStreams];
+    try
+    {
+        for (int i = 0; i < numStreams; i++)
+        {
+            calls[i] = client.StreamingCall();
+            await calls[i].RequestStream.WriteAsync(req).WaitAsync(stepTimeout).ConfigureAwait(false);
+            await calls[i].ResponseStream.MoveNext(CancellationToken.None).WaitAsync(stepTimeout).ConfigureAwait(false);
+        }
+
+        var sw = Stopwatch.StartNew();
+        var tasks = new Task[numStreams];
+        for (int i = 0; i < numStreams; i++)
+        {
+            var call = calls[i];
+            tasks[i] = Task.Run(async () =>
+            {
+                for (int j = 0; j < roundsPerStream; j++)
+                {
+                    await call.RequestStream.WriteAsync(req).WaitAsync(stepTimeout).ConfigureAwait(false);
+                    await call.ResponseStream.MoveNext(CancellationToken.None).WaitAsync(stepTimeout).ConfigureAwait(false);
+                }
+            });
+        }
+        await Task.WhenAll(tasks).WaitAsync(timeout).ConfigureAwait(false);
+        sw.Stop();
+
+        double avgUs = sw.Elapsed.TotalMicroseconds / roundsPerStream;
+        double totalBytes = (double)numStreams * roundsPerStream * payloadSize * 2; // req + resp per round
+        double aggMBps = totalBytes > 0 && sw.Elapsed.TotalSeconds > 0
+            ? totalBytes / (1024 * 1024) / sw.Elapsed.TotalSeconds
+            : 0;
+        return (avgUs, aggMBps);
+    }
+    finally
+    {
+        for (int i = 0; i < numStreams; i++)
+        {
+            if (calls[i] is null) continue;
+            try
+            {
+                await calls[i].RequestStream.CompleteAsync().WaitAsync(stepTimeout).ConfigureAwait(false);
+                while (await calls[i].ResponseStream.MoveNext(CancellationToken.None).WaitAsync(stepTimeout).ConfigureAwait(false))
+                {
+                    // drain
+                }
+            }
+            catch { }
+            calls[i].Dispose();
+        }
+    }
+}
+
+// Determines the per-stream round count for the concurrent matrix.
+// Matches the Go-side trade-off: keep total wire bytes bounded as
+// numStreams x size scales. For 1000 streams x 1 MiB even 5 rounds
+// per stream is 10 GiB of ring traffic.
+static int ConcurrentRoundsForLoad(int numStreams, int size)
+{
+    long maxBytesPerSub = 256L * 1024 * 1024; // ~256 MiB cap per (streams, size) cell
+    long perRound = (long)numStreams * size * 2;
+    if (perRound <= 0) return 200; // pure latency cell, no payload
+    int byMax = (int)Math.Max(1, maxBytesPerSub / perRound);
+    // Floor and ceiling so latency cells still get enough iterations
+    // for the mean to be stable and large cells stay short.
+    return Math.Clamp(byMax, 5, 500);
+}
+
 static async Task UnaryCallWithHardTimeoutAsync(
     BenchmarkService.BenchmarkServiceClient client,
     SimpleRequest request,
@@ -707,14 +1206,16 @@ static int IterationsForSize(int size)
 // Output helpers
 // ============================================================================
 
-static void WriteCsv(string path, List<BenchResult> unary, List<BenchResult> streaming)
+static void WriteCsv(string path, List<BenchResult> unary, List<BenchResult> streaming, List<ConcurrentBenchResult> concurrent)
 {
     using var w = new StreamWriter(path);
-    w.WriteLine("type,transport,size_bytes,iterations,avg_latency_us,throughput_mb_per_s");
+    w.WriteLine("type,transport,streams,size_bytes,iterations,avg_latency_us,throughput_mb_per_s,cpu_us_per_op");
     foreach (var r in unary)
-        w.WriteLine($"unary,{r.Transport},{r.SizeBytes},{r.Iterations},{r.AvgLatencyUs:F3},{r.ThroughputMBps:F3}");
+        w.WriteLine($"unary,{r.Transport},1,{r.SizeBytes},{r.Iterations},{r.AvgLatencyUs:F3},{r.ThroughputMBps:F3},{r.CpuUsPerOp:F3}");
     foreach (var r in streaming)
-        w.WriteLine($"streaming,{r.Transport},{r.SizeBytes},{r.Iterations},{r.AvgLatencyUs:F3},{r.ThroughputMBps:F3}");
+        w.WriteLine($"streaming,{r.Transport},1,{r.SizeBytes},{r.Iterations},{r.AvgLatencyUs:F3},{r.ThroughputMBps:F3},{r.CpuUsPerOp:F3}");
+    foreach (var r in concurrent)
+        w.WriteLine($"concurrent,{r.Transport},{r.Streams},{r.SizeBytes},{r.RoundsPerStream},{r.AvgLatencyUsPerRound:F3},{r.AggregateThroughputMBps:F3},");
 }
 
 static string FormatSize(int bytes) => bytes switch
@@ -724,6 +1225,29 @@ static string FormatSize(int bytes) => bytes switch
     >= 1024 => $"{bytes / 1024}KB",
     _ => $"{bytes}B"
 };
+
+/// <summary>
+/// Returns total CPU time (microseconds) consumed by this client process
+/// plus the optional server child process. Sampled around each measurement
+/// so the delta (cpuAfter − cpuBefore) divided by iterations gives the
+/// average CPU time spent per RPC across the whole client/server pair —
+/// useful for SHM-vs-UDS efficiency comparisons under fair mode.
+/// </summary>
+static double CaptureCpu(Process? serverProcess)
+{
+    double clientUs = Process.GetCurrentProcess().TotalProcessorTime.TotalMicroseconds;
+    double serverUs = 0;
+    if (serverProcess != null && !serverProcess.HasExited)
+    {
+        try
+        {
+            serverProcess.Refresh();
+            serverUs = serverProcess.TotalProcessorTime.TotalMicroseconds;
+        }
+        catch { /* process may have exited between HasExited check and TPT read */ }
+    }
+    return clientUs + serverUs;
+}
 
 static string GetCpuInfo()
 {
@@ -958,7 +1482,9 @@ static double NiceStep(double step)
 // Types
 // ============================================================================
 
-sealed record BenchResult(string Transport, int SizeBytes, int Iterations, double AvgLatencyUs, double ThroughputMBps);
+sealed record BenchResult(string Transport, int SizeBytes, int Iterations, double AvgLatencyUs, double ThroughputMBps, double CpuUsPerOp = 0);
+
+sealed record ConcurrentBenchResult(string Transport, int Streams, int SizeBytes, int RoundsPerStream, double AvgLatencyUsPerRound, double AggregateThroughputMBps);
 sealed record PlotPoint(double X, double Y);
 sealed record PlotSeries(string Label, string Color, List<PlotPoint> Points);
 
@@ -998,6 +1524,14 @@ sealed class BenchmarkServiceImpl : BenchmarkService.BenchmarkServiceBase
 static class ShmBenchConfig
 {
     public static bool SingleStream = true;
+
+    // --fair flag: disables SHM-specific allocation optimizations so the
+    // comparison vs TCP / UDS reflects on-wire and wake-mechanism cost
+    // only (not pooled-deserialization which TCP/UDS could also adopt).
+    // Currently gates server-side pooledDeserialization +
+    // client-side IPooledDeserializer.SetPooledDeserializer (via env
+    // var SHM_DISABLE_POOLED_DESER=1, picked up by ShmControlResponseContent).
+    public static bool FairMode;
 }
 
 static class PayloadCache
@@ -1023,14 +1557,16 @@ sealed class BenchEnv : IAsyncDisposable
     public string Transport { get; }
     public BenchmarkService.BenchmarkServiceClient Client { get; }
     public GrpcChannel Channel { get; }
+    public Process? ServerProcess { get; }
     private readonly Func<Task> _cleanup;
 
-    public BenchEnv(string transport, BenchmarkService.BenchmarkServiceClient client, GrpcChannel channel, Func<Task> cleanup)
+    public BenchEnv(string transport, BenchmarkService.BenchmarkServiceClient client, GrpcChannel channel, Func<Task> cleanup, Process? serverProcess = null)
     {
         Transport = transport;
         Client = client;
         Channel = channel;
         _cleanup = cleanup;
+        ServerProcess = serverProcess;
     }
 
     public async ValueTask DisposeAsync() => await _cleanup();

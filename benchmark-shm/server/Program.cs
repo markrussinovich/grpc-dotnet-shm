@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Globalization;
 using Google.Protobuf;
@@ -147,6 +148,27 @@ public class Program
         {
             Console.WriteLine("Server stopped.");
         }
+
+        // Server-side diag: print WriterLoop Phase 3 wait count if
+        // SHM_DIAG_WRITERLOOP=1. Lets us see how often the server's
+        // WriterLoop hits the kernel wait — needed to estimate the
+        // upside of SignalObjectAndWait combining.
+        if (string.Equals(Environment.GetEnvironmentVariable("SHM_DIAG_WRITERLOOP"), "1", StringComparison.Ordinal))
+        {
+            try
+            {
+                var asm = typeof(Grpc.Net.SharedMemory.ShmConstants).Assembly;
+                var t = asm.GetType("Grpc.Net.SharedMemory.ShmFrameWriter");
+                var m = t?.GetMethod("GetPhase3Waits",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                if (m != null)
+                {
+                    long count = (long)(m.Invoke(null, null) ?? 0L);
+                    Console.Error.WriteLine($"[SRV-DIAG] writerloop phase3-waits={count}");
+                }
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[SRV-DIAG] writerloop-diag failed: {ex.Message}"); }
+        }
     }
 
     private static async Task StartTcpServerAsync(int port, CancellationToken ct)
@@ -242,7 +264,7 @@ public class Program
         // The H2 data-plane wire body is a gRPC LPM blob:
         // [compFlag(1)][len(4 BE)][protobuf]. Strip the 5-byte prefix
         // before handing the body to the protobuf parser.
-        var request = SimpleRequest.Parser.ParseFrom(UnwrapLpm(requestData.Span));
+        var request = SimpleRequest.Parser.ParseFrom(ShmGrpcStream.UnwrapLpm(requestData.Span));
         var responseSize = request.ResponseSize;
         var payload = BenchmarkServiceImpl.GetOrCreatePayload(responseSize);
 
@@ -258,8 +280,11 @@ public class Program
         // Send response headers
         await stream.SendResponseHeadersAsync().ConfigureAwait(false);
 
-        // Send response message wrapped in 5-byte gRPC LPM prefix.
-        await stream.SendMessageAsync(WrapLpm(response.ToByteArray()), ct).ConfigureAwait(false);
+        // Send response — zero-allocation LPM helper on the SHM stream:
+        // protobuf serializes directly into a pooled ring-sized buffer,
+        // 5-byte gRPC LPM header is written inline, buffer is returned to
+        // ArrayPool after the ring write completes.
+        await stream.SendMessageAsync(response, ct).ConfigureAwait(false);
 
         // Send trailers - signal this is the end (also removes stream from connection)
         await stream.SendTrailersAsync(StatusCode.OK).ConfigureAwait(false);
@@ -273,7 +298,7 @@ public class Program
         // Read and respond to each message
         await foreach (var requestData in stream.ReceiveMessagesAsync(ct).ConfigureAwait(false))
         {
-            var request = SimpleRequest.Parser.ParseFrom(UnwrapLpm(requestData));
+            var request = SimpleRequest.Parser.ParseFrom(ShmGrpcStream.UnwrapLpm(requestData));
             var responseSize = request.ResponseSize;
             var payload = BenchmarkServiceImpl.GetOrCreatePayload(responseSize);
 
@@ -286,30 +311,10 @@ public class Program
                 }
             };
 
-            await stream.SendMessageAsync(WrapLpm(response.ToByteArray()), ct).ConfigureAwait(false);
+            await stream.SendMessageAsync(response, ct).ConfigureAwait(false);
         }
 
         // Send trailers
         await stream.SendTrailersAsync(StatusCode.OK).ConfigureAwait(false);
-    }
-
-    // gRPC length-prefixed message helpers. Wire body for H2 DATA frames is
-    // [compFlag(1)][len(4 BE)][body]; both sides must agree.
-    private static byte[] WrapLpm(byte[] body)
-    {
-        var buf = new byte[5 + body.Length];
-        buf[0] = 0; // uncompressed
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(1, 4), (uint)body.Length);
-        body.CopyTo(buf, 5);
-        return buf;
-    }
-
-    private static ReadOnlySpan<byte> UnwrapLpm(ReadOnlySpan<byte> framed)
-    {
-        if (framed.Length < 5) throw new InvalidDataException($"LPM blob too short: {framed.Length}");
-        if (framed[0] != 0) throw new InvalidDataException($"Compressed LPM not supported (flag=0x{framed[0]:X2})");
-        var len = (int)BinaryPrimitives.ReadUInt32BigEndian(framed.Slice(1, 4));
-        if (5 + len > framed.Length) throw new InvalidDataException($"LPM declares {len} bytes, only {framed.Length - 5} available");
-        return framed.Slice(5, len);
     }
 }

@@ -19,6 +19,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Threading.Channels;
+using Google.Protobuf;
 using Grpc.Core;
 
 namespace Grpc.Net.SharedMemory;
@@ -84,6 +85,68 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private bool _cancelled;
     private int _disposed;
     private volatile Exception? _sendFailure; // set by SendBodyAsync on failure
+
+    // Wake-coalescing (unary only): when set, an inline batch was opened
+    // in SendRequestHeadersAsync. SendHalfCloseAsync's inline path closes
+    // it so Headers+Message+HalfClose share a single OS-level data-signal.
+    // Caller (ShmControlHandler) sets this hint only for unary requests
+    // (known content length) where HalfClose is guaranteed to follow
+    // Message in microseconds. For streaming the hint is false and the
+    // per-frame wakes proceed normally to avoid starving the response.
+    private int _pendingInlineBatch; // 0=closed, 1=open
+
+    // Diagnostic counters for the wake-coalescing path. Static across
+    // all streams so the bench can read them via reflection.
+    private static long s_coalesceOpened;
+    private static long s_coalesceClosed;
+    internal static (long Opened, long Closed) GetCoalesceDiag()
+        => (Volatile.Read(ref s_coalesceOpened), Volatile.Read(ref s_coalesceClosed));
+
+    // Diagnostic counters (env-gated SHM_DIAG_HOPTIMING=1) for measuring
+    // the client-side reader-thread → user-thread channel hop cost.
+    // _hopPushTicks: set by reader thread just before/after Channel.TryWrite
+    // _hopReceiveTicks: set by user thread just after Channel TryRead/wait returns
+    // Diff aggregates "in-process hop" overhead — quantifies the upside of
+    // a future inline-reader optimization that lets the user thread read
+    // directly from RxRing, skipping the channel.
+    private static readonly bool s_diagHopTiming =
+        string.Equals(Environment.GetEnvironmentVariable("SHM_DIAG_HOPTIMING"),
+            "1", StringComparison.Ordinal);
+    private long _lastHopPushTicks;
+    private static long s_hopTicksTotal;          // slow path: user awaited
+    private static long s_hopCount;
+    private static long s_hopFastTicksTotal;      // fast path: frame already queued
+    private static long s_hopFastCount;
+    internal static (long TicksTotal, long Count, long FastTicksTotal, long FastCount) GetHopDiag()
+        => (Volatile.Read(ref s_hopTicksTotal), Volatile.Read(ref s_hopCount),
+            Volatile.Read(ref s_hopFastTicksTotal), Volatile.Read(ref s_hopFastCount));
+
+    // Env-gated SHM_CHANNEL_INLINE=1: lets the inbound Channel<InboundFrame>
+    // run continuations synchronously on the reader thread (skipping
+    // ThreadPool dispatch). Saves ~10-15µs/RT on Windows where the
+    // ThreadPool worker wake is the dominant cost (default OFF preserves
+    // current threading model). See repo/grpc-dotnet-shm-channel-hop-finding.
+    // Risk: with N concurrent streams sharing one connection, the reader
+    // thread is briefly serialized while user continuations run inline —
+    // OK if continuations don't block (typical gRPC) but pathological if
+    // they do. Recommend pairing with concurrent A/B bench before default-on.
+    //
+    // CRITICAL incompatibility: when strict-fair forces a small
+    // SHM_FAIR_MAX_FRAME (e.g. 16384), large messages get split across
+    // multiple H2 DATA frames. LazyChainRos then activates and pulls each
+    // chunk synchronously via ReceiveFrameSync → if sync continuations is
+    // also on, the user-code MergeFrom runs on the reader thread, blocks
+    // on the next chunk, and the reader thread can never read that next
+    // chunk → deadlock. We disable sync continuations when fair frame cap
+    // is in effect so the multi-frame path stays correct. Same disable
+    // happens when SHM_FAIR_STREAM_WINDOW is set (it also activates the
+    // multi-frame path via the chunking threshold).
+    private static readonly bool s_channelInlineContinuations =
+        string.Equals(Environment.GetEnvironmentVariable("SHM_CHANNEL_INLINE"),
+            "1", StringComparison.Ordinal)
+        && ShmConstants.FairMaxFramePayload == int.MaxValue
+        && ShmConstants.FairStreamWindow == int.MaxValue;
+
 
     /// <summary>
     /// Records a send-side failure so that response readers can surface
@@ -156,15 +219,78 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         _inboundFrames = Channel.CreateUnbounded<InboundFrame>(new UnboundedChannelOptions
         {
             SingleReader = true,
-            SingleWriter = true
+            SingleWriter = true,
+            AllowSynchronousContinuations = s_channelInlineContinuations
         });
         _disposeCts = new CancellationTokenSource();
         _cancellationCts = new CancellationTokenSource();
         _sendLock = new SemaphoreSlim(1, 1);
-        // Per-stream flow control is disabled: the ring's WaitForSpace
-        // provides back-pressure via the SPSC ring buffer. A separate
-        // per-stream window would add cross-process WindowUpdate round
-        // trips, causing throughput to drop from 1.7 GB/s to 0.75 GB/s.
+        // Per-stream flow control is disabled in production: the ring's
+        // WaitForSpace provides back-pressure via the SPSC ring buffer.
+        // A separate per-stream window would add cross-process WindowUpdate
+        // round trips, causing throughput to drop from 1.7 GB/s to 0.75 GB/s.
+        //
+        // gRFC SHM no-WU alignment (v3.4+ / grpc-go-shmem shmNoWU):
+        // even when SHM_FAIR_STREAM_WINDOW is set, the per-stream window
+        // is NOT enforced — FairAwaitWindow / FairAddWindow / AccruePeerCredit
+        // are all no-ops. SHM_FAIR_STREAM_WINDOW only opts into the
+        // FairMaxFramePayload chunking for apples-to-apples wire-format
+        // comparison with TCP/HTTP2 (smaller H2 DATA frames). The
+        // SHM ring's WaitForSpace backpressure is the sole flow control.
+    }
+
+    /// <summary>
+    /// No-op stub retained for API stability and reflection-based tests.
+    /// Per gRFC SHM no-WU alignment (v3.4+, mirrors grpc-go-shmem
+    /// <c>shm_client_transport.go:acquireSendQuota</c> under shmNoWU):
+    /// per-stream HTTP/2 send-window enforcement is disabled over shared
+    /// memory; the ring's <c>WaitForSpace</c> backpressure in
+    /// <see cref="ShmRing.ReserveWrite"/> is the sole flow control.
+    /// Previously this blocked on a ManualResetEventSlim until peer
+    /// WINDOW_UPDATE credit arrived; the bidirectional WU-credit dance
+    /// produced an unfixable TOCTOU deadlock under chunked sends on
+    /// fast Linux multi-core hosts.
+    /// </summary>
+    /// <param name="needed">Ignored. Was the byte count to debit.</param>
+    /// <param name="drainBeforeWait">
+    /// Ignored. Was a callback to flush owed peer-WUs before sleeping.
+    /// </param>
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822", Justification = "No-op stub kept instance-method for API stability; see method doc.")]
+    internal void FairAwaitWindow(int needed, Action? drainBeforeWait = null)
+    {
+        // No-op: SHM ring backpressure is the only flow control.
+        _ = needed;
+        _ = drainBeforeWait;
+    }
+
+    /// <summary>
+    /// Strict-fair mode: previously credited <paramref name="delta"/>
+    /// bytes back to the stream send-window in response to a peer
+    /// WINDOW_UPDATE. Now a no-op in all modes (see <see cref="FairAwaitWindow"/>);
+    /// incoming WU frames are accepted on the wire for spec compliance
+    /// but their increment is discarded, mirroring grpc-go-shmem
+    /// <c>shm_client_transport.go:addSendQuota</c> under shmNoWU.
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822", Justification = "No-op stub kept instance-method for API stability; see method doc.")]
+    internal void FairAddWindow(int delta)
+    {
+        // No-op. See FairAwaitWindow doc.
+        _ = delta;
+    }
+
+    /// <summary>
+    /// Strict-fair mode: previously accumulated incoming wire-byte credit
+    /// per stream and returned a coalesced peer-WU amount once threshold
+    /// reached. Now a no-op (always returns 0) so no WU frames are ever
+    /// emitted, matching grpc-go-shmem shmNoWU. Receiver-side flow control
+    /// is unnecessary because the SHM ring's <c>WaitForSpace</c> already
+    /// blocks the sender when the ring fills.
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822", Justification = "No-op stub kept instance-method for API stability; see method doc.")]
+    internal uint AccruePeerCredit(int wireBytes)
+    {
+        _ = wireBytes;
+        return 0;
     }
 
     /// <summary>
@@ -178,7 +304,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>
     /// Sends request headers (client-side, must be called first).
     /// </summary>
-    public Task SendRequestHeadersAsync(string method, string authority, Metadata? metadata = null, DateTime? deadline = null)
+    public Task SendRequestHeadersAsync(string method, string authority, Metadata? metadata = null, DateTime? deadline = null, bool coalesceWithHalfClose = false)
     {
         ThrowIfDisposed();
         if (!IsClientStream)
@@ -229,8 +355,34 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             {
                 try
                 {
-                    writer.WriteInlineFrame(FrameType.Headers, StreamId,
-                        HeadersFlags.Initial, payload.AsSpan(0, payloadLength), default);
+                    if (coalesceWithHalfClose)
+                    {
+                        // Wake-coalescing (unary): suppress the per-frame
+                        // SignalData for Headers; SendHalfCloseAsync will
+                        // close the batch and fire a single SignalData
+                        // covering Headers+Message+HalfClose. Only safe
+                        // when caller guarantees HalfClose follows shortly
+                        // (i.e., unary request with known body length).
+                        writer.BeginInlineBatch();
+                        Interlocked.Increment(ref s_coalesceOpened);
+                        var batchOpened = true;
+                        try
+                        {
+                            writer.WriteInlineFrame(FrameType.Headers, StreamId,
+                                HeadersFlags.Initial, payload.AsSpan(0, payloadLength), default);
+                            Volatile.Write(ref _pendingInlineBatch, 1);
+                            batchOpened = false; // ownership transferred to HalfClose / Dispose
+                        }
+                        finally
+                        {
+                            if (batchOpened) writer.EndInlineBatch();
+                        }
+                    }
+                    else
+                    {
+                        writer.WriteInlineFrame(FrameType.Headers, StreamId,
+                            HeadersFlags.Initial, payload.AsSpan(0, payloadLength), default);
+                    }
                     return Task.CompletedTask;
                 }
                 finally
@@ -377,7 +529,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Sends a message payload.
+    /// Sends a message payload as raw bytes — does NOT wrap the gRPC
+    /// 5-byte LPM (length-prefixed-message) header. Use this overload
+    /// when the caller already owns the framed wire form (e.g. relaying
+    /// a pre-framed payload). For typical gRPC use cases prefer the
+    /// <see cref="SendMessageAsync(Google.Protobuf.IMessage, CancellationToken)"/>
+    /// overload, which is zero-allocation by construction.
     /// </summary>
     public Task SendMessageAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
@@ -481,6 +638,71 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Sends a gRPC message: the protobuf body is serialized DIRECTLY
+    /// into a pooled ring-sized buffer (no intermediate
+    /// <c>ToByteArray()</c> allocation) and wrapped with the 5-byte
+    /// gRPC LPM header inline (<c>[compFlag=0(1)][len(4 BE)][body]</c>).
+    /// The pooled buffer is returned to <see cref="ArrayPool{T}"/> after
+    /// the ring write completes.
+    ///
+    /// <para>This is the recommended path for hand-written
+    /// server/client implementations that use <see cref="ShmGrpcStream"/>
+    /// directly (e.g. via <c>ShmGrpcServer</c>). Kestrel-hosted gRPC
+    /// services already get equivalent zero-allocation framing through
+    /// <c>SerializationContext.GetBufferWriter()</c> + the SHM
+    /// <c>PipeWriter</c> adapter; they should NOT call this method.</para>
+    /// </summary>
+    public Task SendMessageAsync(Google.Protobuf.IMessage message, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        var size = message.CalculateSize();
+        var totalLen = 5 + size;
+        var buf = ArrayPool<byte>.Shared.Rent(totalLen);
+        try
+        {
+            buf[0] = 0; // uncompressed (gRPC LPM compression flag)
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                buf.AsSpan(1, 4), (uint)size);
+            if (size > 0)
+            {
+                message.WriteTo(buf.AsSpan(5, size));
+            }
+            // SendMessageZeroCopyAsync owns `buf` and returns it to the pool
+            // after the ring write completes. We must NOT return it here.
+            return SendMessageZeroCopyAsync(buf.AsMemory(0, totalLen), buf, cancellationToken);
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Strips the 5-byte gRPC LPM header from a wire-format MESSAGE body
+    /// (<c>[compFlag(1)][len(4 BE)][body]</c>) and returns the body slice.
+    /// Throws on malformed or compressed (compFlag != 0) blobs; callers
+    /// that need to handle compression should peek the flag byte first.
+    ///
+    /// Counterpart to <see cref="SendMessageWithLpmZeroCopyAsync"/> for
+    /// hand-written servers/clients reading raw frames out of
+    /// <see cref="ReceiveMessagesAsync"/>.
+    /// </summary>
+    public static ReadOnlySpan<byte> UnwrapLpm(ReadOnlySpan<byte> framed)
+    {
+        if (framed.Length < 5)
+            throw new ArgumentException($"LPM blob too short: {framed.Length} bytes", nameof(framed));
+        if (framed[0] != 0)
+            throw new InvalidDataException(
+                $"Compressed gRPC LPM not supported (compFlag=0x{framed[0]:X2}); set grpc-encoding=identity or handle compression at the application layer.");
+        var len = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(framed.Slice(1, 4));
+        if (5 + len > framed.Length)
+            throw new InvalidDataException(
+                $"LPM declares {len} bytes but only {framed.Length - 5} are available.");
+        return framed.Slice(5, len);
+    }
+
+    /// <summary>
     /// Writes trailers directly to the ring via the given (paused) writer.
     /// Caller MUST hold the WriterLoop pause. No queue, no async, no signal race.
     /// </summary>
@@ -571,6 +793,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 try
                 {
                     FrameProtocol.WriteHalfClose(_connection.TxRing, StreamId, default);
+                    // Wake-coalescing close: if SendRequestHeadersAsync
+                    // opened an inline batch (unary path), close it now
+                    // so the single coalesced SignalData fires.
+                    if (Interlocked.Exchange(ref _pendingInlineBatch, 0) == 1)
+                    {
+                        writer.EndInlineBatch();
+                        Interlocked.Increment(ref s_coalesceClosed);
+                    }
                 }
                 finally
                 {
@@ -625,11 +855,123 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         // without allocating a LinkedCTS or async state machine.
         if (_inboundFrames.Reader.TryRead(out var frame))
         {
+            if (s_diagHopTiming)
+            {
+                var push = Volatile.Read(ref _lastHopPushTicks);
+                if (push != 0)
+                {
+                    var hopTicks = System.Diagnostics.Stopwatch.GetTimestamp() - push;
+                    if (hopTicks >= 0)
+                    {
+                        Interlocked.Add(ref s_hopFastTicksTotal, hopTicks);
+                        Interlocked.Increment(ref s_hopFastCount);
+                    }
+                }
+            }
             return Task.FromResult<InboundFrame?>(frame);
         }
 
         // Slow path: need to wait for a frame.
         return ReceiveFrameSlowAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Synchronous variant of <see cref="ReceiveFrameAsync"/>. Used by
+    /// <see cref="LazyChainRos"/>'s pull callback inside protobuf's
+    /// synchronous <c>MergeFrom(ros)</c> parse loop.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Returns the next queued frame immediately if one is buffered.
+    /// Otherwise blocks the calling thread on the inbound frames channel
+    /// until a frame arrives, the stream is disposed, or
+    /// <paramref name="cancellationToken"/> fires.
+    /// </para>
+    /// <para>
+    /// Sync-over-async safety: the underlying <c>Channel&lt;InboundFrame&gt;</c>
+    /// uses <c>ManualResetValueTaskSourceCore</c> internally with no
+    /// SynchronizationContext capture; awaiting it via
+    /// <c>GetAwaiter().GetResult()</c> blocks the calling thread on a
+    /// kernel signal that the producer (the per-connection
+    /// <c>FrameReaderLoopAsync</c> running on its own dedicated task)
+    /// fires asynchronously. Cannot self-deadlock because consumer and
+    /// producer are on different threads.
+    /// </para>
+    /// </remarks>
+    public InboundFrame? ReceiveFrameSync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        if (_inboundFrames.Reader.TryRead(out var frame))
+        {
+            if (s_diagHopTiming)
+            {
+                var push = Volatile.Read(ref _lastHopPushTicks);
+                if (push != 0)
+                {
+                    var hopTicks = System.Diagnostics.Stopwatch.GetTimestamp() - push;
+                    if (hopTicks >= 0)
+                    {
+                        Interlocked.Add(ref s_hopFastTicksTotal, hopTicks);
+                        Interlocked.Increment(ref s_hopFastCount);
+                    }
+                }
+            }
+            return frame;
+        }
+
+        CancellationToken ct;
+        CancellationTokenSource? linkedCts = null;
+        if (cancellationToken.CanBeCanceled)
+        {
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+            ct = linkedCts.Token;
+        }
+        else
+        {
+            ct = _disposeCts.Token;
+        }
+
+        try
+        {
+            // ValueTask<bool>: if synchronously completed, read directly; else
+            // block on the underlying Task.
+            var waitTask = _inboundFrames.Reader.WaitToReadAsync(ct);
+            bool hasMore = waitTask.IsCompleted
+                ? waitTask.Result
+                : waitTask.AsTask().GetAwaiter().GetResult();
+
+            if (hasMore && _inboundFrames.Reader.TryRead(out frame))
+            {
+                if (s_diagHopTiming)
+                {
+                    var push = Volatile.Read(ref _lastHopPushTicks);
+                    if (push != 0)
+                    {
+                        var hopTicks = System.Diagnostics.Stopwatch.GetTimestamp() - push;
+                        if (hopTicks >= 0)
+                        {
+                            Interlocked.Add(ref s_hopTicksTotal, hopTicks);
+                            Interlocked.Increment(ref s_hopCount);
+                        }
+                    }
+                }
+                return frame;
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (ChannelClosedException)
+        {
+        }
+        finally
+        {
+            linkedCts?.Dispose();
+        }
+
+        return null;
     }
 
     private async Task<InboundFrame?> ReceiveFrameSlowAsync(CancellationToken cancellationToken)
@@ -654,6 +996,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             {
                 if (_inboundFrames.Reader.TryRead(out var frame))
                 {
+                    if (s_diagHopTiming)
+                    {
+                        var push = Volatile.Read(ref _lastHopPushTicks);
+                        if (push != 0)
+                        {
+                            var hopTicks = System.Diagnostics.Stopwatch.GetTimestamp() - push;
+                            if (hopTicks >= 0)
+                            {
+                                Interlocked.Add(ref s_hopTicksTotal, hopTicks);
+                                Interlocked.Increment(ref s_hopCount);
+                            }
+                        }
+                    }
                     return frame;
                 }
             }
@@ -1069,6 +1424,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     internal void OnFrameReceived(InboundFrame frame)
     {
+        // Diag: stamp the moment we're about to push to the inbound
+        // channel. ReceiveFrameSlowAsync / ReceiveFrameSync read this
+        // back and accumulate the gap = "in-process reader→user hop".
+        if (s_diagHopTiming)
+        {
+            Volatile.Write(ref _lastHopPushTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+        }
         var ownsFrame = true;
         try
         {
@@ -1351,6 +1713,16 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
+        }
+
+        // Safety: if a wake-coalescing batch was opened in
+        // SendRequestHeadersAsync but never closed (because the request
+        // was cancelled before HalfClose ran), close it now so the
+        // ring's _batchWriteDepth doesn't leak.
+        if (Interlocked.Exchange(ref _pendingInlineBatch, 0) == 1)
+        {
+            try { _connection.FrameWriter?.EndInlineBatch(); }
+            catch { /* best effort */ }
         }
 
         _disposeCts.Cancel();

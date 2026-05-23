@@ -9,6 +9,13 @@
     <SignAssembly>false</SignAssembly>
     <NoWarn>CA1416;CA1822;CA2007;CA2016</NoWarn>
   </PropertyGroup>
+  <!-- Mirror the library's platform DefineConstants so the bench can
+       reference Linux-only types (e.g. LinuxDataSegWaker.GetDiag for
+       wake-path instrumentation). -->
+  <PropertyGroup>
+    <DefineConstants Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(DefineConstants);WINDOWS</DefineConstants>
+    <DefineConstants Condition="$([MSBuild]::IsOSPlatform('Linux'))">$(DefineConstants);LINUX</DefineConstants>
+  </PropertyGroup>
   <ItemGroup>
     <Protobuf Include="Proto\benchmark.proto" GrpcServices="Both" />
   </ItemGroup>

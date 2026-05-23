@@ -16,6 +16,13 @@
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
 
+  <!-- Mirror the library's platform DefineConstants so tests that need
+       to reference Linux-only or Windows-only types compile correctly. -->
+  <PropertyGroup>
+    <DefineConstants Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(DefineConstants);WINDOWS</DefineConstants>
+    <DefineConstants Condition="$([MSBuild]::IsOSPlatform('Linux'))">$(DefineConstants);LINUX</DefineConstants>
+  </PropertyGroup>
+
   <!-- Exclude GoInterop subprojects - they are standalone projects -->
   <ItemGroup>
     <Compile Remove="GoInterop\**" />
