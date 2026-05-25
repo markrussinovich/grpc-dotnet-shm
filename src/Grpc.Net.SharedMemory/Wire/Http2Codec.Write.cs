@@ -203,6 +203,12 @@ internal static partial class Http2Codec
 
     private static void WriteH2WindowUpdate(ShmRing ring, uint streamId, ReadOnlySpan<byte> p1, ReadOnlySpan<byte> p2, CancellationToken ct)
     {
+        // Structural regression guard for the SHM no-WU baseline (gRFC SHM
+        // alignment with grpc-go-shmem v3.4+ shmNoWU). This is the single
+        // wire-level emission point for WINDOW_UPDATE; any code path that
+        // reaches here must show up in the test counter so we never
+        // silently re-introduce WU traffic.
+        ShmConnection.RecordWindowUpdateEmission();
         // Internal payload from FrameProtocol.WriteWindowUpdate is 4 bytes
         // little-endian. Convert to H2 big-endian wire format.
         Span<byte> combined = stackalloc byte[4];

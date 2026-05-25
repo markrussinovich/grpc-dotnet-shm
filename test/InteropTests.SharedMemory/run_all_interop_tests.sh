@@ -14,8 +14,11 @@ echo ""
 PASS_COUNT=0
 FAIL_COUNT=0
 
-# Clean up any leftover shared memory segments
-rm -f /dev/shm/interop_test_* 2>/dev/null || true
+# Clean up any leftover shared memory segments and fd-pass sockets.
+# The .NET / Go transports create files at /dev/shm/grpc_shm_<segName>
+# (data segment + .lock + .fds.sock), so the cleanup pattern must
+# match the full prefix rather than the bare segment name.
+rm -f /dev/shm/grpc_shm_interop_test_* 2>/dev/null || true
 
 # Test 1: Go Server + .NET Client
 echo ">>> Test 1: Go Server + .NET Client"
@@ -43,7 +46,8 @@ echo "============================================"
 echo "SUMMARY: Passed: $PASS_COUNT / Failed: $FAIL_COUNT"
 echo "============================================"
 
-# Final cleanup
-rm -f /dev/shm/interop_test_* 2>/dev/null || true
+# Final cleanup (match .NET / Go file naming: grpc_shm_<seg>* covers
+# data segment, .lock, and .fds.sock).
+rm -f /dev/shm/grpc_shm_interop_test_* 2>/dev/null || true
 
 [ $FAIL_COUNT -eq 0 ] && exit 0 || exit 1

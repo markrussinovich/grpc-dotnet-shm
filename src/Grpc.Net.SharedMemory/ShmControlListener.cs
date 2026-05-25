@@ -41,6 +41,25 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
     private int _disposed;
 
     /// <summary>
+    /// Gets or sets the optional security handshaker. When non-null,
+    /// each accepted connection performs a process-level identity
+    /// handshake on its data segment immediately after the
+    /// control-segment CONNECT/ACCEPT completes; the resulting
+    /// <see cref="ShmAuthInfo"/> is surfaced on
+    /// <see cref="ShmConnection.AuthInfo"/>. Mirrors grpc-go-shmem's
+    /// transport-layer <c>ShmSecurityHandshaker</c>.
+    /// <para>
+    /// When <c>null</c> (default) the server skips the handshake and
+    /// returns connections with <c>AuthInfo == null</c>, matching the
+    /// insecure-local default. Both peers must agree (either both have
+    /// a handshaker or neither does) — mixed modes deadlock the
+    /// silent peer waits for the data-segment frame the handshaker
+    /// peer never sends.
+    /// </para>
+    /// </summary>
+    public IShmSecurityHandshaker? Handshaker { get; set; }
+
+    /// <summary>
     /// Gets the base segment name.
     /// </summary>
     public string BaseName => _baseName;
@@ -64,6 +83,31 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         _activeConnections = new ConcurrentDictionary<string, ShmConnection>();
         _disposeCts = new CancellationTokenSource();
         EndPoint = new ShmEndPoint(baseName);
+
+        // Duplicate-server detection: if another listener is already
+        // serving on this base name, refuse to start. Probing the
+        // existing control segment is cheaper than racing on a creation
+        // error AND avoids silently unlinking a peer listener's inode
+        // (mirrors grpc-go-shmem NewShmListener behaviour).
+        try
+        {
+            using var existing = Segment.OpenControlSegment(baseName);
+            if (existing.IsServerReady())
+            {
+                throw new InvalidOperationException(
+                    $"A server is already listening on segment '{baseName}'.");
+            }
+            // Existing segment present but ServerReady=0 → stale; fall
+            // through and overwrite it.
+        }
+        catch (FileNotFoundException)
+        {
+            // Normal first-start path: no existing control segment.
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // Same as FileNotFoundException on some platforms.
+        }
 
         // Create the control segment like Go does
         _controlSegment = Segment.CreateControlSegment(baseName);
@@ -89,7 +133,22 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         while (!ct.IsCancellationRequested)
         {
             // Read a frame from the control ring
-            var (frameHeader, payload) = await ReadControlFrameAsync(ct).ConfigureAwait(false);
+            FrameHeader frameHeader;
+            Memory<byte> payload;
+            try
+            {
+                (frameHeader, payload) = await ReadControlFrameAsync(ct).ConfigureAwait(false);
+            }
+            catch (MalformedControlFrameException)
+            {
+                // Hostile or stale peer sent a malformed control frame.
+                // ReadControlFrameAsync has already best-effort-drained
+                // the bytes from the ring so subsequent reads can
+                // resynchronize on the next frame boundary. Skip and
+                // keep accepting; mirrors grpc-go-shmem listener
+                // behaviour for errMalformedCtlFrame.
+                continue;
+            }
 
             if (frameHeader.Type != FrameType.Connect)
             {
@@ -162,11 +221,51 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
                 continue;
             }
 
+            // Linux eventfd negotiation: after the opener has signalled it
+            // mapped the segment, the OpenerWakeReady flag in the segment
+            // header is stable. Drop our eventfd waker if the opener did
+            // not establish one (peer is using a futex-only build, or its
+            // SCM_RIGHTS handoff failed) so both sides converge on the
+            // same wake primitive. No-op on Windows / when eventfd wake
+            // is disabled.
+            dataSegment.FinalizeDataSegWaker();
+
+            // Optional security handshake on the data segment BEFORE
+            // we hand it to ShmConnection — the connection ctor starts
+            // the frame reader loop which would otherwise race the
+            // handshake frame I/O. Mirrors grpc-go-shmem's
+            // transport-layer ShmSecurityHandshaker.ServerHandshake.
+            ShmAuthInfo? authInfo = null;
+            if (Handshaker != null)
+            {
+                try
+                {
+                    // From the server's perspective: RingA is
+                    // client→server (we read), RingB is server→client
+                    // (we write).
+                    authInfo = await Handshaker.ServerHandshakeAsync(
+                        writer: (type, payload, c) => WriteHandshakeFrameAsync(dataSegment.RingB, type, payload, c),
+                        reader: c => ReadHandshakeFrameAsync(dataSegment.RingA, c),
+                        ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Handshake failure: dispose the data segment and
+                    // continue accepting. The client surfaces a
+                    // ShmHandshakeException from its side; we just drop
+                    // the half-built connection on the floor here.
+                    dataSegment.Dispose();
+                    Segment.TryRemoveSegment(segmentName);
+                    continue;
+                }
+            }
+
             // Create and return the connection
             ShmConnection connection;
             try
             {
                 connection = new ShmConnection(segmentName, dataSegment);
+                connection.AuthInfo = authInfo;
                 // Propagate client's singleStreamMode request.
                 // Server decides in HandleConnectionAsync whether to honor it.
                 connection.SingleStreamMode = connectParams.clientSingleStream;
@@ -224,7 +323,15 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         {
             if (header.Length > ShmConstants.MinRingCapacity)
             {
-                throw new InvalidDataException($"Control frame payload {header.Length} exceeds maximum.");
+                // Hostile peer sent an oversize Length. Best-effort
+                // drain those bytes from the ring so the next
+                // ReadControlFrameAsync resynchronizes on a clean frame
+                // boundary instead of consuming this frame's bytes as
+                // the next header. Mirrors grpc-go-shmem's
+                // readCtlFrame errMalformedCtlFrame drain.
+                BestEffortDrain(_controlRx, header.Length, ct);
+                throw new MalformedControlFrameException(
+                    $"Control frame payload {header.Length} exceeds maximum {ShmConstants.MinRingCapacity}.");
             }
 
             var payloadBuffer = new byte[header.Length];
@@ -233,6 +340,35 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         }
 
         return Task.FromResult((header, payload));
+    }
+
+    /// <summary>
+    /// Reads and discards up to <paramref name="totalBytes"/> bytes from
+    /// the ring in 4 KiB chunks. Used to resynchronize the ring after a
+    /// malformed frame header reports an oversize Length.
+    /// </summary>
+    private static void BestEffortDrain(ShmRing ring, uint totalBytes, CancellationToken ct)
+    {
+        const int chunk = (int)ShmConstants.MinRingCapacity; // 4096
+        Span<byte> sink = stackalloc byte[chunk];
+        var remaining = (long)totalBytes;
+        while (remaining > 0 && !ct.IsCancellationRequested)
+        {
+            var take = (int)Math.Min(remaining, chunk);
+            try
+            {
+                ReadExact(ring, sink[..take], ct);
+            }
+            catch
+            {
+                // Best-effort: if the ring closes or the read fails
+                // mid-drain there is nothing useful left to do; the
+                // outer Accept loop will surface the underlying failure
+                // on its next iteration.
+                return;
+            }
+            remaining -= take;
+        }
     }
 
     /// <summary>
@@ -287,6 +423,63 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         {
             read += ring.Read(buffer[read..], ct);
         }
+    }
+
+    /// <summary>
+    /// Writes a single security-handshake frame to the data-segment ring.
+    /// Adapter matching <see cref="IShmSecurityHandshaker"/>'s writer
+    /// delegate signature.
+    /// </summary>
+    private static Task WriteHandshakeFrameAsync(ShmRing ring, FrameType type, ReadOnlyMemory<byte> payload, CancellationToken ct)
+    {
+        var header = new FrameHeader
+        {
+            Length = (uint)payload.Length,
+            StreamId = 0,
+            Type = type,
+            Flags = 0
+        };
+        var headerBytes = header.ToBytes();
+        ring.Write(headerBytes, ct);
+        if (payload.Length > 0)
+        {
+            var buffer = payload.ToArray();
+            ring.Write(buffer, ct);
+        }
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Reads a single security-handshake frame from the data-segment
+    /// ring. Adapter matching <see cref="IShmSecurityHandshaker"/>'s
+    /// reader delegate signature.
+    /// </summary>
+    private static Task<(FrameType Type, ReadOnlyMemory<byte> Payload)> ReadHandshakeFrameAsync(ShmRing ring, CancellationToken ct)
+    {
+        var headerBuffer = new byte[ShmConstants.FrameHeaderSize];
+        ReadExact(ring, headerBuffer, ct);
+        var header = FrameHeader.Parse(headerBuffer);
+
+        if (header.Length > ShmConstants.MinRingCapacity)
+        {
+            // Defend against a hostile peer sending an oversize handshake
+            // frame. The handshake runs on the data segment which has a
+            // wider ring than the control segment, but identity tokens
+            // are spec-bounded to MaxIdentitySize (256 B) and Fail
+            // messages are short — anything over 4 KiB is malformed.
+            BestEffortDrain(ring, header.Length, ct);
+            throw new InvalidDataException(
+                $"Handshake frame payload {header.Length} exceeds maximum {ShmConstants.MinRingCapacity}.");
+        }
+
+        ReadOnlyMemory<byte> payload = ReadOnlyMemory<byte>.Empty;
+        if (header.Length > 0)
+        {
+            var payloadBuffer = new byte[header.Length];
+            ReadExact(ring, payloadBuffer, ct);
+            payload = payloadBuffer;
+        }
+        return Task.FromResult((header.Type, payload));
     }
 
     private Task SendAcceptAsync(string segmentName, CancellationToken ct)
@@ -350,4 +543,17 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
 
         _disposeCts.Dispose();
     }
+}
+
+/// <summary>
+/// Thrown when a control-segment frame has a malformed header (e.g.
+/// oversize <c>Length</c>). The listener's Accept loop catches this and
+/// resynchronizes on the next frame boundary instead of tearing down the
+/// listener; the peer is treated as hostile or out-of-sync. Mirrors
+/// grpc-go-shmem's <c>errMalformedCtlFrame</c> sentinel.
+/// </summary>
+public sealed class MalformedControlFrameException : Exception
+{
+    /// <summary>Creates the exception with the supplied message.</summary>
+    public MalformedControlFrameException(string message) : base(message) { }
 }

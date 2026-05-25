@@ -43,7 +43,9 @@ namespace Grpc.Net.SharedMemory;
 /// - Offset 0x48: closed (uint32) - closed flag (0 open, 1 closed)
 /// - Offset 0x4C: pad (uint32) - padding
 /// - Offset 0x50: maxStreams (uint32) - max concurrent streams
-/// - Offset 0x54-0x7F: reserved (44 bytes) - padding to 128B
+/// - Offset 0x54: openerWakeReady (uint32) - 1 if opener established
+///   eventfd waker (matches Go SegmentHeader.openerWakeReady)
+/// - Offset 0x58-0x7F: reserved (40 bytes) - padding to 128B
 /// </summary>
 [StructLayout(LayoutKind.Explicit, Size = 128)]
 public struct SegmentHeader
@@ -108,7 +110,19 @@ public struct SegmentHeader
     [FieldOffset(0x50)]
     public uint MaxStreams;
 
-    // Offset 0x54-0x7F: Reserved (44 bytes) - implicitly zeroed
+    /// <summary>
+    /// Opener wake-ready flag (Phase 2 cross-process eventfd waker).
+    /// Set to 1 by the opener after it successfully obtains a
+    /// <c>LinuxDataSegWaker</c> via SCM_RIGHTS / same-process stash;
+    /// read by the creator after WaitForClient. When 0 the creator
+    /// drops its own waker so both sides converge on the futex /
+    /// Windows-events fallback, avoiding asymmetric-wake deadlock.
+    /// Matches the layout of Go's SegmentHeader.openerWakeReady.
+    /// </summary>
+    [FieldOffset(0x54)]
+    public uint OpenerWakeReady;
+
+    // Offset 0x58-0x7F: Reserved (40 bytes) - implicitly zeroed
 }
 
 /// <summary>
@@ -122,6 +136,9 @@ public sealed partial class Segment : IDisposable
 {
     private const int ServerReadyOffset = 0x40;
     private const int ClientReadyOffset = 0x44;
+#if LINUX
+    private const int OpenerWakeReadyOffset = 0x54;
+#endif
 
     private readonly MemoryMappedFile _mappedFile;
     private readonly MemoryMappedViewAccessor _accessor;
@@ -133,6 +150,16 @@ public sealed partial class Segment : IDisposable
     private int _disposed;
     private int _headerWaitCount;
     private FileStream? _lockFileStream;
+#if LINUX
+    // Per-data-segment eventfd waker (Phase 2 cross-process). Owned
+    // here so both rings share the same kernel fds and lifetime is
+    // tied to Segment.Dispose. Null when the eventfd path is
+    // disabled, unavailable, or dropped by finalizeDataSegWaker.
+    private Synchronization.LinuxDataSegWaker? _eventfdWaker;
+    // Cross-process FD-pass server (creator only). Null if the
+    // eventfd path is off or the bind / chmod failed.
+    private Synchronization.LinuxFdPassServer? _fdPassServer;
+#endif
 
     /// <summary>Gets the segment name.</summary>
     public string Name { get; }
@@ -171,7 +198,14 @@ public sealed partial class Segment : IDisposable
         ulong ringAOffset,
         ulong ringACapacity,
         ulong ringBOffset,
-        ulong ringBCapacity)
+        ulong ringBCapacity,
+#if LINUX
+        Synchronization.LinuxDataSegWaker? eventfdWaker = null,
+        Synchronization.LinuxFdPassServer? fdPassServer = null)
+#else
+        object? eventfdWaker = null,
+        object? fdPassServer = null)
+#endif
     {
         Name = name;
         FilePath = filePath;
@@ -181,6 +215,10 @@ public sealed partial class Segment : IDisposable
         _memory = memoryManager.Memory;
         _isServer = isServer;
         Size = memoryManager.Length;
+#if LINUX
+        _eventfdWaker = eventfdWaker;
+        _fdPassServer = fdPassServer;
+#endif
 
         // Create ring sync primitives
         IRingSync? syncA = null;
@@ -188,12 +226,19 @@ public sealed partial class Segment : IDisposable
 
         try
         {
-            if (OperatingSystem.IsWindows())
+#if LINUX
+            if (eventfdWaker != null)
             {
-                syncA = RingSyncFactory.Create(name, "A", isServer, memoryManager, (int)ringAOffset);
-                syncB = RingSyncFactory.Create(name, "B", isServer, memoryManager, (int)ringBOffset);
+                // Both rings on this side share the same waker; a
+                // wake from the peer just means "check your ring
+                // state". finalizeDataSegWaker may later replace these
+                // with futex if the peer doesn't have eventfd.
+                syncA = new Synchronization.LinuxEventfdRingSync(eventfdWaker);
+                syncB = new Synchronization.LinuxEventfdRingSync(eventfdWaker);
             }
-            else if (OperatingSystem.IsLinux())
+            else
+#endif
+            if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux())
             {
                 syncA = RingSyncFactory.Create(name, "A", isServer, memoryManager, (int)ringAOffset);
                 syncB = RingSyncFactory.Create(name, "B", isServer, memoryManager, (int)ringBOffset);
@@ -330,8 +375,51 @@ public sealed partial class Segment : IDisposable
         // Flush to ensure visibility to other processes
         accessor.Flush();
 
+#if LINUX
+        // Phase 2 eventfd wake: when the env var is set, allocate a
+        // per-segment pair of eventfds. The creator keeps one waker;
+        // the same-process opener will claim the other via
+        // EventfdRegistry.TryClaimOpener, and cross-process openers
+        // will receive duplicates over SCM_RIGHTS via the per-segment
+        // Unix-domain socket served by LinuxFdPassServer.
+        Synchronization.LinuxDataSegWaker? creatorWaker = null;
+        Synchronization.LinuxFdPassServer? fdPassServer = null;
+        if (EventfdWakeEnabled)
+        {
+            try
+            {
+                var (waker, stash) = Synchronization.EventfdRegistry.AllocateAndStash(name);
+                creatorWaker = waker;
+                fdPassServer = Synchronization.LinuxFdPassServer.Start(filePath, stash);
+                if (fdPassServer == null)
+                {
+                    // Cross-process clients can't reach us; keep the
+                    // waker for same-process consumers via the stash.
+                    // (Acceptable: same-process tests still get the
+                    // perf win; cross-process opens fall back to
+                    // futex via OpenerWakeReady=false.)
+                }
+            }
+            catch
+            {
+                // Allocation failure (kernel ENFILE etc.): drop back
+                // to futex by leaving the stash empty.
+                if (creatorWaker != null)
+                {
+                    Synchronization.EventfdRegistry.Drop(name);
+                    creatorWaker.Dispose();
+                    creatorWaker = null;
+                }
+            }
+        }
+
+        return new Segment(name, filePath, mappedFile, accessor, memoryManager, true,
+            ringAOffset, ringCapacity, ringBOffset, ringCapacity,
+            eventfdWaker: creatorWaker, fdPassServer: fdPassServer);
+#else
         return new Segment(name, filePath, mappedFile, accessor, memoryManager, true,
             ringAOffset, ringCapacity, ringBOffset, ringCapacity);
+#endif
     }
 
     /// <summary>
@@ -483,9 +571,62 @@ public sealed partial class Segment : IDisposable
             throw;
         }
 
+        return CreateOpenedSegment(name, filePath, mappedFile, accessor, memoryManager, header);
+    }
+
+#if LINUX
+    private static Segment CreateOpenedSegment(
+        string name,
+        string filePath,
+        MemoryMappedFile mappedFile,
+        MemoryMappedViewAccessor accessor,
+        MappedMemoryManager memoryManager,
+        SegmentHeader header)
+    {
+        // Phase 2 eventfd wake: try the same-process stash first
+        // (zero-syscall fast path); on miss, attempt cross-process
+        // SCM_RIGHTS handoff. On any failure leave the waker null so
+        // the rings fall back to futex.
+        Synchronization.LinuxDataSegWaker? openerWaker = null;
+        if (EventfdWakeEnabled)
+        {
+            openerWaker = Synchronization.EventfdRegistry.TryClaimOpener(name);
+            if (openerWaker == null)
+            {
+                var fds = Synchronization.LinuxFdPassClient.TryReceive(filePath);
+                if (fds != null && fds.Length == 2)
+                {
+                    // fds[0] = creator's recv (our peer); fds[1] = our recv.
+                    openerWaker = new Synchronization.LinuxDataSegWaker(
+                        myReadFd: fds[1], peerReadFd: fds[0], ownsFds: true);
+                }
+            }
+        }
+
+        // Publish the opener's wake status BEFORE the rings go live.
+        // The creator reads this in FinalizeDataSegWaker after
+        // WaitForClient and drops its own waker if we couldn't
+        // establish one — ensures both sides converge on the same
+        // wake primitive (avoids asymmetric-wake deadlock).
+        WriteOpenerWakeReady(memoryManager, openerWaker != null);
+
+        return new Segment(name, filePath, mappedFile, accessor, memoryManager, false,
+            header.RingAOffset, header.RingACapacity, header.RingBOffset, header.RingBCapacity,
+            eventfdWaker: openerWaker, fdPassServer: null);
+    }
+#else
+    private static Segment CreateOpenedSegment(
+        string name,
+        string filePath,
+        MemoryMappedFile mappedFile,
+        MemoryMappedViewAccessor accessor,
+        MappedMemoryManager memoryManager,
+        SegmentHeader header)
+    {
         return new Segment(name, filePath, mappedFile, accessor, memoryManager, false,
             header.RingAOffset, header.RingACapacity, header.RingBOffset, header.RingBCapacity);
     }
+#endif
 
     /// <summary>
     /// Generates the path to the shared memory backing file.
@@ -560,6 +701,106 @@ public sealed partial class Segment : IDisposable
         return ReadSegmentHeader(_memory.Span);
     }
 
+    // ===== Phase 2 eventfd wake (Linux only) =====
+
+    /// <summary>
+    /// Process-wide gate for the eventfd wake path. Honoured at segment
+    /// creation / open time: when set, the creator allocates a pair of
+    /// eventfds and serves them to cross-process openers via
+    /// <c>SCM_RIGHTS</c> over a per-segment Unix domain socket;
+    /// same-process openers claim the peer fd from
+    /// <see cref="Synchronization.EventfdRegistry"/>.
+    /// </summary>
+    internal static bool EventfdWakeEnabled =>
+        OperatingSystem.IsLinux()
+        && string.Equals(Environment.GetEnvironmentVariable("SHM_EVENTFD_WAKE"), "1", StringComparison.Ordinal);
+
+#if LINUX
+    /// <summary>
+    /// Persists the opener-side wake-readiness flag in the segment
+    /// header at offset <c>0x54</c>. Invoked by the opener BEFORE
+    /// signaling <see cref="SetClientReady"/> so the creator observes
+    /// a stable value when <c>WaitForClient</c> returns.
+    /// </summary>
+    /// <remarks>
+    /// Memory ordering: the kernel <c>SetEvent</c> / <c>Write</c>(eventfd)
+    /// call inside <see cref="SetClientReady"/> provides a full release
+    /// barrier on the writer side, and the matching <c>WaitForEvent</c>
+    /// / <c>Read</c>(eventfd) on the reader side provides an acquire
+    /// barrier. <see cref="Thread.MemoryBarrier"/> is added defensively
+    /// so the contract is explicit even if a future change drops the
+    /// kernel hop (e.g. an in-process fast path).
+    /// </remarks>
+    private static void WriteOpenerWakeReady(MappedMemoryManager mem, bool ready)
+    {
+        var v = ready ? 1u : 0u;
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            mem.Memory.Span[OpenerWakeReadyOffset..(OpenerWakeReadyOffset + sizeof(uint))], v);
+        Thread.MemoryBarrier();
+    }
+
+    /// <summary>
+    /// Reads the opener-side wake-readiness flag from the segment
+    /// header. Used by the creator's <see cref="FinalizeDataSegWaker"/>
+    /// after WaitForClient.
+    /// </summary>
+    /// <remarks>
+    /// See <see cref="WriteOpenerWakeReady"/> for the
+    /// release-on-write / acquire-on-read pairing.
+    /// </remarks>
+    private uint ReadOpenerWakeReady()
+    {
+        Thread.MemoryBarrier();
+        return BinaryPrimitives.ReadUInt32LittleEndian(
+            _memory.Span[OpenerWakeReadyOffset..(OpenerWakeReadyOffset + sizeof(uint))]);
+    }
+
+    /// <summary>
+    /// Resolves the eventfd-waker peer state. Caller (dialer after
+    /// connect-response, listener after Accept) invokes this AFTER the
+    /// opposite side's ready signal so the value is stable. When the
+    /// creator holds a waker but the opener didn't establish one
+    /// (<c>OpenerWakeReady == 0</c>) the creator drops its waker so
+    /// both sides converge on the futex wake path — prevents the
+    /// asymmetric-wake deadlock where one side parks on read(efd)
+    /// while the other only signals via futex.
+    /// </summary>
+    public void FinalizeDataSegWaker()
+    {
+        if (!_isServer) return;            // opener already published before signalling
+        if (_eventfdWaker == null) return;   // we never had a waker; nothing to drop
+
+        if (ReadOpenerWakeReady() != 0)
+        {
+            return; // opener has eventfd too — keep ours
+        }
+
+        DropCreatorWaker();
+    }
+
+    private void DropCreatorWaker()
+    {
+        // Pull the stash entry first so a stragger same-process Open
+        // cannot claim a waker we are about to invalidate.
+        Synchronization.EventfdRegistry.Drop(Name);
+
+        var server = _fdPassServer;
+        _fdPassServer = null;
+        server?.Dispose();
+
+        var waker = _eventfdWaker;
+        _eventfdWaker = null;
+        waker?.Dispose();
+
+        // Reinstall a futex-backed sync so the rings keep working.
+        RingA.ReplaceSync(RingSyncFactory.Create(Name, "A", _isServer, _memoryManager, (int)RingA.HeaderOffset));
+        RingB.ReplaceSync(RingSyncFactory.Create(Name, "B", _isServer, _memoryManager, (int)RingB.HeaderOffset));
+    }
+#else
+    /// <summary>No-op on platforms without the eventfd waker.</summary>
+    public void FinalizeDataSegWaker() { }
+#endif
+
     private static void WriteSegmentHeader(Span<byte> buffer, SegmentHeader header)
     {
         var span = buffer.Slice(0, ShmConstants.SegmentHeaderSize);
@@ -581,6 +822,7 @@ public sealed partial class Segment : IDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(span[0x48..0x4C], header.Closed);
         BinaryPrimitives.WriteUInt32LittleEndian(span[0x4C..0x50], header.Pad);
         BinaryPrimitives.WriteUInt32LittleEndian(span[0x50..0x54], header.MaxStreams);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x54..0x58], header.OpenerWakeReady);
     }
 
     private static SegmentHeader ReadSegmentHeader(Span<byte> buffer)
@@ -602,7 +844,8 @@ public sealed partial class Segment : IDisposable
             ClientReady = BinaryPrimitives.ReadUInt32LittleEndian(span[0x44..0x48]),
             Closed = BinaryPrimitives.ReadUInt32LittleEndian(span[0x48..0x4C]),
             Pad = BinaryPrimitives.ReadUInt32LittleEndian(span[0x4C..0x50]),
-            MaxStreams = BinaryPrimitives.ReadUInt32LittleEndian(span[0x50..0x54])
+            MaxStreams = BinaryPrimitives.ReadUInt32LittleEndian(span[0x50..0x54]),
+            OpenerWakeReady = BinaryPrimitives.ReadUInt32LittleEndian(span[0x54..0x58])
         };
     }
 
@@ -1076,6 +1319,29 @@ public sealed partial class Segment : IDisposable
 
         RingA.Dispose();
         RingB.Dispose();
+
+#if LINUX
+        // Phase 2 eventfd-waker teardown (Linux only). Order matters:
+        //   1. Stop the FD-pass server FIRST so no cross-process opener
+        //      can dial in and receive about-to-be-EBADF descriptors.
+        //   2. Close the waker (Dispose writes a wake to MyReadFd so any
+        //      same-process opener parked on Read returns 0, then closes
+        //      the eventfds when ownsFds=true).
+        //   3. Drop the stash so a late same-process Open returns null.
+        var fdPassServer = _fdPassServer;
+        _fdPassServer = null;
+        fdPassServer?.Dispose();
+
+        var waker = _eventfdWaker;
+        _eventfdWaker = null;
+        waker?.Dispose();
+
+        if (_isServer)
+        {
+            Synchronization.EventfdRegistry.Drop(Name);
+        }
+#endif
+
         _memoryManager.Dispose();
         _accessor.Dispose();
         _mappedFile.Dispose();

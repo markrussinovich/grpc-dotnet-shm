@@ -157,6 +157,48 @@ public static class ShmConstants
     /// <summary>Current protocol version.</summary>
     public const uint ProtocolVersion = 1;
 
+    /// <summary>
+    /// Bench-only "strict fair" mode cap on per-frame payload size.
+    /// When env var <c>SHM_FAIR_MAX_FRAME</c> is set to a positive integer
+    /// (typically 16384 to match HTTP/2 spec default
+    /// SETTINGS_MAX_FRAME_SIZE / Go gRPC's spec default), the SHM
+    /// writer caps both the single-frame threshold and multi-frame
+    /// chunk size to this value. This forces a large message to be
+    /// split into multiple frames the same way TCP/UDS gRPC does,
+    /// removing SHM's "single 16 MiB frame" advantage from fair
+    /// comparisons.
+    ///
+    /// Has zero effect when the env var is unset (production default).
+    /// Has no effect on messages smaller than the cap (still single
+    /// frame).
+    /// </summary>
+    public static readonly int FairMaxFramePayload =
+        int.TryParse(Environment.GetEnvironmentVariable("SHM_FAIR_MAX_FRAME"),
+            System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out var v) && v > 0
+            ? v : int.MaxValue;
+
+    /// <summary>
+    /// Bench-only "strict fair" wire-format parity signal (env var
+    /// <c>SHM_FAIR_STREAM_WINDOW</c>, default <see cref="int.MaxValue"/>).
+    /// When set to a positive integer, the SHM transport disables
+    /// HEADERS+DATA+Trailers coalescing on the server (so each H2 frame
+    /// is dispatched separately, mirroring TCP/UDS behaviour) and bypasses
+    /// the single-stream send fast-path.
+    ///
+    /// <b>Does NOT enforce per-stream HTTP/2 flow control.</b> SHM is
+    /// no-WU in all modes (gRFC SHM alignment with grpc-go-shmem v3.4+
+    /// <c>shmNoWU</c>); the ring's <see cref="ShmRing.ReserveWrite"/>
+    /// <c>WaitForSpace</c> is the sole back-pressure primitive. The
+    /// constant value is retained as a threshold input only; its
+    /// numeric magnitude is not used to cap any send window.
+    /// </summary>
+    public static readonly int FairStreamWindow =
+        int.TryParse(Environment.GetEnvironmentVariable("SHM_FAIR_STREAM_WINDOW"),
+            System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out var w) && w > 0
+            ? w : int.MaxValue;
+
     /// <summary>Default ring buffer capacity (64 MiB).</summary>
     public const int DefaultRingCapacity = 64 * 1024 * 1024;
 
@@ -164,18 +206,9 @@ public static class ShmConstants
     public const uint DefaultMaxStreams = 100;
 
     /// <summary>
-    /// Initial flow-control window size.
-    /// HTTP/2 over TCP uses 65 535, but shared memory is a local, high-bandwidth
-    /// transport so we use 32 MiB. Messages larger than the window are
-    /// automatically chunked by the flow-control layer in ShmGrpcStream,
-    /// so the window does not limit the maximum message size.
-    /// </summary>
-    /// <summary>
-    /// Initial send window per stream.
-    /// Set to half the default ring capacity so that at least one max-frame-payload
-    /// chunk can be sent immediately. Larger messages are chunked at the
-    /// SendMessageAsync layer, with each chunk independently consuming window
-    /// and triggering WindowUpdate from the receiver.
+    /// Legacy constant retained for H2 codec parity. SHM is no-WU in
+    /// all modes — the per-stream send window is not enforced and the
+    /// ring's <c>WaitForSpace</c> is the sole back-pressure primitive.
     /// </summary>
     public const int InitialWindowSize = 32 * 1024 * 1024;
 
@@ -183,11 +216,9 @@ public static class ShmConstants
     public const int MaxWindowSize = int.MaxValue;
 
     /// <summary>
-    /// Threshold for batching stream-level WINDOW_UPDATE frames.
-    /// Updates are accumulated and flushed when the pending bytes exceed
-    /// this value, or when the stream receives HalfClose / Trailers.
-    /// Set to InitialWindowSize / 4 so the sender's window is replenished
-    /// well before it is exhausted.
+    /// Legacy threshold retained for H2 codec parity. SHM never emits
+    /// <c>WINDOW_UPDATE</c> frames in any mode (gRFC SHM no-WU
+    /// alignment with grpc-go-shmem v3.4+ <c>shmNoWU</c>).
     /// </summary>
     public const uint WindowUpdateBatchThreshold = (uint)(InitialWindowSize / 4);
 

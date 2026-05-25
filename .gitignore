@@ -39,3 +39,49 @@ binaries/
 build/feed
 .dotnet/
 *.log.txt
+
+# === SHM transport: bench output, traces, scratch logs ===
+# (Append-only; do not edit lines above.)
+# Benchmark output:
+benchmark-shm/out/
+benchmark-shm/ringbench/out_*/
+benchmark-shm/ringbench/benchmark-shm/
+benchmark-shm/ringbench/bug_repro/
+benchmark-shm/__pycache__/
+
+# Scratch logs / trace files (workflow leftovers):
+*.nettrace
+*.speedscope.json
+bench_*.txt
+bench_*.log
+bench_*.json
+baseline_bench_*.txt
+_run_*.log
+_run_*.ps1
+_*.txt
+_*.log
+exit*.txt
+lastcode.txt
+sec_result.txt
+blob1m_chk.txt
+interop_run.log
+shm-requeststreamtests.log
+
+# Draft markdown notes left at repo root:
+SHM_*.md
+
+# Interop scaffold build artifacts (committed sources, not binaries):
+test/InteropTests.SharedMemory/go/server.exe
+test/InteropTests.SharedMemory/go/client.exe
+test/InteropTests.SharedMemory/go/**/*.exe
+test/InteropTests.SharedMemory/go/**/server_linux
+test/InteropTests.SharedMemory/go/**/client_linux
+test/InteropTests.SharedMemory/go/**/*_new.exe
+
+# One-off probe / scratch directories used during perf investigation:
+eventfd_probe/
+test_futex/
+
+# Stray VPN / IDE leftovers:
+azurevpnconfig*.xml
+

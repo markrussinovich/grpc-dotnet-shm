@@ -50,6 +50,14 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
     private readonly bool _useWaitOnAddress;
     private bool _disposed;
 
+    // Cached raw HANDLE values for direct-syscall hot path; see ctor.
+    private readonly IntPtr _dataEventNative;
+    private readonly IntPtr _spaceEventNative;
+    private readonly IntPtr _contigEventNative;
+    private readonly IntPtr _dataFallbackNative;
+    private readonly IntPtr _spaceFallbackNative;
+    private readonly IntPtr _contigFallbackNative;
+
     public WindowsRingSync(string segmentName, string ringId, bool isServer)
     {
         _useWaitOnAddress = false;
@@ -89,6 +97,18 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
         _dataEvent = _dataWaitHandle.SafeWaitHandle;
         _spaceEvent = _spaceWaitHandle.SafeWaitHandle;
         _contigEvent = _contigWaitHandle.SafeWaitHandle;
+
+        // Cache raw HANDLEs so the no-spin hot path can do direct
+        // P/Invoke WaitForSingleObject / SetEvent without allocating
+        // a WaitHandle[] per call. We keep AddRef'd SafeWaitHandles via
+        // the EventWaitHandle fields, so the raw handles stay valid for
+        // the life of this WindowsRingSync.
+        _dataEventNative = _dataEvent.DangerousGetHandle();
+        _spaceEventNative = _spaceEvent.DangerousGetHandle();
+        _contigEventNative = _contigEvent.DangerousGetHandle();
+        _dataFallbackNative = _dataWaitHandleFallback?.SafeWaitHandle.DangerousGetHandle() ?? IntPtr.Zero;
+        _spaceFallbackNative = _spaceWaitHandleFallback?.SafeWaitHandle.DangerousGetHandle() ?? IntPtr.Zero;
+        _contigFallbackNative = _contigWaitHandleFallback?.SafeWaitHandle.DangerousGetHandle() ?? IntPtr.Zero;
     }
 
     public unsafe WindowsRingSync(string segmentName, string ringId, bool isServer, MappedMemoryManager memoryManager, int ringHeaderOffset)
@@ -109,34 +129,76 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
         _contigSeqPtr = memoryManager.GetUInt32Pointer(ringHeaderOffset + ContigSeqOffset);
     }
 
+    /// <summary>
+    /// Hard requirement (matches the Linux eventfd path): never spin on
+    /// cross-process shared-memory sequence counters before blocking.
+    /// <see cref="ShmRing"/> will skip its adaptive outer spin and call
+    /// <see cref="WaitForData"/>/<see cref="WaitForSpace"/>/<see cref="WaitForContig"/>
+    /// directly, which invoke <see cref="WaitHandle.WaitAny(WaitHandle[], int, bool)"/>
+    /// on the named auto-reset event. Each wake therefore costs one
+    /// kernel transition (~5-10 µs on Windows) plus the signal write
+    /// (~3-5 µs), but the system never busy-polls shared memory.
+    ///
+    /// Env-var kill-switch <c>SHM_WIN_ALLOW_SPIN=1</c> restores the legacy
+    /// ShmRing-outer spin for A/B benchmarking. Default OFF.
+    /// </summary>
+    public bool SkipSpinWait => !s_allowSpin;
+
+    private static readonly bool s_allowSpin =
+        string.Equals(Environment.GetEnvironmentVariable("SHM_WIN_ALLOW_SPIN"),
+            "1", StringComparison.Ordinal);
+
+    // Diagnostic counters (env-gated SHM_WIN_DIAG=1) for understanding
+    // which syscalls fire during the no-spin hot path.
+    private static readonly bool s_diag =
+        string.Equals(Environment.GetEnvironmentVariable("SHM_WIN_DIAG"),
+            "1", StringComparison.Ordinal);
+    private static long s_signalDataCalls;
+    private static long s_signalSpaceCalls;
+    private static long s_signalContigCalls;
+    private static long s_waitDataCalls;
+    private static long s_waitSpaceCalls;
+    private static long s_waitContigCalls;
+
+    public static (long SigData, long SigSpace, long SigContig, long WaitData, long WaitSpace, long WaitContig) GetWinDiag()
+        => (Volatile.Read(ref s_signalDataCalls),
+            Volatile.Read(ref s_signalSpaceCalls),
+            Volatile.Read(ref s_signalContigCalls),
+            Volatile.Read(ref s_waitDataCalls),
+            Volatile.Read(ref s_waitSpaceCalls),
+            Volatile.Read(ref s_waitContigCalls));
+
     public bool WaitForData(uint expectedSeq, TimeSpan? timeout, CancellationToken cancellationToken)
     {
+        if (s_diag) Interlocked.Increment(ref s_waitDataCalls);
         if (_useWaitOnAddress)
         {
             return WaitOnAddressLoop(_dataSeqPtr, expectedSeq, timeout, cancellationToken);
         }
 
-        return WaitForEvent(_dataWaitHandle, _dataWaitHandleFallback, timeout, cancellationToken);
+        return WaitForEventFast(_dataEventNative, _dataFallbackNative, timeout, cancellationToken);
     }
 
     public bool WaitForSpace(uint expectedSeq, TimeSpan? timeout, CancellationToken cancellationToken)
     {
+        if (s_diag) Interlocked.Increment(ref s_waitSpaceCalls);
         if (_useWaitOnAddress)
         {
             return WaitOnAddressLoop(_spaceSeqPtr, expectedSeq, timeout, cancellationToken);
         }
 
-        return WaitForEvent(_spaceWaitHandle, _spaceWaitHandleFallback, timeout, cancellationToken);
+        return WaitForEventFast(_spaceEventNative, _spaceFallbackNative, timeout, cancellationToken);
     }
 
     public bool WaitForContig(uint expectedSeq, TimeSpan? timeout, CancellationToken cancellationToken)
     {
+        if (s_diag) Interlocked.Increment(ref s_waitContigCalls);
         if (_useWaitOnAddress)
         {
             return WaitOnAddressLoop(_contigSeqPtr, expectedSeq, timeout, cancellationToken);
         }
 
-        return WaitForEvent(_contigWaitHandle, _contigWaitHandleFallback, timeout, cancellationToken);
+        return WaitForEventFast(_contigEventNative, _contigFallbackNative, timeout, cancellationToken);
     }
 
     private static bool WaitForEvent(EventWaitHandle handle, EventWaitHandle? fallbackHandle, TimeSpan? timeout, CancellationToken cancellationToken)
@@ -182,6 +244,41 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
         }
     }
 
+    /// <summary>
+    /// Fast no-spin kernel wait using direct Win32 P/Invoke. Cached
+    /// native HANDLE values avoid the per-call <c>WaitHandle[]</c>
+    /// allocation in <c>WaitHandle.WaitAny</c> as well as the managed
+    /// wait synchronization machinery. Saves ~2-5 µs per kernel wait
+    /// on the hot ping-pong path.
+    /// </summary>
+    private unsafe bool WaitForEventFast(IntPtr nativeHandle, IntPtr nativeFallback, TimeSpan? timeout, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested) return false;
+        var timeoutMs = timeout.HasValue
+            ? (uint)timeout.Value.TotalMilliseconds
+            : INFINITE;
+
+        // No fallback + no CT: single-handle WaitForSingleObject.
+        if (nativeFallback == IntPtr.Zero && !cancellationToken.CanBeCanceled)
+        {
+            return WaitForSingleObject(nativeHandle, timeoutMs) == WAIT_OBJECT_0;
+        }
+
+        IntPtr* handles = stackalloc IntPtr[3];
+        int count = 0;
+        handles[count++] = nativeHandle;
+        if (nativeFallback != IntPtr.Zero) handles[count++] = nativeFallback;
+        if (cancellationToken.CanBeCanceled)
+        {
+            handles[count++] = cancellationToken.WaitHandle.SafeWaitHandle.DangerousGetHandle();
+        }
+
+        var result = WaitForMultipleObjects((uint)count, handles, false, timeoutMs);
+        if (result == WAIT_OBJECT_0) return true;
+        if (nativeFallback != IntPtr.Zero && result == 1) return true;
+        return false;
+    }
+
     public void SignalData()
     {
         if (_useWaitOnAddress)
@@ -190,8 +287,9 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
             return;
         }
 
-        _dataWaitHandle.Set();
-        _dataWaitHandleFallback?.Set();
+        if (s_diag) Interlocked.Increment(ref s_signalDataCalls);
+        SetEvent(_dataEventNative);
+        if (_dataFallbackNative != IntPtr.Zero) SetEvent(_dataFallbackNative);
     }
 
     public void SignalSpace()
@@ -202,8 +300,9 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
             return;
         }
 
-        _spaceWaitHandle.Set();
-        _spaceWaitHandleFallback?.Set();
+        if (s_diag) Interlocked.Increment(ref s_signalSpaceCalls);
+        SetEvent(_spaceEventNative);
+        if (_spaceFallbackNative != IntPtr.Zero) SetEvent(_spaceFallbackNative);
     }
 
     public void SignalContig()
@@ -214,8 +313,42 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
             return;
         }
 
-        _contigWaitHandle.Set();
-        _contigWaitHandleFallback?.Set();
+        if (s_diag) Interlocked.Increment(ref s_signalContigCalls);
+        SetEvent(_contigEventNative);
+        if (_contigFallbackNative != IntPtr.Zero) SetEvent(_contigFallbackNative);
+    }
+
+    /// <summary>
+    /// Atomic SignalData+Wait via <c>SignalObjectAndWait</c>. Saves
+    /// one kernel transition per RT on the writer-loop's
+    /// "signal-then-wait" hot path. <paramref name="localWaitHandleNative"/>
+    /// must be a kernel handle (e.g. <see cref="EventWaitHandle"/>'s
+    /// <see cref="SafeWaitHandle.DangerousGetHandle"/>) — Slim or
+    /// pure-managed primitives won't work.
+    /// </summary>
+    public bool TrySignalDataAndWaitForLocal(IntPtr localWaitHandleNative, TimeSpan? timeout, CancellationToken cancellationToken)
+    {
+        if (_useWaitOnAddress)
+        {
+            // No combined primitive for WaitOnAddress; fall back.
+            WakeByAddressSingle(_dataSeqPtr);
+            return false;
+        }
+        if (localWaitHandleNative == IntPtr.Zero) return false;
+        if (cancellationToken.IsCancellationRequested) return false;
+
+        if (s_diag) Interlocked.Increment(ref s_signalDataCalls);
+
+        // Fallback signal must still fire to wake cross-session
+        // listeners; SAW only handles the primary event.
+        if (_dataFallbackNative != IntPtr.Zero) SetEvent(_dataFallbackNative);
+
+        var ms = timeout.HasValue
+            ? (uint)Math.Max(0, (int)timeout.Value.TotalMilliseconds)
+            : INFINITE;
+        var result = SignalObjectAndWait(_dataEventNative, localWaitHandleNative, ms, false);
+        if (s_diag) Interlocked.Increment(ref s_waitDataCalls);
+        return result == WAIT_OBJECT_0;
     }
 
     public void Dispose()
@@ -323,6 +456,36 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
 
     [LibraryImport("api-ms-win-core-synch-l1-2-0.dll")]
     private static unsafe partial void WakeByAddressSingle(void* address);
+
+    // Fast-path Win32 synchronization P/Invokes. The .NET WaitHandle wrapper
+    // allocates a WaitHandle[] per WaitAny call and goes through the managed
+    // wait synchronization machinery. For the no-spin SHM hot path that's
+    // ~2-5 µs of overhead per kernel wait that we don't need.
+    //
+    // We bypass it: cache SafeWaitHandle native handles in IntPtr fields and
+    // call WaitForSingleObject / WaitForMultipleObjects directly. The handles
+    // stay valid for the lifetime of WindowsRingSync (until Dispose).
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    private static partial uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    private static unsafe partial uint WaitForMultipleObjects(uint nCount, IntPtr* lpHandles, [MarshalAs(UnmanagedType.Bool)] bool bWaitAll, uint dwMilliseconds);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetEvent(IntPtr hEvent);
+
+    /// <summary>
+    /// SignalObjectAndWait: atomically signal one synchronization object
+    /// and wait on another in a single syscall. Used by ping-pong hot
+    /// paths to collapse the typical "Signal peer; Wait for response"
+    /// 2-syscall sequence into 1. Saves ~3-5µs per RT on Windows.
+    /// </summary>
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    private static partial uint SignalObjectAndWait(IntPtr hObjectToSignal, IntPtr hObjectToWaitOn, uint dwMilliseconds, [MarshalAs(UnmanagedType.Bool)] bool bAlertable);
+
+    private const uint INFINITE = 0xFFFFFFFF;
+    private const uint WAIT_OBJECT_0 = 0;
 }
 
 #endif
