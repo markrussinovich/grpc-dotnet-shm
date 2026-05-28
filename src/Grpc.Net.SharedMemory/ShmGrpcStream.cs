@@ -95,6 +95,20 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     // per-frame wakes proceed normally to avoid starving the response.
     private int _pendingInlineBatch; // 0=closed, 1=open
 
+    // Client-unary headers staging (next-PR client-side coalesce path).
+    // ShmControlHandler.SendOnStreamAsync calls StageRequestHeaders for
+    // Unary content types instead of sending immediately. The staged
+    // payload is encoded once and held in a pooled buffer; the body-write
+    // path (ShmGrpcRequestStream.WriteSerializedMessageAsync) reads
+    // HasStagedHeaders and, if the protobuf body fits in one wrap-safe
+    // H2 DATA frame, writes Headers + DATA(END_STREAM) under one inline
+    // batch -> 1 SignalData wake for the whole request. If the body is
+    // too big or non-protobuf, FlushStagedHeadersAsync sends the staged
+    // Headers via the existing queued path (today's behavior preserved).
+    private byte[]? _stagedHeadersPayload;
+    private int _stagedHeadersPayloadLength;
+    private int _stagedHeadersConsumed; // 0=available, 1=already sent or aborted
+
     // Diagnostic counters for the wake-coalescing path. Static across
     // all streams so the bench can read them via reflection.
     private static long s_coalesceOpened;
@@ -585,6 +599,139 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             ArrayPool<byte>.Shared.Return(payload);
         }
+    }
+
+    /// <summary>
+    /// Encodes Unary request headers and stages them in a pooled buffer
+    /// WITHOUT writing to the ring. Used by <c>ShmControlHandler.SendOnStreamAsync</c>
+    /// when the request content is a known-Unary <c>PushUnaryContent</c>:
+    /// the body-write path (<c>ShmGrpcRequestStream.WriteSerializedMessageAsync</c>)
+    /// can then coalesce HEADERS + DATA(END_STREAM) into ONE inline batch
+    /// (single peer SignalData wake) if the protobuf body fits in one
+    /// wrap-safe H2 DATA frame.
+    /// </summary>
+    /// <remarks>
+    /// MUST be followed by either <see cref="FlushStagedHeadersAsync"/>
+    /// (fall-back: sends Headers separately) OR an inline coalesced send
+    /// via <see cref="WriteStagedHeadersInline"/>. <c>Dispose</c>
+    /// defensively returns any unflushed staged buffer to the pool to
+    /// avoid a leak if the caller fails to do either.
+    /// </remarks>
+    internal void StageRequestHeaders(string method, string authority, Metadata? metadata = null, DateTime? deadline = null)
+    {
+        ThrowIfDisposed();
+        if (!IsClientStream)
+            throw new InvalidOperationException("Only client can stage request headers");
+        if (_requestHeaders != null)
+            throw new InvalidOperationException("Request headers already sent or staged");
+
+        _requestHeaders = new HeadersV1
+        {
+            Version = 1,
+            HeaderType = 0, // client-initial
+            Method = method,
+            Authority = authority,
+            DeadlineUnixNano = deadline.HasValue
+                ? (ulong)new DateTimeOffset(deadline.Value).ToUnixTimeMilliseconds() * 1_000_000
+                : 0,
+            Metadata = ConvertMetadata(metadata)
+        };
+
+        var (payload, payloadLength) = _requestHeaders.Encode();
+        _stagedHeadersPayload = payload;
+        _stagedHeadersPayloadLength = payloadLength;
+        Volatile.Write(ref _stagedHeadersConsumed, 0);
+    }
+
+    /// <summary>
+    /// True iff <see cref="StageRequestHeaders"/> was called and the
+    /// staged Headers have not yet been written or aborted.
+    /// </summary>
+    internal bool HasStagedHeaders =>
+        Volatile.Read(ref _stagedHeadersConsumed) == 0
+        && _stagedHeadersPayload != null;
+
+    /// <summary>
+    /// Writes the staged Headers frame inline via <paramref name="writer"/>'s
+    /// direct ring-write path. Caller MUST already hold
+    /// <c>writer.TryPauseWriterLoop</c>. The pooled payload buffer is
+    /// returned to <see cref="System.Buffers.ArrayPool{T}"/> after the
+    /// write. No-op if Headers were already consumed (idempotent under
+    /// CAS race with <see cref="FlushStagedHeadersAsync"/>).
+    /// </summary>
+    internal void WriteStagedHeadersInline(ShmFrameWriter writer)
+    {
+        if (Interlocked.Exchange(ref _stagedHeadersConsumed, 1) == 1)
+        {
+            return; // already consumed
+        }
+        var payload = _stagedHeadersPayload;
+        var len = _stagedHeadersPayloadLength;
+        _stagedHeadersPayload = null;
+        if (payload == null) return;
+        try
+        {
+            writer.WriteInlineFrame(FrameType.Headers, StreamId,
+                HeadersFlags.Initial, payload.AsSpan(0, len), default);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(payload);
+        }
+    }
+
+    /// <summary>
+    /// Fall-back: sends the staged Headers via the standard queued send
+    /// path (separate SignalData wake). Used by <c>WriteSerializedMessageAsync</c>
+    /// when the body is too big or non-coalesce-eligible, AND by
+    /// <c>ShmControlHandler.SendOnStreamAsync</c>'s post-body catch-all
+    /// for the no-body Unary case. Idempotent.
+    /// </summary>
+    internal Task FlushStagedHeadersAsync(CancellationToken cancellationToken = default)
+    {
+        if (Interlocked.Exchange(ref _stagedHeadersConsumed, 1) == 1)
+        {
+            return Task.CompletedTask; // already consumed
+        }
+        var payload = _stagedHeadersPayload;
+        var len = _stagedHeadersPayloadLength;
+        _stagedHeadersPayload = null;
+        if (payload == null) return Task.CompletedTask;
+
+        if (len <= 512)
+        {
+            Task task;
+            try
+            {
+                task = SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
+                    payload.AsMemory(0, len), cancellationToken);
+            }
+            catch
+            {
+                ArrayPool<byte>.Shared.Return(payload);
+                throw;
+            }
+            if (task.IsCompletedSuccessfully)
+            {
+                ArrayPool<byte>.Shared.Return(payload);
+                return Task.CompletedTask;
+            }
+            return SendRequestHeadersReturnPoolAsync(task, payload);
+        }
+        return SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
+            payload.AsMemory(0, len), payload, cancellationToken);
+    }
+
+    /// <summary>
+    /// Marks HalfClose as already sent (used by the client-coalesce
+    /// path that emits DATA with H2 END_STREAM flag — there is no
+    /// separate HalfClose frame to send). Subsequent calls to
+    /// <see cref="SendHalfCloseAsync"/> become no-ops via the existing
+    /// <c>_halfCloseSent</c> CAS gate.
+    /// </summary>
+    internal void MarkHalfClosed()
+    {
+        Volatile.Write(ref _halfCloseSent, 1);
     }
 
     /// <summary>Sets the grpc-encoding for response compression.
@@ -1932,6 +2079,21 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             try { _connection.FrameWriter?.EndInlineBatch(); }
             catch { /* best effort */ }
+        }
+
+        // Safety: if StageRequestHeaders was called but neither
+        // WriteStagedHeadersInline nor FlushStagedHeadersAsync ran
+        // (e.g., request cancelled before body write), return the
+        // rented headers buffer to the pool to prevent a leak.
+        if (Interlocked.Exchange(ref _stagedHeadersConsumed, 1) == 0)
+        {
+            var staged = _stagedHeadersPayload;
+            _stagedHeadersPayload = null;
+            if (staged != null)
+            {
+                try { ArrayPool<byte>.Shared.Return(staged); }
+                catch { /* best effort */ }
+            }
         }
 
         _disposeCts.Cancel();

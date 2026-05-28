@@ -107,6 +107,17 @@ public sealed class ShmRing : IDisposable
     // interop reasons).
     private int _localWaitInflight;
 
+    // Process-wide diagnostic counter: how many times any ShmRing has
+    // actually invoked the OS-level SignalData wake (excludes Close()
+    // teardown signals). Used by client-coalesce tests (next PR) to
+    // verify "this Unary RT collapsed N wire frames into ≤1 SignalData".
+    // Increment paths: Write(), CommitWrite(), EndBatchWrite() — the
+    // three steady-state SignalData emission sites. Read via
+    // <see cref="GetSignalDataCountForTest"/>.
+    private static long s_signalDataCount;
+
+    internal static long GetSignalDataCountForTest() => Volatile.Read(ref s_signalDataCount);
+
     // Adaptive spin state
     private int _dataSpinCutoff = ShmConstants.SpinIterationsDefault;
     private int _spaceSpinCutoff = ShmConstants.SpinIterationsDefault;
@@ -762,6 +773,7 @@ public sealed class ShmRing : IDisposable
                     Interlocked.Increment(ref header.DataSeq);
                     if (_batchWriteDepth == 0 && Volatile.Read(ref header.DataWaiters) > 0)
                     {
+                        Interlocked.Increment(ref s_signalDataCount);
                         _sync?.SignalData();
                     }
                 }
@@ -957,6 +969,7 @@ public sealed class ShmRing : IDisposable
             Interlocked.Increment(ref header.DataSeq);
             if (_batchWriteDepth == 0 && Volatile.Read(ref header.DataWaiters) > 0)
             {
+                Interlocked.Increment(ref s_signalDataCount);
                 _sync?.SignalData();
             }
         }
@@ -981,6 +994,7 @@ public sealed class ShmRing : IDisposable
             ref var header = ref GetHeader();
             if (Volatile.Read(ref header.DataWaiters) > 0)
             {
+                Interlocked.Increment(ref s_signalDataCount);
                 _sync?.SignalData();
             }
         }

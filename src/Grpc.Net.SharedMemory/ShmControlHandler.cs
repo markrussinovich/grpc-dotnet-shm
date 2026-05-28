@@ -232,24 +232,39 @@ public sealed class ShmControlHandler : HttpMessageHandler
         var metadata = ExtractMetadata(request.Headers);
         var deadline = ExtractDeadline(request.Headers);
 
-        // Unary content-type detection (for diagnostic counters only;
-        // client-side wake-coalescing was removed after GPT-5.5 review
-        // F2 — the only safe gate required request.Content.Headers
-        // .ContentLength, which gRPC.NET's PushUnaryContent declines to
-        // expose (TryComputeLength returns false). To reintroduce real
-        // client-side coalescing, defer the BeginInlineBatch from
-        // Headers to body-write time — either via a friend-accessor on
-        // PushUnaryContent's serialized size, or via Grpc.Net.Client
-        // cooperation. The server-side HEADERS+DATA+Trailers coalesce
-        // path remains active (see ShmGrpcServer.UnaryHandler).
+        // Unary content-type detection. For known Unary content types
+        // (PushUnaryContent / UnaryContent / WinHttpUnaryContent in
+        // grpc-dotnet) we STAGE the request Headers instead of sending
+        // them immediately. The body-write path inside
+        // ShmGrpcRequestStream.WriteSerializedMessageAsync can then
+        // coalesce HEADERS + DATA(END_STREAM) into a single inline
+        // batch -> ONE peer SignalData wake covering the entire request
+        // (vs 3 wakes today: Headers + Data + HalfClose). The size gate
+        // is the SAME wrap-safe CanCoalesceInlineMessage threshold used
+        // by the server-side coalesce path on this branch.
+        //
+        // For streaming content (PushStreamContent etc.) we keep the
+        // today's behaviour: send Headers eagerly so the server can
+        // start processing as soon as the first DATA arrives, not after
+        // the client has flushed its body.
         var contentTypeName = request.Content?.GetType().Name;
         var isUnary = contentTypeName != null
             && (contentTypeName.StartsWith("PushUnaryContent", StringComparison.Ordinal)
-                || contentTypeName.StartsWith("UnaryContent", StringComparison.Ordinal));
+                || contentTypeName.StartsWith("UnaryContent", StringComparison.Ordinal)
+                || contentTypeName.StartsWith("WinHttpUnaryContent", StringComparison.Ordinal));
         if (isUnary) Interlocked.Increment(ref s_unaryRequests);
         else Interlocked.Increment(ref s_streamingRequests);
 
-        await stream.SendRequestHeadersAsync(method, authority, metadata, deadline, coalesceWithHalfClose: false).ConfigureAwait(false);
+        if (isUnary)
+        {
+            // Defer Headers wire send; body-write coalesce path may consume
+            // the staged Headers under the same inline batch.
+            stream.StageRequestHeaders(method, authority, metadata, deadline);
+        }
+        else
+        {
+            await stream.SendRequestHeadersAsync(method, authority, metadata, deadline, coalesceWithHalfClose: false).ConfigureAwait(false);
+        }
 
         if (request.Content != null)
         {
@@ -258,6 +273,13 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
         else
         {
+            // No-body Unary: flush any staged headers (coalesce path
+            // never ran), then HalfClose. For streaming with no body the
+            // staged-headers branch above was skipped.
+            if (stream.HasStagedHeaders)
+            {
+                await stream.FlushStagedHeadersAsync(cancellationToken).ConfigureAwait(false);
+            }
             await stream.SendHalfCloseAsync().ConfigureAwait(false);
         }
 
@@ -324,6 +346,17 @@ public sealed class ShmControlHandler : HttpMessageHandler
         try
         {
             await content.CopyToAsync(writeStream, cancellationToken).ConfigureAwait(false);
+            // Safety: if the body write completed but did NOT consume
+            // the staged Headers (e.g., the marshaller didn't take the
+            // IDirectMessageWriter fast path, or the user supplied a
+            // custom HttpContent that calls Stream.WriteAsync directly),
+            // flush the staged Headers now so the peer sees them BEFORE
+            // HalfClose. Without this guard, the peer would observe a
+            // HalfClose on a stream with no Headers => protocol error.
+            if (stream.HasStagedHeaders)
+            {
+                await stream.FlushStagedHeadersAsync(cancellationToken).ConfigureAwait(false);
+            }
             await stream.SendHalfCloseAsync().ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -984,6 +1017,69 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
             if (writer != null)
             {
                 var size = protoMsg.CalculateSize();
+
+                // Client-coalesce path (next-PR optimisation):
+                //
+                // When ShmControlHandler.SendOnStreamAsync detected a
+                // Unary-shaped request (PushUnaryContent / UnaryContent /
+                // WinHttpUnaryContent) it called StageRequestHeaders
+                // instead of SendRequestHeadersAsync, deferring the
+                // Headers wire write to right here. If the protobuf
+                // body fits in ONE wrap-safe H2 DATA frame AND the
+                // size is below the per-call latency cap, we open one
+                // inline batch and write HEADERS + DATA(END_STREAM)
+                // back-to-back -> 1 SignalData wake for the entire
+                // request (vs 3 wakes today: Headers + Data + HalfClose).
+                //
+                // Two thresholds:
+                //   - writer.CanCoalesceInlineMessage(5 + size) is the
+                //     correctness gate (wrap-safe cap/8 from PR #21).
+                //   - CoalesceLatencyCapBytes is a per-call blast-radius
+                //     cap: even if cap/8 = 8 MiB allows a 1 MiB Unary
+                //     to "coalesce", holding the pause for that long
+                //     would starve other concurrent streams' wakes.
+                //     ~64 KiB matches the bench's small-Unary cell
+                //     range where the wake savings (10-15 us) dominate
+                //     over the marginal pause cost.
+                const int CoalesceLatencyCapBytes = 64 * 1024;
+                var lpmFramedSize = 5 + size;
+                if (_shmStream.HasStagedHeaders
+                    && size <= CoalesceLatencyCapBytes
+                    && writer.CanCoalesceInlineMessage(lpmFramedSize)
+                    && writer.TryPauseWriterLoop())
+                {
+                    try
+                    {
+                        writer.BeginInlineBatch();
+                        try
+                        {
+                            _shmStream.WriteStagedHeadersInline(writer);
+                            writer.WriteInlineDirectMultiFrame(
+                                _shmStream.StreamId, size, protoMsg,
+                                MessageFlags.EndStream, default, _shmStream);
+                            _shmStream.MarkHalfClosed();
+                        }
+                        finally
+                        {
+                            writer.EndInlineBatch();
+                        }
+                        return Task.CompletedTask;
+                    }
+                    finally
+                    {
+                        writer.ResumeWriterLoop();
+                    }
+                }
+
+                // Existing fast path: just DATA. If Headers were staged
+                // but coalesce gate failed (too big / pause contended),
+                // flush them via the slow path first to preserve wire
+                // ordering, then fall through to the DATA inline write.
+                if (_shmStream.HasStagedHeaders)
+                {
+                    return WriteFlushHeadersThenMessageAsync(message, serializer, size, protoMsg, cancellationToken);
+                }
+
                 if (writer.TryPauseWriterLoop())
                 {
                     try
@@ -1001,9 +1097,58 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 
         // Standard path: serialize via the provided marshaller delegate
         // into a pooled buffer, then send via TryPause/ExecuteInline/queue.
+        if (_shmStream.HasStagedHeaders)
+        {
+            return WriteFlushHeadersThenSerializedAsync(message, serializer, cancellationToken);
+        }
         var ctx = new DirectWriteSerializationContext(_shmStream);
         serializer(message, ctx);
         return ctx.SendResult(cancellationToken);
+    }
+
+    private async Task WriteFlushHeadersThenMessageAsync<TMessage>(
+        TMessage message,
+        Action<TMessage, Grpc.Core.SerializationContext> serializer,
+        int size,
+        Google.Protobuf.IMessage protoMsg,
+        CancellationToken cancellationToken)
+    {
+        await _shmStream.FlushStagedHeadersAsync(cancellationToken).ConfigureAwait(false);
+
+        // Now re-enter the inline DATA fast path. Recursion-safe because
+        // HasStagedHeaders is now false (Flush consumed it).
+        var writer = _shmStream.Connection.FrameWriter;
+        if (writer != null && writer.TryPauseWriterLoop())
+        {
+            try
+            {
+                writer.WriteInlineDirectMultiFrame(_shmStream.StreamId, size, protoMsg, 0, default, _shmStream);
+                return;
+            }
+            finally
+            {
+                writer.ResumeWriterLoop();
+            }
+        }
+
+        // Fallback to the standard marshaller-driven path (TryPause
+        // contended). Uses the same serializer the caller provided so
+        // DirectWriteSerializationContext correctly reserves the 5-byte
+        // gRPC LPM header at the front of its pooled buffer.
+        var ctx = new DirectWriteSerializationContext(_shmStream);
+        serializer(message, ctx);
+        await ctx.SendResult(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task WriteFlushHeadersThenSerializedAsync<TMessage>(
+        TMessage message,
+        Action<TMessage, Grpc.Core.SerializationContext> serializer,
+        CancellationToken cancellationToken)
+    {
+        await _shmStream.FlushStagedHeadersAsync(cancellationToken).ConfigureAwait(false);
+        var ctx = new DirectWriteSerializationContext(_shmStream);
+        serializer(message, ctx);
+        await ctx.SendResult(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
