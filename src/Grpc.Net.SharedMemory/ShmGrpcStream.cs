@@ -123,13 +123,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     // Env-gated SHM_CHANNEL_INLINE=1: lets the inbound Channel<InboundFrame>
     // run continuations synchronously on the reader thread (skipping
-    // ThreadPool dispatch). Saves ~10-15µs/RT on Windows where the
-    // ThreadPool worker wake is the dominant cost (default OFF preserves
-    // current threading model). See repo/grpc-dotnet-shm-channel-hop-finding.
-    // Risk: with N concurrent streams sharing one connection, the reader
-    // thread is briefly serialized while user continuations run inline —
-    // OK if continuations don't block (typical gRPC) but pathological if
-    // they do. Recommend pairing with concurrent A/B bench before default-on.
+    // ThreadPool dispatch). Saves ~17µs/hop on Windows where the
+    // ThreadPool worker wake dominates the channel hop cost. Default OFF
+    // preserves the current threading model — opt in only after validating
+    // your receive-side continuations are pure async and never block
+    // synchronously (sync waits would stall the reader thread and
+    // serialize concurrent streams). See repo/grpc-dotnet-shm-channel-hop-finding.
     //
     // CRITICAL incompatibility: when strict-fair forces a small
     // SHM_FAIR_MAX_FRAME (e.g. 16384), large messages get split across
@@ -137,15 +136,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     // chunk synchronously via ReceiveFrameSync → if sync continuations is
     // also on, the user-code MergeFrom runs on the reader thread, blocks
     // on the next chunk, and the reader thread can never read that next
-    // chunk → deadlock. We disable sync continuations when fair frame cap
-    // is in effect so the multi-frame path stays correct. Same disable
-    // happens when SHM_FAIR_STREAM_WINDOW is set (it also activates the
-    // multi-frame path via the chunking threshold).
+    // chunk → deadlock. We disable sync continuations whenever the fair
+    // frame cap is in effect so the multi-frame path stays correct.
     private static readonly bool s_channelInlineContinuations =
         string.Equals(Environment.GetEnvironmentVariable("SHM_CHANNEL_INLINE"),
             "1", StringComparison.Ordinal)
-        && ShmConstants.FairMaxFramePayload == int.MaxValue
-        && ShmConstants.FairStreamWindow == int.MaxValue;
+        && ShmConstants.FairMaxFramePayload == int.MaxValue;
 
 
     /// <summary>
@@ -216,81 +212,240 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         StreamId = streamId;
         _connection = connection;
         IsServerStream = isServerStream;
+        // Inline continuations: enabled when ANY of:
+        //   (a) The connection has the receive striper enabled (default).
+        //       Each stream's inbound frames are dispatched from
+        //       exactly one stripe Thread, so the stripe Thread can
+        //       safely inline-run the user's awaiter continuation
+        //       \u2014 the per-frame ThreadPool dispatch this saves is
+        //       the main win path for the 1000\u00d764B Windows cell
+        //       (where each ThreadPool wake costs ~17 us).
+        //   (b) The explicit per-connection opt-in
+        //       ShmConnection.InlineReceiveContinuations is set
+        //       (the Stage 1A path, gated on caller-promised
+        //       single-active-stream semantics).
+        //   (c) The legacy process-wide env var SHM_CHANNEL_INLINE=1.
+        // Safety guard: when the strict-fair frame cap is in effect,
+        // multi-frame messages activate LazyChainRos's sync-pull path
+        // which would self-deadlock if the same Thread is doing both
+        // chunk delivery and chunk consumption. Disable inline
+        // continuations in that case regardless of opt-in.
+        //
+        // Self-join correctness: when a user awaiter continuation
+        // runs inline on the stripe Thread and that continuation
+        // synchronously calls connection.Dispose, the resulting
+        // ReceiveStriper.Dispose \u2192 Stripe.Dispose path would
+        // self-Join the stripe Thread. ReceiveStriper.Stripe.Dispose
+        // detects this and skips the Join (the stripe Thread exits
+        // on its own once the queue is observed completed).
+        var inlineContinuations = (connection.UseReceiveStriper
+                || s_channelInlineContinuations
+                || connection.InlineReceiveContinuations)
+            && ShmConstants.FairMaxFramePayload == int.MaxValue;
         _inboundFrames = Channel.CreateUnbounded<InboundFrame>(new UnboundedChannelOptions
         {
             SingleReader = true,
             SingleWriter = true,
-            AllowSynchronousContinuations = s_channelInlineContinuations
+            AllowSynchronousContinuations = inlineContinuations
         });
         _disposeCts = new CancellationTokenSource();
         _cancellationCts = new CancellationTokenSource();
         _sendLock = new SemaphoreSlim(1, 1);
-        // Per-stream flow control is disabled in production: the ring's
-        // WaitForSpace provides back-pressure via the SPSC ring buffer.
-        // A separate per-stream window would add cross-process WindowUpdate
-        // round trips, causing throughput to drop from 1.7 GB/s to 0.75 GB/s.
-        //
-        // gRFC SHM no-WU alignment (v3.4+ / grpc-go-shmem shmNoWU):
-        // even when SHM_FAIR_STREAM_WINDOW is set, the per-stream window
-        // is NOT enforced — FairAwaitWindow / FairAddWindow / AccruePeerCredit
-        // are all no-ops. SHM_FAIR_STREAM_WINDOW only opts into the
-        // FairMaxFramePayload chunking for apples-to-apples wire-format
-        // comparison with TCP/HTTP2 (smaller H2 DATA frames). The
-        // SHM ring's WaitForSpace backpressure is the sole flow control.
+        // HTTP/2 per-stream send quota: bytes the peer has granted us via
+        // SETTINGS_INITIAL_WINDOW_SIZE + accumulated WINDOW_UPDATE. Decremented
+        // by ReserveSendQuota on each outbound DATA chunk; refunded on rollback;
+        // grown by AddSendQuota on incoming WU. Sender consults via CAS;
+        // if insufficient, sender blocks on _sendQuotaWake until WU arrives.
+        // Initial value is the H2-spec SETTINGS_INITIAL_WINDOW_SIZE — at SHM
+        // it defaults to ShmConstants.InitialWindowSize (32 MiB).
+        Volatile.Write(ref _sendQuota, ShmConstants.InitialWindowSize);
+        _sendQuotaWake = new ManualResetEventSlim(initialState: false);
+
+        // HTTP/2 per-stream receive flow control. Tracks inbound DATA against
+        // the limit we advertised, accumulates pendingUpdate for limit/4 drip,
+        // and supports SHM-specific stream-level pre-credit at LPM-header
+        // parse via MaybeAdjustAdditive (gRFC SHM v3.4+ MUST). Caller emits
+        // the returned WU through ShmConnection.SendStreamWindowUpdate.
+        InFlow = new Synchronization.InFlow(initialLimit: (uint)ShmConstants.InitialWindowSize);
+    }
+
+    // ============================================================
+    // HTTP/2 send-side flow control (per-stream send window)
+    // ============================================================
+
+    /// <summary>
+    /// Per-stream send-window quota (bytes the peer has granted us).
+    /// Volatile read via <see cref="Interlocked.CompareExchange(ref long, long, long)"/>
+    /// for the CAS reserve path. Refilled by <see cref="AddSendQuota"/>
+    /// on inbound WINDOW_UPDATE; drained by <see cref="TryReserveSendQuota"/>
+    /// on outbound DATA chunks; refunded by <see cref="RefundSendQuota"/>
+    /// when the sender rolls back a reservation it could not commit (e.g.
+    /// ring-write cancellation).
+    /// </summary>
+    private long _sendQuota;
+
+    /// <summary>
+    /// Wake signal for senders blocked on insufficient send quota.
+    /// <see cref="AddSendQuota"/> sets this when quota grows. Senders
+    /// (or the writer task) reset it before re-checking quota to avoid
+    /// missed wakes (see writer-task loop in <see cref="ShmFrameWriter"/>).
+    /// </summary>
+    private readonly ManualResetEventSlim _sendQuotaWake;
+
+    /// <summary>
+    /// Per-stream inbound flow-control state. <see cref="ShmConnection"/>
+    /// invokes <see cref="Synchronization.InFlow.MaybeAdjustAdditive"/>
+    /// on LPM-header parse, <see cref="Synchronization.InFlow.OnData"/>
+    /// on each inbound DATA frame, and <see cref="Synchronization.InFlow.OnRead"/>
+    /// when the application consumes a message.
+    /// </summary>
+    internal Synchronization.InFlow InFlow { get; }
+
+    /// <summary>
+    /// Pending stream-level WINDOW_UPDATE credit awaiting emission.
+    /// Mirrors grpc-go-shmem's <c>s.pendingWU</c> in the lockless
+    /// WU emission path. Producers (the reader Thread's
+    /// <c>OnData</c> drip and the codec's <c>OnMessageStart</c>
+    /// pre-credit) atomically <c>Add</c> their delta; the same
+    /// producer (or one racing later) reads the threshold gate and
+    /// <c>Exchange(0)</c>s the accumulator to claim the full sum
+    /// for a single coalesced frame. Eliminates the per-drip
+    /// frame-writer Enqueue cost on apples-to-apples 65535 windows
+    /// where the previous per-call emit triggered O(messages /
+    /// drip-threshold) frame-writer hops per stream.
+    /// </summary>
+    internal long PendingWU;
+
+    /// <summary>
+    /// Snapshot of the current send-window quota (bytes peer has granted).
+    /// Lock-free; may be slightly stale relative to a concurrent
+    /// <see cref="TryReserveSendQuota"/> / <see cref="AddSendQuota"/> call.
+    /// </summary>
+    internal long SendQuota => Volatile.Read(ref _sendQuota);
+
+    /// <summary>
+    /// Attempts to reserve <paramref name="n"/> bytes of send-window quota
+    /// for an outbound DATA chunk. Returns <see langword="true"/> with the
+    /// quota debited if the reservation succeeds; returns <see langword="false"/>
+    /// (and leaves quota unchanged) if the current window is insufficient.
+    /// </summary>
+    /// <remarks>
+    /// Lock-free CAS loop; aborts (returns false) on insufficient quota
+    /// rather than spinning. Senders that need to block should call this,
+    /// observe false, then await <see cref="_sendQuotaWake"/> before
+    /// retrying. Negative <paramref name="n"/> is rejected to prevent the
+    /// quota from being inflated past <see cref="int.MaxValue"/> via
+    /// signed overflow.
+    /// </remarks>
+    internal bool TryReserveSendQuota(int n)
+    {
+        if (n <= 0) return n == 0; // 0 trivially succeeds; negatives are bugs
+        while (true)
+        {
+            var current = Volatile.Read(ref _sendQuota);
+            if (current < n) return false;
+            var desired = current - n;
+            if (Interlocked.CompareExchange(ref _sendQuota, desired, current) == current)
+            {
+                return true;
+            }
+            // CAS contention: another thread mutated quota; retry.
+        }
     }
 
     /// <summary>
-    /// No-op stub retained for API stability and reflection-based tests.
-    /// Per gRFC SHM no-WU alignment (v3.4+, mirrors grpc-go-shmem
-    /// <c>shm_client_transport.go:acquireSendQuota</c> under shmNoWU):
-    /// per-stream HTTP/2 send-window enforcement is disabled over shared
-    /// memory; the ring's <c>WaitForSpace</c> backpressure in
-    /// <see cref="ShmRing.ReserveWrite"/> is the sole flow control.
-    /// Previously this blocked on a ManualResetEventSlim until peer
-    /// WINDOW_UPDATE credit arrived; the bidirectional WU-credit dance
-    /// produced an unfixable TOCTOU deadlock under chunked sends on
-    /// fast Linux multi-core hosts.
+    /// Returns <paramref name="n"/> bytes of previously-reserved quota
+    /// to the send window (called on rollback when a write fails after
+    /// quota was debited). Always succeeds.
     /// </summary>
-    /// <param name="needed">Ignored. Was the byte count to debit.</param>
-    /// <param name="drainBeforeWait">
-    /// Ignored. Was a callback to flush owed peer-WUs before sleeping.
-    /// </param>
-    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822", Justification = "No-op stub kept instance-method for API stability; see method doc.")]
-    internal void FairAwaitWindow(int needed, Action? drainBeforeWait = null)
+    internal void RefundSendQuota(int n)
     {
-        // No-op: SHM ring backpressure is the only flow control.
-        _ = needed;
-        _ = drainBeforeWait;
+        if (n <= 0) return;
+        Interlocked.Add(ref _sendQuota, n);
+        _sendQuotaWake.Set();
     }
 
     /// <summary>
-    /// Strict-fair mode: previously credited <paramref name="delta"/>
-    /// bytes back to the stream send-window in response to a peer
-    /// WINDOW_UPDATE. Now a no-op in all modes (see <see cref="FairAwaitWindow"/>);
-    /// incoming WU frames are accepted on the wire for spec compliance
-    /// but their increment is discarded, mirroring grpc-go-shmem
-    /// <c>shm_client_transport.go:addSendQuota</c> under shmNoWU.
+    /// Adds <paramref name="delta"/> bytes to the send window in response
+    /// to an incoming <c>WINDOW_UPDATE</c> frame from the peer. Caps at
+    /// <see cref="Synchronization.InFlow.MaxWindowSize"/> (HTTP/2 31-bit
+    /// ceiling); ignores zero/negative deltas (peer protocol violation
+    /// per RFC 7540 §6.9.1 — caller is expected to RST_STREAM at the
+    /// codec layer before reaching here).
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822", Justification = "No-op stub kept instance-method for API stability; see method doc.")]
-    internal void FairAddWindow(int delta)
+    internal void AddSendQuota(int delta)
     {
-        // No-op. See FairAwaitWindow doc.
-        _ = delta;
+        if (delta <= 0) return;
+        while (true)
+        {
+            var current = Volatile.Read(ref _sendQuota);
+            var desired = current + delta;
+            if (desired > Synchronization.InFlow.MaxWindowSize)
+            {
+                desired = Synchronization.InFlow.MaxWindowSize;
+            }
+            if (Interlocked.CompareExchange(ref _sendQuota, desired, current) == current)
+            {
+                _sendQuotaWake.Set();
+                return;
+            }
+        }
     }
 
     /// <summary>
-    /// Strict-fair mode: previously accumulated incoming wire-byte credit
-    /// per stream and returned a coalesced peer-WU amount once threshold
-    /// reached. Now a no-op (always returns 0) so no WU frames are ever
-    /// emitted, matching grpc-go-shmem shmNoWU. Receiver-side flow control
-    /// is unnecessary because the SHM ring's <c>WaitForSpace</c> already
-    /// blocks the sender when the ring fills.
+    /// Wake handle for senders blocked on insufficient quota; senders
+    /// reset before re-checking <see cref="TryReserveSendQuota"/> to
+    /// avoid missed wakes.
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822", Justification = "No-op stub kept instance-method for API stability; see method doc.")]
-    internal uint AccruePeerCredit(int wireBytes)
+    internal ManualResetEventSlim SendQuotaWake => _sendQuotaWake;
+
+    /// <summary>
+    /// Reserves <paramref name="n"/> bytes of per-stream send quota,
+    /// blocking until the quota is available. Honors
+    /// <paramref name="cancellationToken"/> (throws
+    /// <see cref="OperationCanceledException"/>) and the stream's
+    /// dispose token (throws <see cref="ObjectDisposedException"/>).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Pattern follows the standard missed-wake-safe protocol:
+    /// </para>
+    /// <list type="number">
+    ///   <item><description>Fast path: <c>TryReserveSendQuota(n)</c> — if succeeds, return.</description></item>
+    ///   <item><description><c>Reset</c> the wake handle BEFORE re-checking quota.</description></item>
+    ///   <item><description>Re-check <c>TryReserveSendQuota</c> after reset; if succeeds (covers the race where WU landed between fast-path-fail and Reset), return.</description></item>
+    ///   <item><description>Invoke <paramref name="drainBeforeWait"/> to flush any pending Ping/Pong control traffic owed by this writer (avoids keepalive starvation while we block).</description></item>
+    ///   <item><description><c>Wait(ct)</c>. Sticky-set semantics: if WU arrives any time after our Reset (before or during Wait), Wait returns immediately.</description></item>
+    ///   <item><description>Loop. Re-Reset, re-check, re-wait until success or cancellation.</description></item>
+    /// </list>
+    /// <para>
+    /// <b>Phase A (this PR):</b> caller (typically <c>FrameProtocol.WriteMessage</c>)
+    /// blocks inline. This is correct for ALL paths but stalls the writer task
+    /// when called from its loop — addressed in Phase B by relocating multi-frame
+    /// chunking into the writer task with a deferred-message map.
+    /// </para>
+    /// </remarks>
+    internal void ReserveSendQuotaOrBlock(int n, Action? drainBeforeWait, CancellationToken cancellationToken)
     {
-        _ = wireBytes;
-        return 0;
+        if (n <= 0) return;
+        // Fast path: quota readily available.
+        if (TryReserveSendQuota(n)) return;
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ThrowIfDisposed();
+            // Reset BEFORE recheck to ensure we observe any quota added
+            // before our Wait starts; sticky semantics of MRESlim mean
+            // a Set between Reset and Wait still wakes us.
+            _sendQuotaWake.Reset();
+            if (TryReserveSendQuota(n)) return;
+            // Flush pending control frames (Ping/Pong keepalive) so
+            // they are not stranded behind a blocked DATA write while
+            // we wait for the peer to grant more quota.
+            drainBeforeWait?.Invoke();
+            _sendQuotaWake.Wait(cancellationToken);
+        }
     }
 
     /// <summary>
@@ -929,7 +1084,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
         else
         {
-            ct = _disposeCts.Token;
+            // Steady-state hot path: pass CancellationToken.None so the
+            // runtime SingleConsumerUnboundedChannel.WaitToReadAsync can
+            // use its pooled _waiterSingleton (the !CanBeCanceled fast
+            // path) instead of allocating a new WaitingReadAsyncOperation
+            // + cancellation registration per receive. GPT-5.5 review
+            // identified this as the hidden per-frame tax that explains
+            // why even SHM-off was losing 1000x64B Linux to UDS.
+            //
+            // Wake-on-dispose still works via
+            // _inboundFrames.Writer.TryComplete() called from
+            // ShmGrpcStream.Dispose() and from the connection-level
+            // early-wake loop in ShmConnection.Dispose() / DisposeAsync.
+            ct = CancellationToken.None;
         }
 
         try
@@ -987,7 +1154,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
         else
         {
-            ct = _disposeCts.Token;
+            // See ReceiveFrameSync's parallel rationale: passing
+            // CancellationToken.None lets the runtime
+            // SingleConsumerUnboundedChannel pick its pooled
+            // _waiterSingleton fast path. Dispose wake propagates via
+            // _inboundFrames.Writer.TryComplete().
+            ct = CancellationToken.None;
         }
 
         try
@@ -1180,7 +1352,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     {
                         messageAccumulator.Write(f.Memory.Span);
                         f.ReturnToPool();
-                        yield return messageAccumulator.ToArray();
+                        var msgBytes = messageAccumulator.ToArray();
+                        // Note: stream-level drip is handled at the codec
+                        // hook (ShmConnection.OnDataFrame → InFlow.OnRead),
+                        // not here — SHM has no separate copy buffer, so
+                        // receive == read for FC purposes.
+                        yield return msgBytes;
                         messageAccumulator.SetLength(0);
                         if ((f.Flags & MessageFlags.EndStream) != 0) { _halfCloseReceived = true; yield break; }
                         break;
@@ -1375,6 +1552,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                             // receives just the message body.
                             previousFrame.ReturnToPool();
                             var assembled = messageAccumulator.ToArray();
+                            // Note: stream-level drip is handled at the codec
+                            // hook (ShmConnection.OnDataFrame → InFlow.OnRead),
+                            // not here — SHM has no separate copy buffer.
                             yield return assembled.AsMemory(5);
                             messageAccumulator.SetLength(0);
                             if ((f.Flags & MessageFlags.EndStream) != 0) { _halfCloseReceived = true; yield break; }
@@ -1707,6 +1887,26 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Local-side teardown for receiver-driven FC violation. Invoked by
+    /// <see cref="ShmConnection.OnDataFrame"/> when inbound DATA pushes
+    /// this stream over its receive window (RFC 7540 §5.2.2 /§6.9.1).
+    /// The remote RST_STREAM(FLOW_CONTROL_ERROR) is sent by the connection
+    /// itself; here we cancel local readers and complete the inbound
+    /// frame channel so any pending await surfaces a cancellation.
+    /// Also wakes any sender parked on insufficient send quota so it
+    /// observes the canceled state and aborts (matches grpc-go-shmem's
+    /// closeStream-unblocks-acquireSendQuota fix).
+    /// </summary>
+    internal void AbortForFlowControl(string reason)
+    {
+        System.Diagnostics.Debug.WriteLine($"[shm-fc] stream {StreamId} AbortForFlowControl: {reason}");
+        CancelCancellationToken();
+        _sendQuotaWake.Set();
+        _inboundFrames.Writer.TryComplete(
+            new System.IO.IOException($"HTTP/2 FLOW_CONTROL_ERROR: {reason}"));
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
@@ -1714,6 +1914,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             return;
         }
+
+        // Wake any sender parked inside ReserveSendQuotaOrBlock so it
+        // observes _disposed == 1 at the top of the for{} loop and
+        // throws ObjectDisposedException promptly instead of waiting
+        // for the (possibly long-lived) caller cancellation token to
+        // fire. Mirrors grpc-go-shmem's TestConnWaiterElem_CloseStream
+        // UnblocksParkedAcquire fix (acquireSendQuota deadlock after
+        // closeStream).
+        _sendQuotaWake.Set();
 
         // Safety: if a wake-coalescing batch was opened in
         // SendRequestHeadersAsync but never closed (because the request

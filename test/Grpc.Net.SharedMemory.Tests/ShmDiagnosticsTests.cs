@@ -184,7 +184,11 @@ public class ShmDiagnosticsTests
         using var client = ShmConnection.ConnectAsClient(segmentName);
 
         var telemetry = new ShmTelemetryCollector();
-        var minDuration = TimeSpan.FromMilliseconds(50);
+        // Use a slightly larger delay than the assertion floor to absorb
+        // Task.Delay's coarse timer resolution on Windows (~15ms tick, can
+        // wake ~1ms early in practice on faster execution paths).
+        var minDuration = TimeSpan.FromMilliseconds(40);
+        var serverDelay = TimeSpan.FromMilliseconds(60);
 
         // Server adds delay
         var serverTask = Task.Run(async () =>
@@ -192,7 +196,7 @@ public class ShmDiagnosticsTests
             var serverStream = server.CreateStream();
             
             await serverStream.SendResponseHeadersAsync();
-            await Task.Delay(minDuration);
+            await Task.Delay(serverDelay);
             await serverStream.SendTrailersAsync(StatusCode.OK);
         });
 

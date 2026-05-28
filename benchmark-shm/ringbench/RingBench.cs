@@ -90,27 +90,95 @@ for (int i = 0; i < args.Length; i++)
         // Forces large messages (>16 KiB) to be split into the same
         // multi-DATA-frame sequences as TCP/UDS gRPC.
         Environment.SetEnvironmentVariable("SHM_FAIR_MAX_FRAME", "16384");
-        // Set SHM_FAIR_STREAM_WINDOW to HTTP/2 spec default
-        // SETTINGS_INITIAL_WINDOW_SIZE = 65535 as a wire-format parity
-        // signal: disables HEADERS+DATA+Trailers coalescing on the
-        // server and bypasses the single-stream send fast-path so each
-        // H2 frame is dispatched separately, mirroring TCP/UDS.
-        // Does NOT enable per-stream flow control — SHM is no-WU in
-        // all modes (gRFC SHM alignment with grpc-go-shmem shmNoWU);
-        // the ring's WaitForSpace remains the sole back-pressure
-        // primitive. The numeric value 65535 is not used as a window
-        // cap; only the presence of the env var matters. Lets the
-        // reviewer verify SHM's perf wins are not from a coarser
-        // wire format.
+        // True apples-to-apples FC: the H2 spec default initial
+        // window is 65535 B. We must constrain BOTH transports to
+        // that value, otherwise SHM's 32 MiB default window
+        // silently absorbs the receive-side back-pressure that
+        // UDS+Kestrel actually pays via WINDOW_UPDATE round-trips.
         //
-        // Interop: --fair is compatible with peers in any mode (both
-        // .NET and grpc-go-shmem are no-WU in every mode).
+        //   SHM_INITIAL_WINDOW   → SHM library InFlow.limit
+        //                          (enforces real per-stream FC,
+        //                          triggers WU emission at limit/4
+        //                          drip threshold per gRFC SHM v3.4+).
+        //   WindowOverrideBytes  → Kestrel server + HttpClientHandler
+        //                          InitialStreamWindowSize.
+        //
+        // Without SHM_INITIAL_WINDOW the bench previously left SHM at
+        // its 32 MiB default while UDS was constrained to 65535 —
+        // SHM had ~500× the window of UDS and the "apples-to-apples"
+        // claim was wrong.
         //
         // Note: enabling these env vars BEFORE the library reads its
         // static config means SHM_CHANNEL_INLINE auto-downgrades to
         // false in fair mode (multi-frame messages + sync continuations
         // + LazyChainRos sync-pull = reader-thread self-deadlock).
-        Environment.SetEnvironmentVariable("SHM_FAIR_STREAM_WINDOW", "65535");
+        Environment.SetEnvironmentVariable("SHM_INITIAL_WINDOW", "65535");
+        ShmBenchConfig.WindowOverrideBytes = 65535;
+    }
+    if (args[i] == "--jumbo")
+    {
+        // Jumbo profile — direct counterpart to grpc-go's
+        // `BENCH_PROFILE=fair-default SHM_INITIAL_WINDOW=1048576
+        // SHM_MAX_FRAME_SIZE=1048576` cell. Layered on top of --fair
+        // semantics: 1 MiB initial window applied symmetrically to
+        // SHM, UDS, TCP (Kestrel server + client SocketsHttpHandler);
+        // SHM frame raised to 1 MiB. UDS/TCP frame stays at the H2
+        // spec 16 KiB because grpc-dotnet (like grpc-go) exposes no
+        // DialOption to tune MAX_FRAME_SIZE — this asymmetry is the
+        // legitimate operator-only tuning advantage SHM has on
+        // local IPC, mirroring grpc-go's bench docs §3.1.
+        ShmBenchConfig.JumboMode = true;
+        ShmBenchConfig.FairMode = true;
+        Environment.SetEnvironmentVariable("SHM_DISABLE_POOLED_DESER", "1");
+        Environment.SetEnvironmentVariable("SHM_FAIR_MAX_FRAME", "1048576");
+        Environment.SetEnvironmentVariable("SHM_INITIAL_WINDOW", "1048576");
+        ShmBenchConfig.WindowOverrideBytes = 1048576;
+    }
+    if (args[i] == "--jumbo32")
+    {
+        // "Free-fight" / no-shackles profile — 32 MiB initial window +
+        // 32 MiB SHM frame size. Direct counterpart to grpc-go's
+        // `SHM_INITIAL_WINDOW=33554432 SHM_MAX_FRAME_SIZE=33554432`
+        // ceiling cell. Same parity caveat as --jumbo: UDS/TCP frame
+        // stays at H2 spec 16 KiB (no DialOption), so the larger
+        // SHM frame is the operator-tuning advantage.
+        //
+        // Bumps SHM ring capacity to 128 MiB so the frame-size cap
+        // (= ringCapacity / 3 = ~42 MiB) accommodates the 32 MiB
+        // single-frame requirement with safety margin.
+        ShmBenchConfig.JumboMode = true;
+        ShmBenchConfig.FairMode = true;
+        ShmBenchConfig.RingCapacityBytes = 128UL * 1024 * 1024;
+        Environment.SetEnvironmentVariable("SHM_DISABLE_POOLED_DESER", "1");
+        Environment.SetEnvironmentVariable("SHM_FAIR_MAX_FRAME", "33554432");
+        Environment.SetEnvironmentVariable("SHM_INITIAL_WINDOW", "33554432");
+        ShmBenchConfig.WindowOverrideBytes = 33554432;
+    }
+    if (args[i] == "--probe-window")
+    {
+        // Explicit override for the H2 initial-window symmetric
+        // tuning value — used to reproduce the §3.4 "2 MiB window
+        // probe" cell from the grpc-go bench, which confirms the FC
+        // + LPM-header hypothesis by widening the conn window past
+        // the 1 MiB payload+5-byte LPM-header trigger. Accepts a
+        // raw byte count (e.g. `--probe-window 2097152` for 2 MiB).
+        // Implies the SHM env-var side too, so the SHM ring sees the
+        // same per-stream window cap as UDS/TCP.
+        var n = int.Parse(args[++i], CultureInfo.InvariantCulture);
+        if (n <= 0) throw new ArgumentException("--probe-window must be positive");
+        ShmBenchConfig.WindowOverrideBytes = n;
+        Environment.SetEnvironmentVariable("SHM_INITIAL_WINDOW",
+            n.ToString(CultureInfo.InvariantCulture));
+    }
+    if (args[i] == "--spin")
+    {
+        // Opt-in spin cell (Doug §5 / grpc-go SHM_SPIN_ITERS=2000
+        // equivalent on Windows). On .NET the spin lever is the
+        // legacy SHM_WIN_ALLOW_SPIN env var honoured by
+        // WindowsRingSync.SkipSpinWait. No-op on Linux because the
+        // futex/eventfd primitives don't spin by design.
+        ShmBenchConfig.SpinOptIn = true;
+        Environment.SetEnvironmentVariable("SHM_WIN_ALLOW_SPIN", "1");
     }
     if (args[i] == "--concurrent")
         runConcurrent = true;
@@ -118,6 +186,8 @@ for (int i = 0; i < args.Length; i++)
         concurrentLevels = args[++i].Split(',').Select(s => int.Parse(s.Trim(), CultureInfo.InvariantCulture)).ToArray();
     if (args[i] == "--concurrent-sizes")
         concurrentSizes = args[++i].Split(',').Select(s => int.Parse(s.Trim(), CultureInfo.InvariantCulture)).ToArray();
+    if (args[i] == "--inline-rx")
+        ShmBenchConfig.InlineReceive = true;
 }
 
 if (serverMode)
@@ -159,6 +229,11 @@ Console.WriteLine($"CPU: {cpu}");
 Console.WriteLine($"Runtime: {runtime}");
 Console.WriteLine($"SHM SingleStreamMode: {ShmBenchConfig.SingleStream}");
 Console.WriteLine($"SHM FairMode: {ShmBenchConfig.FairMode}");
+Console.WriteLine($"SHM JumboMode: {ShmBenchConfig.JumboMode}");
+Console.WriteLine($"SHM WindowOverride: {(ShmBenchConfig.WindowOverrideBytes.HasValue ? ShmBenchConfig.WindowOverrideBytes.Value.ToString(CultureInfo.InvariantCulture) + " B (symmetric: Kestrel + SHM InitialWindow)" : "(none, Kestrel 128 MiB / SHM 32 MiB default)")}");
+Console.WriteLine($"SHM SpinOptIn: {ShmBenchConfig.SpinOptIn}");
+Console.WriteLine($"SHM InlineReceive: {ShmBenchConfig.InlineReceive}");
+Console.WriteLine($"SHM RingCapacity: {ShmBenchConfig.RingCapacityBytes / (1024 * 1024)} MiB");
 Console.WriteLine();
 
 var unaryResults = new List<BenchResult>();
@@ -167,8 +242,24 @@ var concurrentResults = new List<ConcurrentBenchResult>();
 
 // Run each transport independently to avoid idle-spin stack buildup in SHM frame reader
 #pragma warning disable CS8321
-foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartUdsEnv, StartShmEnv })
+var envFactories = new (string Name, Func<Task<BenchEnv>> Start)[]
 {
+    ("tcp", StartTcpEnv),
+    ("uds", StartUdsEnv),
+    ("shm", StartShmEnv),
+};
+foreach (var (envName, startEnv) in envFactories)
+{
+    // --only tcp|uds|shm: skip non-matching transports BEFORE startup so
+    // their server processes never even spin up. Important for two
+    // reasons: (1) on WSL2, TCP loopback bind can stall 20s+ and time
+    // out, killing the bench; (2) profile workflows (dotnet-trace topN)
+    // need a clean single-transport process tree, not 3 servers booting
+    // in series. Previous behaviour started+disposed each env then
+    // filtered — wasted ~2-3s per skipped transport.
+    if (onlyTransport != null && envName != onlyTransport)
+        continue;
+
     // Force GC between transport tests to avoid cross-test interference
     // (TCP 256MB tests leave hundreds of MB on LOH that can cause GC pauses
     // during SHM tests, leading to spurious timeouts).
@@ -177,14 +268,6 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartUdsEnv, 
     GC.Collect(2, GCCollectionMode.Aggressive, true, true);
 
     var env = await startEnv();
-
-    // --only tcp|shm: skip transports that don't match
-    if (onlyTransport != null && env.Transport != onlyTransport)
-    {
-        await env.DisposeAsync();
-        continue;
-    }
-
     await using var envDisposable = env;
 
     Console.WriteLine($"=== {env.Transport.ToUpper()} Transport ===");
@@ -238,8 +321,8 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartUdsEnv, 
         // per-stream latency under contention plus aggregate
         // throughput across all streams.
         Console.WriteLine("  Concurrent streams (ping-pong, same connection):");
-        Console.WriteLine($"  {"Streams",-8} {"Payload",-10} {"Rounds",-8} {"Avg µs/RT",-14} {"AggMB/s",-12} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
-        Console.WriteLine("  " + new string('-', 76));
+        Console.WriteLine($"  {"Streams",-8} {"Payload",-10} {"Rounds",-8} {"Avg µs/RT",-14} {"AggMB/s",-12} {"CPU µs/op",-12} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
+        Console.WriteLine("  " + new string('-', 92));
         foreach (var streams in concurrentLevels)
         {
             foreach (var size in concurrentSizes)
@@ -247,10 +330,18 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartUdsEnv, 
                 int rounds = ConcurrentRoundsForLoad(streams, size);
                 Console.WriteLine($"  -> running streams={streams} size={FormatSize(size)} rounds={rounds}...");
                 int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
+                var cpuBefore = CaptureCpu(env.ServerProcess);
                 var (avgUs, aggMBps) = await MeasureConcurrentStreams(env.Client, streams, size, rounds, measurementTimeout);
+                var cpuAfter = CaptureCpu(env.ServerProcess);
                 int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
-                concurrentResults.Add(new ConcurrentBenchResult(env.Transport, streams, size, rounds, avgUs, aggMBps));
-                Console.WriteLine($"  {streams,-8} {FormatSize(size),-10} {rounds,-8} {avgUs,-14:F3} {aggMBps,-12:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+                // Concurrent runs do `rounds * streams` ping-pong RTs
+                // total, so amortise CPU across that grand total to
+                // match Go's `cpu-ns/op` semantics in
+                // shm-rfc/C-bench-results.md (per-RPC CPU cost).
+                long totalOps = (long)rounds * streams;
+                double cpuUsPerOp = (cpuAfter - cpuBefore) / Math.Max(totalOps, 1);
+                concurrentResults.Add(new ConcurrentBenchResult(env.Transport, streams, size, rounds, avgUs, aggMBps, cpuUsPerOp));
+                Console.WriteLine($"  {streams,-8} {FormatSize(size),-10} {rounds,-8} {avgUs,-14:F3} {aggMBps,-12:F3} {cpuUsPerOp,-12:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
             }
         }
         Console.WriteLine();
@@ -443,7 +534,8 @@ var results = new
         size_bytes = r.SizeBytes,
         rounds_per_stream = r.RoundsPerStream,
         avg_latency_us_per_round = Math.Round(r.AvgLatencyUsPerRound, 3),
-        aggregate_throughput_mb_per_s = Math.Round(r.AggregateThroughputMBps, 3)
+        aggregate_throughput_mb_per_s = Math.Round(r.AggregateThroughputMBps, 3),
+        cpu_us_per_op = Math.Round(r.CpuUsPerOp, 3)
     }),
     notes = "BenchmarkService protobuf payloads; client and server in separate processes"
 };
@@ -497,11 +589,39 @@ async Task<BenchEnv> StartTcpEnv()
 
     try
     {
-        var channel = GrpcChannel.ForAddress($"http://127.0.0.1:{port}", new GrpcChannelOptions
+        var channelOpts = new GrpcChannelOptions
         {
             MaxReceiveMessageSize = 512 * 1024 * 1024,
             MaxSendMessageSize = 512 * 1024 * 1024
-        });
+        };
+        // Apply H2 stream-window override (--fair/--jumbo/--jumbo32/--probe-window).
+        // Without an explicit HttpHandler, GrpcChannel.ForAddress uses
+        // .NET's default handler which honours
+        // SocketsHttpHandler.InitialHttp2StreamWindowSize only if we
+        // construct one ourselves. The connection-level window is not
+        // user-tunable on the client side; .NET auto-derives it from
+        // the stream window so we trust that to keep
+        // conn >= stream (mirroring grpc-go-shmem bench §3.1 where
+        // the same MAX_FRAME_SIZE asymmetry exists vs SHM).
+        //
+        // SocketsHttpHandler.InitialHttp2StreamWindowSize caps at
+        // 16 MiB (.NET hard limit). When --jumbo32 sets a 32 MiB
+        // window, UDS/TCP transparently downgrades to the ceiling;
+        // SHM keeps its full configured window via env var. This
+        // mirrors the same parity caveat as MAX_FRAME_SIZE: an
+        // operator-only tuning advantage SHM has on local IPC.
+        if (ShmBenchConfig.WindowOverrideBytes.HasValue)
+        {
+            const int H2ClientWindowMax = 16 * 1024 * 1024;
+            var clientWindow = Math.Min(ShmBenchConfig.WindowOverrideBytes.Value, H2ClientWindowMax);
+            var handler = new System.Net.Http.SocketsHttpHandler
+            {
+                InitialHttp2StreamWindowSize = clientWindow
+            };
+            channelOpts.HttpHandler = handler;
+            channelOpts.DisposeHttpClient = true;
+        }
+        var channel = GrpcChannel.ForAddress($"http://127.0.0.1:{port}", channelOpts);
         var client = new BenchmarkService.BenchmarkServiceClient(channel);
 
         await WaitForServerReadyAsync(client, TimeSpan.FromSeconds(20));
@@ -548,6 +668,18 @@ async Task<BenchEnv> StartUdsEnv()
                 return new NetworkStream(sock, ownsSocket: true);
             },
         };
+        // Apply H2 stream-window override symmetric to the Kestrel
+        // server above; same rationale as StartTcpEnv (see comment
+        // there). Set BEFORE the handler is wrapped by GrpcChannel.
+        // SocketsHttpHandler.InitialHttp2StreamWindowSize caps at
+        // 16 MiB (.NET hard limit); --jumbo32 (32 MiB) transparently
+        // downgrades UDS to the ceiling. SHM keeps full window.
+        if (ShmBenchConfig.WindowOverrideBytes.HasValue)
+        {
+            const int H2ClientWindowMax = 16 * 1024 * 1024;
+            handler.InitialHttp2StreamWindowSize = Math.Min(
+                ShmBenchConfig.WindowOverrideBytes.Value, H2ClientWindowMax);
+        }
         var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
         {
             HttpHandler = handler,
@@ -597,6 +729,7 @@ async Task<BenchEnv> StartShmEnv()
                 new ShmClientTransportOptions
                 {
                     SingleStreamMode = ShmBenchConfig.SingleStream,
+                    InlineReceiveContinuations = ShmBenchConfig.InlineReceive,
                 }),
             DisposeHttpClient = true,
             MaxReceiveMessageSize = 512 * 1024 * 1024,
@@ -671,6 +804,38 @@ static Process StartServerProcess(string transport, int? port = null, string? se
     if (ShmBenchConfig.FairMode)
     {
         argParts.Add("--fair");
+    }
+
+    if (ShmBenchConfig.JumboMode)
+    {
+        argParts.Add("--jumbo");
+    }
+
+    // --probe-window overrides whatever --fair/--jumbo would set, so
+    // always propagate when the parent's effective window differs from
+    // the defaults those flags imply (65535 for fair, 1048576 for
+    // jumbo). Simplest correct rule: always pass when set; child's
+    // --probe-window parsing is idempotent and last-wins.
+    if (ShmBenchConfig.WindowOverrideBytes.HasValue)
+    {
+        var expected = ShmBenchConfig.JumboMode ? 1048576
+                     : ShmBenchConfig.FairMode  ? 65535
+                     : -1;
+        if (ShmBenchConfig.WindowOverrideBytes.Value != expected)
+        {
+            argParts.Add("--probe-window");
+            argParts.Add(ShmBenchConfig.WindowOverrideBytes.Value.ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
+    if (ShmBenchConfig.SpinOptIn)
+    {
+        argParts.Add("--spin");
+    }
+
+    if (ShmBenchConfig.InlineReceive)
+    {
+        argParts.Add("--inline-rx");
     }
 
     var psi = new ProcessStartInfo
@@ -825,8 +990,22 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
         {
             k.Listen(IPAddress.Loopback, port, lo => lo.Protocols = HttpProtocols.Http2);
             k.Limits.MaxRequestBodySize = 512L * 1024 * 1024;
-            k.Limits.Http2.InitialConnectionWindowSize = 128 * 1024 * 1024;
-            k.Limits.Http2.InitialStreamWindowSize = 128 * 1024 * 1024;
+            // Window cap: --fair/--jumbo/--jumbo32/--probe-window force
+            // apples-to-apples symmetric tuning vs grpc-go's bench. Default
+            // (no override) keeps the 128 MiB throughput-tuned baseline
+            // that the SHM-vs-UDS demo has used historically.
+            //
+            // The .NET HttpClient side (SocketsHttpHandler) caps at
+            // 16 MiB. To keep symmetry across both directions, also
+            // cap Kestrel's advertised receive window at 16 MiB when
+            // a higher value is requested (e.g. --jumbo32 = 32 MiB).
+            // SHM bypasses this cap via SHM_INITIAL_WINDOW env var.
+            const int H2WindowMax = 16 * 1024 * 1024;
+            var winBytes = ShmBenchConfig.WindowOverrideBytes.HasValue
+                ? Math.Min(ShmBenchConfig.WindowOverrideBytes.Value, H2WindowMax)
+                : (128 * 1024 * 1024);
+            k.Limits.Http2.InitialConnectionWindowSize = winBytes;
+            k.Limits.Http2.InitialStreamWindowSize = winBytes;
             // Raise the per-connection stream cap so the concurrent
             // matrix (up to 1000 simultaneous streams) fits in one
             // HTTP/2 connection. Kestrel's default 100 would queue the
@@ -875,8 +1054,15 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
         {
             k.ListenUnixSocket(udsPath!, lo => lo.Protocols = HttpProtocols.Http2);
             k.Limits.MaxRequestBodySize = 512L * 1024 * 1024;
-            k.Limits.Http2.InitialConnectionWindowSize = 128 * 1024 * 1024;
-            k.Limits.Http2.InitialStreamWindowSize = 128 * 1024 * 1024;
+            // Cap at .NET HttpClient's 16 MiB ceiling (see StartTcpEnv
+            // for full rationale; --jumbo32 transparently downgrades
+            // UDS/TCP to this max while SHM keeps full window).
+            const int H2WindowMax = 16 * 1024 * 1024;
+            var winBytes = ShmBenchConfig.WindowOverrideBytes.HasValue
+                ? Math.Min(ShmBenchConfig.WindowOverrideBytes.Value, H2WindowMax)
+                : (128 * 1024 * 1024);
+            k.Limits.Http2.InitialConnectionWindowSize = winBytes;
+            k.Limits.Http2.InitialStreamWindowSize = winBytes;
             // See TCP server above — 1000-stream concurrent matrix
             // requires a high per-connection stream cap.
             k.Limits.Http2.MaxStreamsPerConnection = 10_000;
@@ -915,8 +1101,9 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
     Segment.TryRemoveSegment(segmentName);
     Segment.TryRemoveSegment(segmentName + "_ctl");
 
-    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, singleStreamMode: ShmBenchConfig.SingleStream, pooledDeserialization: !ShmBenchConfig.FairMode,
-        maxReceiveMessageSize: 0); // unlimited for benchmark
+    var server = new ShmGrpcServer(segmentName, ringCapacity: ShmBenchConfig.RingCapacityBytes, singleStreamMode: ShmBenchConfig.SingleStream, pooledDeserialization: !ShmBenchConfig.FairMode,
+        maxReceiveMessageSize: 0, // unlimited for benchmark
+        inlineReceiveContinuations: ShmBenchConfig.InlineReceive);
 
     server.MapUnary<SimpleRequest, SimpleResponse>(
         "/grpc.testing.BenchmarkService/UnaryCall",
@@ -1215,7 +1402,7 @@ static void WriteCsv(string path, List<BenchResult> unary, List<BenchResult> str
     foreach (var r in streaming)
         w.WriteLine($"streaming,{r.Transport},1,{r.SizeBytes},{r.Iterations},{r.AvgLatencyUs:F3},{r.ThroughputMBps:F3},{r.CpuUsPerOp:F3}");
     foreach (var r in concurrent)
-        w.WriteLine($"concurrent,{r.Transport},{r.Streams},{r.SizeBytes},{r.RoundsPerStream},{r.AvgLatencyUsPerRound:F3},{r.AggregateThroughputMBps:F3},");
+        w.WriteLine($"concurrent,{r.Transport},{r.Streams},{r.SizeBytes},{r.RoundsPerStream},{r.AvgLatencyUsPerRound:F3},{r.AggregateThroughputMBps:F3},{r.CpuUsPerOp:F3}");
 }
 
 static string FormatSize(int bytes) => bytes switch
@@ -1484,7 +1671,7 @@ static double NiceStep(double step)
 
 sealed record BenchResult(string Transport, int SizeBytes, int Iterations, double AvgLatencyUs, double ThroughputMBps, double CpuUsPerOp = 0);
 
-sealed record ConcurrentBenchResult(string Transport, int Streams, int SizeBytes, int RoundsPerStream, double AvgLatencyUsPerRound, double AggregateThroughputMBps);
+sealed record ConcurrentBenchResult(string Transport, int Streams, int SizeBytes, int RoundsPerStream, double AvgLatencyUsPerRound, double AggregateThroughputMBps, double CpuUsPerOp = 0);
 sealed record PlotPoint(double X, double Y);
 sealed record PlotSeries(string Label, string Color, List<PlotPoint> Points);
 
@@ -1532,6 +1719,55 @@ static class ShmBenchConfig
     // client-side IPooledDeserializer.SetPooledDeserializer (via env
     // var SHM_DISABLE_POOLED_DESER=1, picked up by ShmControlResponseContent).
     public static bool FairMode;
+
+    // --jumbo flag: layered on top of --fair. Sets the H2 initial window
+    // to 1 MiB (symmetric across SHM/UDS/TCP via WindowOverrideBytes)
+    // and the SHM frame size to 1 MiB (UDS/TCP frame stays at H2 spec
+    // 16 KiB because grpc-dotnet exposes no DialOption to tune frame
+    // size, mirroring grpc-go's behaviour). Direct counterpart to
+    // grpc-go's `SHM_INITIAL_WINDOW=1048576 SHM_MAX_FRAME_SIZE=1048576`
+    // cell from shm-rfc/C-bench-results.md §3.
+    public static bool JumboMode;
+
+    // H2 initial-window cap applied symmetrically to all three
+    // transports for apples-to-apples comparison. Null = no override
+    // (Kestrel keeps its 128 MiB default + SHM keeps its native 2 GiB
+    // receive quota). Set non-null by --fair (65 535), --jumbo
+    // (1 048 576) or --probe-window (explicit value).
+    //
+    // When non-null:
+    //   * Kestrel server: Http2.Initial{Stream,Connection}WindowSize = N
+    //   * Client SocketsHttpHandler.InitialHttp2StreamWindowSize = N
+    //     (System.Net.Http exposes only the stream-window knob; the
+    //     connection-level window is auto-derived by .NET so we set
+    //     stream and trust .NET to keep conn ≥ stream.)
+    //   * SHM:   SHM_INITIAL_WINDOW env var = N
+    public static int? WindowOverrideBytes;
+
+    // --spin flag: opt-in spin cell (Doug §5 equivalent). Sets the
+    // SHM_WIN_ALLOW_SPIN env var so WindowsRingSync.SkipSpinWait
+    // returns false and the ring does the legacy adaptive outer spin
+    // before blocking. No-op on Linux. Mirrors grpc-go's
+    // `SHM_SPIN_ITERS=2000` cell.
+    public static bool SpinOptIn;
+
+    // --inline-rx flag: opts the SHM connection in to
+    // InlineReceiveContinuations (both client and server sides). The
+    // reader thread invokes awaiting Channel<InboundFrame> consumer
+    // continuations inline, saving ~17 us / receive on Windows. SAFE
+    // ONLY when the connection's RPC pattern is strictly single-active-
+    // stream-at-a-time (PingPong / Stream / Unary sequential phases of
+    // RingBench). The MeasureConcurrentStreams phase uses N parallel
+    // streams on one connection and HOL-blocks the reader under inline
+    // dispatch; do not pair --inline-rx with --concurrent on a shared
+    // connection. Default off; explicit opt-in matches the
+    // ShmConnection.InlineReceiveContinuations API contract.
+    public static bool InlineReceive;
+
+    // SHM ring buffer capacity in bytes. Default 64 MiB. Bumped to
+    // 128 MiB by --jumbo32 so the per-frame cap (= ringCapacity / 3)
+    // can fit a 32 MiB single-frame payload with safety margin.
+    public static ulong RingCapacityBytes = 64UL * 1024 * 1024;
 }
 
 static class PayloadCache

@@ -166,10 +166,11 @@ public static class FrameProtocol
         if (data.Length <= maxFramePayload)
         {
             // Flush pending Ping/Pong control frames before the message
-            // write so keepalive stays responsive. FairAwaitWindow is a
-            // no-op under SHM no-WU alignment; retained for API stability.
+            // write so keepalive stays responsive, then reserve per-stream
+            // H2 send quota for the chunk (blocks if peer has not yet
+            // granted enough WINDOW_UPDATE credit). gRFC SHM v3.4+ FC.
             preChunkDrain?.Invoke();
-            fairStream?.FairAwaitWindow(data.Length, preChunkDrain);
+            fairStream?.ReserveSendQuotaOrBlock(data.Length, preChunkDrain, cancellationToken);
             var header = new FrameHeader(FrameType.Message, streamId, (uint)data.Length, flags);
             WriteFrame(ring, header, data, cancellationToken);
             return;
@@ -193,10 +194,11 @@ public static class FrameProtocol
             }
 
             // Flush pending Ping/Pong control frames before each chunk
-            // for keepalive responsiveness. FairAwaitWindow is a no-op
-            // under SHM no-WU alignment; retained for API stability.
+            // for keepalive responsiveness, then reserve per-stream H2
+            // send quota for this chunk (blocks until peer grants enough
+            // WINDOW_UPDATE credit). gRFC SHM v3.4+ FC.
             preChunkDrain?.Invoke();
-            fairStream?.FairAwaitWindow(chunkSize, preChunkDrain);
+            fairStream?.ReserveSendQuotaOrBlock(chunkSize, preChunkDrain, cancellationToken);
 
             var header = new FrameHeader(FrameType.Message, streamId, (uint)chunkSize, chunkFlags);
             WriteFrame(ring, header, chunk, cancellationToken);

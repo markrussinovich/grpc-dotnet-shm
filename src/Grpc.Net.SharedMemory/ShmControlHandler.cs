@@ -55,16 +55,6 @@ public sealed class ShmControlHandler : HttpMessageHandler
     internal static (long Unary, long Streaming) GetRequestKindDiag()
         => (Volatile.Read(ref s_unaryRequests), Volatile.Read(ref s_streamingRequests));
 
-    // Env-var opt-in: SHM_ENABLE_COALESCE=1 enables wake-coalescing on
-    // the unary client path (Headers+Message+HalfClose fire a single
-    // SignalData instead of two). Default OFF: measured ~5µs/RT
-    // regression in WSL2 due to lost server pipelining; expected ~10-15µs
-    // gain on native Linux with higher syscall cost — needs production
-    // validation before flipping the default.
-    private static readonly bool s_enableCoalesce =
-        string.Equals(Environment.GetEnvironmentVariable("SHM_ENABLE_COALESCE"),
-            "1", StringComparison.Ordinal);
-
     // --- Pool-bypass mode (EnableMultipleConnections = false) ---
     // Holds a single direct connection, lazily initialized on first use.
     private readonly SemaphoreSlim? _directConnectLock;
@@ -242,26 +232,24 @@ public sealed class ShmControlHandler : HttpMessageHandler
         var metadata = ExtractMetadata(request.Headers);
         var deadline = ExtractDeadline(request.Headers);
 
-        // Unary detection: grpc-dotnet uses PushUnaryContent for unary +
-        // server-streaming (single request) and PushStreamContent for
-        // client/bidi streaming. The unary content sends one Message
-        // immediately followed by HalfClose, so we can safely coalesce
-        // Headers+Message+HalfClose into a single SignalData wake.
-        //
-        // Default OFF: in WSL2 (syscall ~5µs) the saved wake is offset by
-        // lost server-side Headers pipelining (the server can't start
-        // processing Headers until the coalesced wake fires, delaying it
-        // by ~5µs). On native Linux with higher syscall cost, opt in via
-        // SHM_ENABLE_COALESCE=1 to recover ~5-15µs/RT on unary calls.
+        // Unary content-type detection (for diagnostic counters only;
+        // client-side wake-coalescing was removed after GPT-5.5 review
+        // F2 — the only safe gate required request.Content.Headers
+        // .ContentLength, which gRPC.NET's PushUnaryContent declines to
+        // expose (TryComputeLength returns false). To reintroduce real
+        // client-side coalescing, defer the BeginInlineBatch from
+        // Headers to body-write time — either via a friend-accessor on
+        // PushUnaryContent's serialized size, or via Grpc.Net.Client
+        // cooperation. The server-side HEADERS+DATA+Trailers coalesce
+        // path remains active (see ShmGrpcServer.UnaryHandler).
         var contentTypeName = request.Content?.GetType().Name;
         var isUnary = contentTypeName != null
             && (contentTypeName.StartsWith("PushUnaryContent", StringComparison.Ordinal)
                 || contentTypeName.StartsWith("UnaryContent", StringComparison.Ordinal));
-        if (!s_enableCoalesce) isUnary = false;
         if (isUnary) Interlocked.Increment(ref s_unaryRequests);
         else Interlocked.Increment(ref s_streamingRequests);
 
-        await stream.SendRequestHeadersAsync(method, authority, metadata, deadline, coalesceWithHalfClose: isUnary).ConfigureAwait(false);
+        await stream.SendRequestHeadersAsync(method, authority, metadata, deadline, coalesceWithHalfClose: false).ConfigureAwait(false);
 
         if (request.Content != null)
         {
@@ -451,6 +439,15 @@ public sealed class ShmControlHandler : HttpMessageHandler
                             // against an inline writer on the same ring).
                             conn.SingleStreamMode = true;
                             conn.FrameWriter?.EnableSingleStreamMode();
+                        }
+                        if (_options.InlineReceiveContinuations)
+                        {
+                            // Local receive-side opt-in: only affects this
+                            // client's Channel<InboundFrame> dispatch, not
+                            // the wire protocol. Each side picks its own
+                            // continuation model independently. See
+                            // ShmConnection.InlineReceiveContinuations.
+                            conn.InlineReceiveContinuations = true;
                         }
                         return conn;
                     }
@@ -1686,9 +1683,21 @@ internal sealed class ShmControlResponseContent : HttpContent,
     private async ValueTask<(ReadOnlySequence<byte> Payload, bool EndOfStream)> ReadNextMessageSlowAsync(
         CancellationToken cancellationToken)
     {
+        // Steady-state path: when the caller passes default (no
+        // cancellation), pass CancellationToken.None to
+        // WaitForFrameAsync so the underlying
+        // SingleConsumerUnboundedChannel.WaitToReadAsync can use its
+        // pooled _waiterSingleton fast path. Per GPT-5.5 review: the
+        // previous fall-back to _stream.DisposeCancellationToken
+        // forced an allocation + cancellation registration per
+        // empty-receive even in the steady state, which is the
+        // hidden per-frame tax that hurt 1000x64B both OSes.
+        // Dispose wake still arrives via _inboundFrames.Writer.TryComplete
+        // from ShmGrpcStream.Dispose() / ShmConnection.Dispose()'s
+        // early-wake loop.
         var ct = cancellationToken.CanBeCanceled
             ? cancellationToken
-            : _stream.DisposeCancellationToken;
+            : CancellationToken.None;
 
         try
         {

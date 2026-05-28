@@ -32,26 +32,36 @@ diagnostics, and incremental rollout of new wake paths.
 | Variable | Default | Effect |
 |---|---|---|
 | `SHM_CHANNEL_INLINE` | unset | When set to `1`, lets the `Channel<InboundFrame>` slow-path schedule its continuation **synchronously on the reader thread**, skipping the .NET `ThreadPool` dispatch (~10–15 µs/RT on Windows). Auto-disabled when strict-fair mode is active (multi-frame DATA + sync continuations + LazyChainRos sync-pull could self-deadlock the reader). |
-| `SHM_ENABLE_COALESCE` | unset | When set to `1`, opts client-side unary RPCs into wake-coalesced `HEADERS + Message + HalfClose` (single peer SignalData instead of three). Currently a measured slight regression on WSL2 (~+5 µs / RT) due to lost server-side Headers pipelining; ships as opt-in pending native Linux validation. |
+
+## Internal tuning knobs (advanced)
+
+These are read-once-at-load knobs that override otherwise-baked-in defaults. Setting them is normally not necessary; they exist for benchmark tuning or repro of niche regressions.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SHM_INITIAL_WINDOW` | `33554432` (32 MiB) | Initial per-stream HTTP/2 send window (= per-stream `InFlow` limit and `WindowUpdateBatchThreshold` denominator). Capped to `int.MaxValue`. Smaller values force more frequent WU emissions; larger values reduce WU overhead but risk OOM if the peer is slow. |
+| `SHM_WRITER_SPIN_ITERATIONS` | `3000` (= `SpinIterationsDefault`, capped at `SpinIterationsMax=10000`) | Spin budget for the WriterLoop before falling through to a kernel wait. Increase to trade CPU for tighter ping-pong latency under low-contention bench workloads; decrease to give CPU back to other work. |
+| `SHM_RECEIVE_STRIPER` | unset (= enabled) | **Opt-OUT** knob. Set to `0` to disable the per-connection `ReceiveStriper` stripe-thread dispatch (fan-out across N work threads). Default-on because the striper is the only way to keep ~1000+ concurrent streams unblocked when one stream's user code stalls. Disable for single-stream micro-benchmarks where the striper hop is measurable. |
+| `SHM_LPM_ASSERT_LOG` | unset | Path of a file to append `[SHM_LPM_ASSERT] ...` diagnostic lines to. When unset, the assertions still throw + log to stderr; setting a path adds file-based persistence for postmortem analysis. Used to catch the rare "declared=0, payload all-zero" framer corruption signature. |
+| `SHM_DIAG_STRIPER=1` | Enables `ReceiveStriper.GetDiagCounters()` per-stripe enqueue + dispatch counters. Used to verify even fan-out across stripes when investigating tail-latency outliers. |
 
 ## Strict-fair benchmark mode (`--fair` in ringbench)
 
-These three together opt-into a benchmark-only mode where the SHM
+These together opt-into a benchmark-only mode where the SHM
 transport mirrors TCP / UDS gRPC's HTTP/2 *wire-format* constraints, so
 a reviewer can compare against TCP/UDS on equal terms.
 
 | Variable | Set by `--fair` to | Effect |
 |---|---|---|
-| `SHM_FAIR_MAX_FRAME` | `16384` | Caps the per-DATA-frame payload at the HTTP/2 spec default `SETTINGS_MAX_FRAME_SIZE`. Large messages are split into multiple H2 DATA frames, the same way TCP/UDS gRPC would. |
-| `SHM_FAIR_STREAM_WINDOW` | `65535` | Wire-format parity signal only. Disables HEADERS+DATA+Trailers coalescing on the server so each frame is dispatched separately (mirrors TCP/UDS behaviour). **Does NOT enable per-stream HTTP/2 flow control** — SHM is no-WU in all modes (matches grpc-go-shmem v3.4+ `shmNoWU`); the ring's `WaitForSpace` remains the sole back-pressure primitive. |
+| `SHM_FAIR_MAX_FRAME` | `16384` | Caps the per-DATA-frame payload at the HTTP/2 spec default `SETTINGS_MAX_FRAME_SIZE`. Large messages are split into multiple H2 DATA frames, the same way TCP/UDS gRPC would. Also gates off the `Channel<InboundFrame>` inline-continuation fast-path (`SHM_CHANNEL_INLINE`) and the server's HEADERS+DATA+Trailers coalescing so each frame is dispatched separately like TCP/UDS. |
 | `SHM_DISABLE_POOLED_DESER` | `1` | Suppresses the `IPooledDeserializer` fast-path on the client so the client falls back to the stock `Grpc.Net.Client` buffered codec (which TCP/UDS use). Removes one allocation-pool advantage SHM has by default. |
 
 > ℹ️ **Interop note.** `--fair` is interop-compatible with peers in any
-> mode (default or `--fair`). Both .NET and grpc-go-shmem are no-WU in
-> every mode, so there is no flow-control mismatch to deadlock on.
-> An earlier design re-enabled WU emission under `--fair` and was
-> incompatible with default peers; that variant was removed after the
-> gRFC SHM v3.4+ no-WU alignment.
+> mode (default or `--fair`). Per-stream HTTP/2 flow control is active
+> on both sides via `InFlow` / `TrInFlow` and a `WindowUpdateBatchThreshold`-
+> driven drip path, so there is no FC mismatch to deadlock on.
+> Connection-level FC remains elided in all modes (the ring's `WaitForSpace`
+> provides connection-wide back-pressure).
 
 ## Production default summary
 
@@ -60,13 +70,15 @@ With no environment variables set, the transport runs:
 - **No spin wait** on Windows (matches Linux eventfd protocol).
 - **Futex-based** wake on Linux (eventfd path is opt-in via
   `SHM_EVENTFD_WAKE`).
-- **No HTTP/2 WINDOW_UPDATE emission** (aligned with grpc-go-shmem
-  v3.4+ default; ring `WaitForSpace` is the canonical back-pressure
-  primitive).
+- **Per-stream HTTP/2 flow control active** with a 32 MiB initial
+  window (`InFlow` / `TrInFlow` + WU emission at limit/4). Connection-
+  level FC remains elided — the ring's `WaitForSpace` provides
+  connection-wide back-pressure.
 - **No diagnostic instrumentation** in the hot path.
 - **`ThreadPool`-dispatched** Channel continuations (cross-process
   fairness across many streams).
 - **Pooled deserialization** on the client (peak GC reduction).
+- **`ReceiveStriper` enabled** (opt-out via `SHM_RECEIVE_STRIPER=0`).
 
 If a benchmark or smoke run misbehaves, the first thing to check is
 whether any of the above variables are leaking in from the shell — many

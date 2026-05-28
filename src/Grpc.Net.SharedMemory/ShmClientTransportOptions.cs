@@ -145,6 +145,25 @@ public sealed class ShmClientTransportOptions
     public bool SingleStreamMode { get; set; }
 
     /// <summary>
+    /// Gets or sets whether the inbound-frame channel of every stream on
+    /// this connection invokes awaiting consumer continuations inline on
+    /// the SHM reader thread, skipping the .NET ThreadPool dispatch hop.
+    /// Saves ~17 µs per receive on Windows (about 41 % of the
+    /// streaming-0B round-trip).
+    /// <para>
+    /// SAFE ONLY when (a) the connection carries at most one active
+    /// stream at a time and (b) the receive-side continuations never
+    /// perform a synchronous wait that depends on the reader thread
+    /// making further progress. Violating either property
+    /// head-of-line-blocks the reader and can deadlock the connection.
+    /// Recommended only for tightly-controlled ping-pong / unary
+    /// workloads where the caller owns both sides of the RPC. The
+    /// default is <c>false</c> (legacy ThreadPool dispatch).
+    /// </para>
+    /// </summary>
+    public bool InlineReceiveContinuations { get; set; }
+
+    /// <summary>
     /// Gets or sets the optional security handshaker. When non-null, the
     /// client performs a process-level identity handshake on the data
     /// segment immediately after the control-segment CONNECT/ACCEPT

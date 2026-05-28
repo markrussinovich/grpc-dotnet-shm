@@ -51,8 +51,23 @@ internal static partial class Http2Codec
                 WriteH2Trailers(ring, header, payload1, payload2, cancellationToken);
                 return;
             case FrameType.Cancel:
-                WriteH2RstStream(ring, header.StreamId, Http2ErrorCode.Cancel, cancellationToken);
-                return;
+                {
+                    // Optional 4-byte BE error code payload overrides default Cancel.
+                    // Used by FC enforcement (RFC 7540 §5.2.2 / §6.9.1) to send
+                    // RST_STREAM(FLOW_CONTROL_ERROR) without adding a new
+                    // FrameType. Empty payload preserves prior behavior.
+                    var errPayloadLen = payload1.Length + payload2.Length;
+                    var error = Http2ErrorCode.Cancel;
+                    if (errPayloadLen == 4)
+                    {
+                        Span<byte> tmp = stackalloc byte[4];
+                        payload1.CopyTo(tmp);
+                        if (payload1.Length < 4) payload2.CopyTo(tmp.Slice(payload1.Length));
+                        error = (Http2ErrorCode)BinaryPrimitives.ReadUInt32BigEndian(tmp);
+                    }
+                    WriteH2RstStream(ring, header.StreamId, error, cancellationToken);
+                    return;
+                }
             case FrameType.GoAway:
                 WriteH2GoAway(ring, header, payload1, payload2, cancellationToken);
                 return;

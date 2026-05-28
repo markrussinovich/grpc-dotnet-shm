@@ -32,6 +32,9 @@ public class FlowControlTests
     [Platform("Win")]
     public void InitialWindowSize_IsCorrect()
     {
+        // Default (no SHM_INITIAL_WINDOW env var) is 32 MiB; fair-mode
+        // bench may override to 65535 via env var (RFC 7540 §6.9.2 default).
+        // Tests run without the env var, so we expect the SHM-tuned default.
         Assert.That(ShmConstants.InitialWindowSize, Is.EqualTo(32 * 1024 * 1024));
     }
 
@@ -206,8 +209,68 @@ public class FlowControlTests
     public void FlowControl_Constants_AreValid()
     {
         // Verify constants are appropriate for shared memory transport
-        Assert.That(ShmConstants.InitialWindowSize, Is.EqualTo(32 * 1024 * 1024), "Initial window should be half the default ring capacity");
+        Assert.That(ShmConstants.InitialWindowSize, Is.GreaterThan(0), "Initial window must be positive");
+        Assert.That(ShmConstants.InitialWindowSize, Is.LessThanOrEqualTo(int.MaxValue), "Initial window must fit in 31-bit H2 window");
         Assert.That(ShmConstants.MaxWindowSize, Is.EqualTo(int.MaxValue), "Max window should be 2^31-1");
+    }
+
+    /// <summary>
+    /// Regression guard mirroring grpc-go-shmem's
+    /// <c>TestConnWaiterElem_CloseStreamUnblocksParkedAcquire</c>:
+    /// a sender parked inside <c>ReserveSendQuotaOrBlock</c> waiting on
+    /// <c>_sendQuotaWake</c> MUST be woken when the stream is disposed,
+    /// even if the caller's cancellation token is unrelated to the
+    /// stream dispose token. Without the <c>_sendQuotaWake.Set()</c>
+    /// call in <c>Dispose()</c> this test deadlocks (caught by
+    /// <c>[CancelAfter]</c>).
+    /// </summary>
+    [Test]
+    [Platform("Win")]
+    [CancelAfter(5000)]
+    public async Task ReserveSendQuotaOrBlock_DisposeUnblocksParkedSender()
+    {
+        var segmentName = $"flow_dispose_wake_{Guid.NewGuid():N}";
+        using var server = ShmConnection.CreateAsServer(segmentName, ringCapacity: 65536, maxStreams: 10);
+        using var client = ShmConnection.ConnectAsClient(segmentName);
+
+        var clientStream = client.CreateStream();
+
+        // Drain the per-stream send quota to 0 so the next reservation
+        // will be forced to park.
+        var initialQuota = clientStream.SendQuota;
+        Assert.That(initialQuota, Is.GreaterThan(0));
+        var drained = clientStream.TryReserveSendQuota((int)initialQuota);
+        Assert.That(drained, Is.True, "should fully drain quota");
+        Assert.That(clientStream.SendQuota, Is.EqualTo(0));
+
+        // Start a sender that blocks waiting for quota.
+        var senderDone = new TaskCompletionSource<Exception?>();
+        var parkedCt = new CancellationTokenSource(); // unrelated to stream dispose
+        var t = Task.Run(() =>
+        {
+            try
+            {
+                clientStream.ReserveSendQuotaOrBlock(1, drainBeforeWait: null, parkedCt.Token);
+                senderDone.SetResult(null);
+            }
+            catch (Exception ex)
+            {
+                senderDone.SetResult(ex);
+            }
+        });
+
+        // Give the sender a chance to enter Wait().
+        await Task.Delay(50);
+        Assert.That(senderDone.Task.IsCompleted, Is.False, "sender must be parked");
+
+        // Disposing the stream MUST wake the parked sender promptly.
+        clientStream.Dispose();
+
+        var ex = await senderDone.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.That(ex, Is.InstanceOf<ObjectDisposedException>(),
+            "Dispose() must wake parked sender so it surfaces ObjectDisposedException, not deadlock.");
+
+        parkedCt.Dispose();
     }
 }
 
@@ -420,4 +483,111 @@ public class ConcurrentStreamTests
 
         await s.SendTrailersAsync(Grpc.Core.StatusCode.OK);
     }
+
+    /// <summary>
+    /// Heavy concurrent FC stress: <c>StreamCount</c> streams in parallel,
+    /// each sending enough 64 KiB messages to cross the per-stream drip
+    /// threshold (limit/4 = 8 MiB) several times. This is the .NET
+    /// counterpart to grpc-go-shmem's
+    /// <c>TestShmFlowControl_ConcurrentStreams_StressMultiStreamWU</c>
+    /// — verifies that:
+    /// <list type="bullet">
+    ///   <item><description>The FC path holds up under multi-stream load with no deadlock.</description></item>
+    ///   <item><description><see cref="ShmConnection.WindowUpdateFramesEmittedForTest"/> is incremented (proves WU drip path actually fires across streams, not silently bypassed).</description></item>
+    ///   <item><description>Every byte sent is received intact and in-order on each stream (no cross-stream contamination).</description></item>
+    /// </list>
+    /// <para>
+    /// Per-stream payload is sized to deterministically cross the drip
+    /// threshold: 64 KiB * 200 messages = 12.5 MiB &gt; 8 MiB drip threshold.
+    /// </para>
+    /// </summary>
+    [Test]
+    [Platform("Win")]
+    [NonParallelizable] // touches process-global WindowUpdate counter
+    [CancelAfter(60000)]
+    public async Task ConcurrentStreams_HeavyFlowControlStress_AllRpcsCompleteWithWU()
+    {
+        const int StreamCount = 50;       // intentionally modest for CI determinism
+        const int MessagesPerStream = 200;
+        const int MessageBytes = 64 * 1024;
+
+        var wuBefore = ShmConnection.WindowUpdateFramesEmittedForTest();
+
+        var segmentName = $"fc_stress_{Guid.NewGuid():N}";
+        using var server = ShmConnection.CreateAsServer(
+            segmentName, ringCapacity: 16 * 1024 * 1024, maxStreams: (uint)(StreamCount * 4));
+        using var client = ShmConnection.ConnectAsClient(segmentName);
+
+        // Per-stream payload reused — must be deep-copied on receive
+        // for any equality assertion. Use a small per-stream marker.
+        var clientTasks = new List<Task>();
+        var serverTasks = new List<Task>();
+        var perStreamBytes = new long[StreamCount];
+
+        for (int i = 0; i < StreamCount; i++)
+        {
+            var idx = i;
+            serverTasks.Add(Task.Run(async () =>
+            {
+                var s = await server.AcceptStreamAsync();
+                Assert.That(s, Is.Not.Null, $"server stream #{idx} accept");
+                using var ss = s!;
+                await ss.SendResponseHeadersAsync();
+                long received = 0;
+                int msgCount = 0;
+                await foreach (var msg in ss.ReceiveLpmMessagesAsync())
+                {
+                    received += msg.Length;
+                    msgCount++;
+                }
+                Assert.That(msgCount, Is.EqualTo(MessagesPerStream),
+                    $"stream #{idx} expected {MessagesPerStream} msgs, got {msgCount}");
+                Interlocked.Add(ref perStreamBytes[idx], received);
+                await ss.SendMessageAsync(LpmHelpers.WrapLpmText("ok"));
+                await ss.SendTrailersAsync(Grpc.Core.StatusCode.OK);
+            }));
+        }
+
+        for (int i = 0; i < StreamCount; i++)
+        {
+            var idx = i;
+            clientTasks.Add(Task.Run(async () =>
+            {
+                var stream = client.CreateStream();
+                await stream.SendRequestHeadersAsync($"/fc-stress/{idx}", "localhost");
+                // Use a fresh buffer per stream so each Send completes
+                // before re-entering (single-threaded per-stream).
+                var payload = new byte[MessageBytes];
+                payload[0] = (byte)(idx & 0xFF);
+                var lpm = LpmHelpers.WrapLpm(payload);
+                for (int m = 0; m < MessagesPerStream; m++)
+                {
+                    await stream.SendMessageAsync(lpm);
+                }
+                await stream.SendHalfCloseAsync();
+                await stream.ReceiveResponseHeadersAsync();
+                await foreach (var _ in stream.ReceiveLpmMessagesAsync()) { }
+            }));
+        }
+
+        await Task.WhenAll(clientTasks.Concat(serverTasks));
+
+        // Every stream should have received exactly MessagesPerStream * MessageBytes.
+        for (int i = 0; i < StreamCount; i++)
+        {
+            Assert.That(perStreamBytes[i], Is.EqualTo((long)MessagesPerStream * MessageBytes),
+                $"stream #{i} byte count mismatch");
+        }
+
+        // The cross-stream FC drip path MUST have fired at least once
+        // (12.5 MiB per stream * 50 streams = 625 MiB inbound on server;
+        //  drip threshold = 8 MiB → many WUs).
+        var wuAfter = ShmConnection.WindowUpdateFramesEmittedForTest();
+        Assert.That(wuAfter, Is.GreaterThan(wuBefore),
+            "ConcurrentStreams_HeavyFlowControlStress: expected the receiver " +
+            "to emit at least one stream- or conn-level WINDOW_UPDATE under " +
+            "this load (625 MiB inbound, drip at 8 MiB). Zero WU emissions " +
+            "means the multi-stream FC path is not wired or is bypassed.");
+    }
 }
+

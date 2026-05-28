@@ -462,21 +462,20 @@ public class EndToEndTests
     }
 
     /// <summary>
-    /// Verifies the gRFC no-WU alignment (matches grpc-go-shmem v3.4+
-    /// shmNoWU=true default): a full unary RPC in DEFAULT mode (no
-    /// SHM_FAIR_STREAM_WINDOW) MUST NOT emit any WINDOW_UPDATE wire
-    /// frames. Ring WaitForSpace is the canonical back-pressure
-    /// primitive on SHM; H2 stream-window machinery is elided.
+    /// Sub-threshold guard: a small unary RPC in DEFAULT window mode
+    /// (32 MiB initial limit, drip at limit/4 = 8 MiB) MUST NOT emit
+    /// any <c>WINDOW_UPDATE</c> wire frames because neither the
+    /// per-stream drip nor the per-LPM pre-credit threshold is crossed.
+    /// This guards the fast path (no FC overhead for typical RPC sizes)
+    /// per the gRFC SHM HTTP/2 FC design (Phase A).
     ///
-    /// This test guards interop with Go peers in their default mode:
-    /// neither side emits WU, neither expects to receive WU. If a
-    /// future change accidentally re-enables WU emission here, this
-    /// test fails and signals an interop break.
+    /// A companion test (<c>WindowUpdate_EmittedForLargeTransfer</c>)
+    /// verifies the positive case where WU IS emitted.
     /// </summary>
     [Test]
     [NonParallelizable] // Uses process-global s_wuFramesEmitted counter.
     [CancelAfter(10000)]
-    public async Task NoWindowUpdate_EmittedInDefaultMode_GrpcGoInteropAlignment()
+    public async Task NoWindowUpdate_EmittedForSmallUnary_SubDripThreshold()
     {
         // Snapshot before
         var before = ShmConnection.WindowUpdateFramesEmittedForTest();
@@ -515,11 +514,187 @@ public class EndToEndTests
         Assert.That(resp, Is.EqualTo(responseData), "response body interop");
         Assert.That(cs.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.OK));
 
-        // The actual no-WU assertion.
+        // Small-RPC fast-path: payload is far below the 8 MiB drip
+        // threshold and 32 MiB pre-credit headroom, so NO WU frames
+        // should be emitted on the wire.
         var after = ShmConnection.WindowUpdateFramesEmittedForTest();
         Assert.That(after, Is.EqualTo(before),
-            "gRFC SHM alignment: SHM MUST NOT emit WINDOW_UPDATE frames in any mode " +
-            "(must match grpc-go-shmem shmNoWU=true). The opt-in SHM_FAIR_STREAM_WINDOW " +
-            "env var only affects wire-format parity (chunking, coalescing), not flow control.");
+            "Sub-drip-threshold RPCs must not emit WINDOW_UPDATE frames " +
+            "(default initial window 32 MiB, drip threshold 8 MiB). " +
+            "Seeing WU here means a fast-path FC optimization regressed.");
+    }
+
+    /// <summary>
+    /// Positive WU guard: when the receiver drains more than the
+    /// stream-level drip threshold (limit/4 = 8 MiB on default 32 MiB
+    /// initial window), it MUST emit a stream-level
+    /// <c>WINDOW_UPDATE</c>. This guards the gRFC SHM HTTP/2 FC
+    /// implementation against regression to no-WU mode.
+    /// </summary>
+    [Test]
+    [NonParallelizable] // Uses process-global s_wuFramesEmitted counter.
+    [CancelAfter(30000)]
+    public async Task WindowUpdate_EmittedForLargeTransfer_AboveDripThreshold()
+    {
+        var before = ShmConnection.WindowUpdateFramesEmittedForTest();
+
+        var segmentName = $"grpc_yes_wu_{Guid.NewGuid():N}";
+        // Larger ring (16 MiB) so we can actually push enough bytes to
+        // cross the 8 MiB drip threshold without ring backpressure.
+        using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 16 * 1024 * 1024, maxStreams: 100);
+        using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
+
+        // Payload chosen > limit/4 = 8 MiB so the receiver's drip
+        // threshold is crossed once the application drains it.
+        var bigPayload = new byte[10 * 1024 * 1024];
+        new Random(42).NextBytes(bigPayload);
+        var responseData = Encoding.UTF8.GetBytes("ok");
+
+        var serverTask = Task.Run(async () =>
+        {
+            var stream = await serverConnection.AcceptStreamAsync();
+            using var s = stream!;
+            byte[]? received = null;
+            await foreach (var m in s.ReceiveLpmMessagesAsync()) received = m;
+            await s.SendResponseHeadersAsync();
+            await s.SendMessageAsync(LpmHelpers.WrapLpm(responseData));
+            await s.SendTrailersAsync(StatusCode.OK, "Success");
+            return received;
+        });
+
+        using var cs = clientConnection.CreateStream();
+        await cs.SendRequestHeadersAsync("/big.Greeter/SayHello", "localhost");
+        await cs.SendMessageAsync(LpmHelpers.WrapLpm(bigPayload));
+        await cs.SendHalfCloseAsync();
+        await cs.ReceiveResponseHeadersAsync();
+        byte[]? resp = null;
+        await foreach (var m in cs.ReceiveLpmMessagesAsync()) resp = m;
+        var serverReceived = await serverTask;
+
+        Assert.That(serverReceived!.Length, Is.EqualTo(bigPayload.Length), "request bytes received");
+        Assert.That(resp, Is.EqualTo(responseData));
+        Assert.That(cs.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.OK));
+
+        var after = ShmConnection.WindowUpdateFramesEmittedForTest();
+        Assert.That(after, Is.GreaterThan(before),
+            "Transferring 10 MiB through a 32 MiB initial window (drip at " +
+            "8 MiB) MUST emit at least one WINDOW_UPDATE frame. Zero WU " +
+            "emissions here means the FC drip path is not wired or is " +
+            "miscounting.");
+    }
+
+    /// <summary>
+    /// Verifies the contract of
+    /// <see cref="ShmConnection.InlineReceiveContinuations"/>: when the
+    /// flag is set on the connection BEFORE a stream is created, the
+    /// stream's inbound channel must dispatch consumer continuations
+    /// synchronously on a non-ThreadPool dispatch thread (the SHM
+    /// reader thread, or, with the receive striper enabled, one of
+    /// the four stripe Threads). This is the per-receive optimisation
+    /// that saves ~17 us/hop on Windows; the test asserts the
+    /// contract by checking <see cref="Thread.IsThreadPoolThread"/>
+    /// on the continuation execution thread.
+    ///
+    /// Note: with the receive-side striper enabled (default), the
+    /// inbound channel uses AllowSynchronousContinuations=true even
+    /// when InlineReceiveContinuations is left at its default value,
+    /// because the stripe Thread is a safe single-dispatch-point.
+    /// So both halves of this test exercise the non-ThreadPool
+    /// dispatch path; setting SHM_RECEIVE_STRIPER=0 restores the
+    /// legacy reader-Thread-only behaviour where InlineReceiveContinuations
+    /// is the sole knob.
+    /// </summary>
+    [Test]
+    [Platform("Win")]
+    [CancelAfter(15000)]
+    public async Task InlineReceiveContinuations_OptIn_RunsConsumerOnReaderThread()
+    {
+        var inlineThreadIsPool = await RunInlineReceiveContractAsync(inline: true).ConfigureAwait(false);
+        var legacyThreadIsPool = await RunInlineReceiveContractAsync(inline: false).ConfigureAwait(false);
+
+        Assert.That(inlineThreadIsPool, Is.False,
+            "InlineReceiveContinuations=true: consumer continuation should run " +
+            "on the SHM dispatch thread (reader Thread, or stripe Thread when " +
+            "the receive striper is enabled). " +
+            "IsThreadPoolThread=true means the continuation was dispatched " +
+            "via ThreadPool — i.e., AllowSynchronousContinuations was NOT " +
+            "honoured on the inbound Channel.");
+
+        // Striper default-on. With the striper enabled, the stripe
+        // Thread is the inbound-channel writer and
+        // AllowSynchronousContinuations is forced ON regardless of
+        // the InlineReceiveContinuations flag (see ShmGrpcStream
+        // ctor). So the default-environment branch dispatches inline
+        // on the stripe Thread as well.
+        var striperDisabled = string.Equals(
+            Environment.GetEnvironmentVariable("SHM_RECEIVE_STRIPER"),
+            "0", StringComparison.Ordinal);
+        if (striperDisabled)
+        {
+            Assert.That(legacyThreadIsPool, Is.True,
+                "InlineReceiveContinuations=false (default) with striper off: " +
+                "consumer continuation should run on a ThreadPool worker. " +
+                "IsThreadPoolThread=false means the continuation was inlined " +
+                "despite the flag being off.");
+        }
+        else
+        {
+            Assert.That(legacyThreadIsPool, Is.False,
+                "InlineReceiveContinuations=false (default) with striper on: " +
+                "consumer continuation should still run on the stripe Thread " +
+                "(non-ThreadPool). IsThreadPoolThread=true means the striper " +
+                "did not engage AllowSynchronousContinuations on the per-stream " +
+                "channel.");
+        }
+
+        static async Task<bool> RunInlineReceiveContractAsync(bool inline)
+        {
+            var segmentName = $"grpc_inlinerx_{Guid.NewGuid():N}";
+            using var server = ShmConnection.CreateAsServer(segmentName, ringCapacity: 4096, maxStreams: 100);
+            using var client = ShmConnection.ConnectAsClient(segmentName);
+
+            // Flag MUST be set before any inbound channel is constructed —
+            // Channel<T> options are immutable after construction.
+            client.InlineReceiveContinuations = inline;
+
+            var serverAcceptTask = Task.Run(async () => await server.AcceptStreamAsync().ConfigureAwait(false));
+            using var cs = client.CreateStream();
+            await cs.SendRequestHeadersAsync("/inlinerx.Test/Probe", "localhost").ConfigureAwait(false);
+
+            var ss = (await serverAcceptTask.ConfigureAwait(false))!;
+            using var srv = ss;
+
+            // Park a consumer that captures the executing thread's
+            // ThreadPool-membership the instant a frame arrives.
+            var consumerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            bool? consumerThreadIsPool = null;
+            var consumerTask = Task.Run(async () =>
+            {
+                consumerStarted.SetResult();
+                await foreach (var _ in cs.ReceiveLpmMessagesAsync().ConfigureAwait(false))
+                {
+                    consumerThreadIsPool = Thread.CurrentThread.IsThreadPoolThread;
+                    break;
+                }
+            });
+
+            // Wait for the consumer task to be scheduled and parked on
+            // the inbound channel's WaitToReadAsync. The 100 ms is well
+            // above scheduler jitter on a 4-core Windows VM and ensures
+            // the producer's TryWrite hits a registered awaiter — that's
+            // the code path AllowSynchronousContinuations affects.
+            await consumerStarted.Task.ConfigureAwait(false);
+            await Task.Delay(100).ConfigureAwait(false);
+
+            await srv.SendResponseHeadersAsync().ConfigureAwait(false);
+            await srv.SendMessageAsync(LpmHelpers.WrapLpm(Encoding.UTF8.GetBytes("probe"))).ConfigureAwait(false);
+            await srv.SendTrailersAsync(StatusCode.OK).ConfigureAwait(false);
+
+            await consumerTask.ConfigureAwait(false);
+
+            Assert.That(consumerThreadIsPool, Is.Not.Null,
+                "Consumer never observed the inbound message — receive path is broken.");
+            return consumerThreadIsPool!.Value;
+        }
     }
 }
