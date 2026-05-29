@@ -1043,9 +1043,24 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
                 //     over the marginal pause cost.
                 const int CoalesceLatencyCapBytes = 64 * 1024;
                 var lpmFramedSize = 5 + size;
+                // HTTP/2 send-quota gate: the coalesce branch opens
+                // BeginInlineBatch which SUPPRESSES the HEADERS wake until
+                // EndInlineBatch fires. WriteInlineDirectMultiFrame then
+                // calls ReserveSendQuotaOrBlock(lpmFramedSize) on the
+                // stream — if that blocks (quota < lpmFramedSize), the
+                // peer never sees the suppressed HEADERS, so no
+                // WINDOW_UPDATE can flow, deadlocking the stream
+                // (same F1/F2 shape as PR #21, just via FC quota).
+                // Pre-check the snapshot — this stream is single-producer
+                // for sends so the quota only grows from here until we
+                // call ReserveSendQuotaOrBlock. If insufficient, fall
+                // through to the safe non-batched fall-back path which
+                // commits HEADERS first (firing its own wake), letting
+                // the peer drain DATA and send WINDOW_UPDATE.
                 if (_shmStream.HasStagedHeaders
                     && size <= CoalesceLatencyCapBytes
                     && writer.CanCoalesceInlineMessage(lpmFramedSize)
+                    && _shmStream.SendQuota >= lpmFramedSize
                     && writer.TryPauseWriterLoop())
                 {
                     try
