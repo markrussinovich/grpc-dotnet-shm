@@ -1113,15 +1113,44 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         Google.Protobuf.IMessage protoMsg,
         CancellationToken cancellationToken)
     {
-        await _shmStream.FlushStagedHeadersAsync(cancellationToken).ConfigureAwait(false);
-
-        // Now re-enter the inline DATA fast path. Recursion-safe because
-        // HasStagedHeaders is now false (Flush consumed it).
+        // Coalesce-gate-failed fall-back. Two paths possible:
+        //
+        //   FAST: writer.TryPauseWriterLoop succeeds. Write the staged
+        //         Headers inline + the DATA inline UNDER THE SAME
+        //         PAUSE. No BeginInlineBatch is opened, so each
+        //         CommitWrite fires its own SignalData as today —
+        //         wire-level wake count is identical to the pre-PR
+        //         path (Headers + N DATA chunks + HalfClose). The win
+        //         vs the prior implementation is that Headers skips
+        //         the queued `SendFrameAsync` overhead (~10-30 us /
+        //         call for Task allocation + WriterLoop scheduling)
+        //         and goes inline on the caller thread, matching the
+        //         OLD `SendRequestHeadersAsync` behaviour. Without
+        //         this path, Unary calls whose size exceeds the
+        //         coalesce gate (e.g., fair mode `SHM_FAIR_MAX_FRAME=
+        //         16 KiB` with a 64 KiB Unary body) would regress vs
+        //         pre-PR by the queued-Headers latency.
+        //
+        //         Important: do NOT use `BeginInlineBatch` here. The
+        //         coalesce gate already rejected this size because
+        //         the body chunks into multiple frames under
+        //         `RingFrameStream`, and chunked writes under an open
+        //         batch are the F1 deadlock class fixed in PR #21
+        //         (signals suppressed -> peer never drains -> ring
+        //         fills -> next chunk's `ReserveWrite` blocks).
+        //
+        //   SLOW: TryPauseWriterLoop loses the CAS to another inline
+        //         writer (rare; only at multi-stream concurrency).
+        //         Falls back to the queued path: flush Headers via
+        //         the standard `SendFrameAsync` queue, then drive
+        //         DATA through the marshaller into a pooled buffer
+        //         and queue it too.
         var writer = _shmStream.Connection.FrameWriter;
         if (writer != null && writer.TryPauseWriterLoop())
         {
             try
             {
+                _shmStream.WriteStagedHeadersInline(writer);
                 writer.WriteInlineDirectMultiFrame(_shmStream.StreamId, size, protoMsg, 0, default, _shmStream);
                 return;
             }
@@ -1131,10 +1160,7 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
             }
         }
 
-        // Fallback to the standard marshaller-driven path (TryPause
-        // contended). Uses the same serializer the caller provided so
-        // DirectWriteSerializationContext correctly reserves the 5-byte
-        // gRPC LPM header at the front of its pooled buffer.
+        await _shmStream.FlushStagedHeadersAsync(cancellationToken).ConfigureAwait(false);
         var ctx = new DirectWriteSerializationContext(_shmStream);
         serializer(message, ctx);
         await ctx.SendResult(cancellationToken).ConfigureAwait(false);
