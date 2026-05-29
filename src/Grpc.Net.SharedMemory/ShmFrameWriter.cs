@@ -1867,8 +1867,22 @@ internal sealed class ShmFrameWriter : IDisposable
             // WINDOW_UPDATE credit). gRFC SHM v3.4+ FC.
             if (_fairStream != null) _owner.DrainControlFrames();
             _fairStream?.ReserveSendQuotaOrBlock(chunkPayload, _fairStream != null ? _owner.DrainControlFrames : null, _ct);
-            var totalSize = _wireHeaderSize + chunkPayload;
-            _currentReservation = _ring.ReserveWrite(totalSize, _ct);
+            // Refund send quota if ring reservation throws (e.g., RingClosed,
+            // OperationCanceled): we have debited chunkPayload bytes but
+            // never put them on the wire, so peer will never emit WU to
+            // refund. Without this, future sends on this stream block
+            // forever waiting for credit that the peer doesn't owe.
+            WriteReservation reservation;
+            try
+            {
+                reservation = _ring.ReserveWrite(_wireHeaderSize + chunkPayload, _ct);
+            }
+            catch
+            {
+                _fairStream?.RefundSendQuota(chunkPayload);
+                throw;
+            }
+            _currentReservation = reservation;
             _currentFrameCapacity = chunkPayload;
             _currentFrameWritten = 0;
             _reservationActive = true;
@@ -2056,6 +2070,17 @@ internal sealed class ShmFrameWriter : IDisposable
                 }
                 catch { /* ring may be closed */ }
                 _reservationActive = false;
+                // Refund the unused portion of H2 send quota: we reserved
+                // _currentFrameCapacity bytes but only put _currentFrameWritten
+                // bytes on the wire, so the peer will only emit WU for the
+                // bytes it received. Without this refund we permanently
+                // over-debit by (capacity - written) per partial frame,
+                // causing future sends on the stream to stall.
+                var unused = _currentFrameCapacity - _currentFrameWritten;
+                if (unused > 0)
+                {
+                    _fairStream?.RefundSendQuota(unused);
+                }
             }
             base.Dispose(disposing);
         }

@@ -171,8 +171,19 @@ public static class FrameProtocol
             // granted enough WINDOW_UPDATE credit). gRFC SHM v3.4+ FC.
             preChunkDrain?.Invoke();
             fairStream?.ReserveSendQuotaOrBlock(data.Length, preChunkDrain, cancellationToken);
-            var header = new FrameHeader(FrameType.Message, streamId, (uint)data.Length, flags);
-            WriteFrame(ring, header, data, cancellationToken);
+            // Refund quota if WriteFrame throws: we have debited but the
+            // bytes never reached the peer, so no future WU will arrive
+            // to refund and the stream would stall on the next send.
+            try
+            {
+                var header = new FrameHeader(FrameType.Message, streamId, (uint)data.Length, flags);
+                WriteFrame(ring, header, data, cancellationToken);
+            }
+            catch
+            {
+                fairStream?.RefundSendQuota(data.Length);
+                throw;
+            }
             return;
         }
 
@@ -199,9 +210,20 @@ public static class FrameProtocol
             // WINDOW_UPDATE credit). gRFC SHM v3.4+ FC.
             preChunkDrain?.Invoke();
             fairStream?.ReserveSendQuotaOrBlock(chunkSize, preChunkDrain, cancellationToken);
-
-            var header = new FrameHeader(FrameType.Message, streamId, (uint)chunkSize, chunkFlags);
-            WriteFrame(ring, header, chunk, cancellationToken);
+            // Refund quota if WriteFrame throws mid-chunk: we have debited
+            // chunkSize bytes but the peer never received them, so no WU
+            // will ever refund this credit. Prior chunks in this loop are
+            // already on the wire and will be acked by peer WU as normal.
+            try
+            {
+                var header = new FrameHeader(FrameType.Message, streamId, (uint)chunkSize, chunkFlags);
+                WriteFrame(ring, header, chunk, cancellationToken);
+            }
+            catch
+            {
+                fairStream?.RefundSendQuota(chunkSize);
+                throw;
+            }
         }
     }
 

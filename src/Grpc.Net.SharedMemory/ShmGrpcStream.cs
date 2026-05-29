@@ -454,6 +454,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             // a Set between Reset and Wait still wakes us.
             _sendQuotaWake.Reset();
             if (TryReserveSendQuota(n)) return;
+            // Re-check disposal AFTER Reset to close the missed-wake
+            // race where Dispose() ran between our earlier
+            // ThrowIfDisposed() and our Reset() — Dispose's wake-Set
+            // would have been cleared by Reset, and the subsequent
+            // Wait(ct=None) would block forever because no future
+            // AddSendQuota arrives for a disposed/removed stream.
+            // Cancellation is re-checked symmetrically.
+            ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
             // Flush pending control frames (Ping/Pong keepalive) so
             // they are not stranded behind a blocked DATA write while
             // we wait for the peer to grant more quota.

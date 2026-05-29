@@ -272,6 +272,69 @@ public class FlowControlTests
 
         parkedCt.Dispose();
     }
+
+    /// <summary>
+    /// Round-5 review (Opus 4.8 HIGH): closes the missed-wake race
+    /// in <c>ReserveSendQuotaOrBlock</c> where Dispose's wake-Set
+    /// lands in the window between the sender's initial
+    /// <c>ThrowIfDisposed</c> and its <c>_sendQuotaWake.Reset()</c>.
+    /// The Reset clears the wake; without the post-Reset re-check
+    /// added in this round, <c>Wait(ct=None)</c> would block forever.
+    ///
+    /// Stress-races Dispose against fresh entry into the loop with
+    /// <c>ct=None</c>; with the fix, every iteration surfaces
+    /// <see cref="ObjectDisposedException"/>. Without the fix, at
+    /// least one iteration of the 200-run stress deadlocks and the
+    /// <c>[CancelAfter]</c> watchdog fails the test.
+    /// </summary>
+    [Test]
+    [Platform("Win")]
+    [CancelAfter(15000)]
+    public async Task ReserveSendQuotaOrBlock_DisposeRace_NoDeadlock_Stress()
+    {
+        const int iterations = 200;
+        for (int i = 0; i < iterations; i++)
+        {
+            var segmentName = $"flow_dispose_race_{i}_{Guid.NewGuid():N}";
+            using var server = ShmConnection.CreateAsServer(segmentName, ringCapacity: 65536, maxStreams: 10);
+            using var client = ShmConnection.ConnectAsClient(segmentName);
+            var clientStream = client.CreateStream();
+
+            // Drain per-stream quota to 0.
+            var initialQuota = (int)clientStream.SendQuota;
+            Assert.That(clientStream.TryReserveSendQuota(initialQuota), Is.True);
+
+            // Concurrently race sender entry vs Dispose. Sender uses
+            // CancellationToken.None to deliberately exclude the
+            // cancellation-token-based unblock path \u2014 the test
+            // verifies the disposal-check path itself.
+            using var startBarrier = new ManualResetEventSlim(false);
+            var senderDone = new TaskCompletionSource<Exception?>();
+            var t = Task.Run(() =>
+            {
+                startBarrier.Wait();
+                try
+                {
+                    clientStream.ReserveSendQuotaOrBlock(1, drainBeforeWait: null, CancellationToken.None);
+                    senderDone.SetResult(null);
+                }
+                catch (Exception ex)
+                {
+                    senderDone.SetResult(ex);
+                }
+            });
+
+            // Release the sender and Dispose almost simultaneously
+            // to maximize chance of hitting the Reset/Wait window.
+            startBarrier.Set();
+            clientStream.Dispose();
+
+            var ex = await senderDone.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.That(ex, Is.InstanceOf<ObjectDisposedException>(),
+                $"Iteration {i}: Dispose must wake parked sender even when ct=None " +
+                "(missed-wake race between Set-by-Dispose and Reset-by-sender).");
+        }
+    }
 }
 
 /// <summary>
