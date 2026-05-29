@@ -1129,7 +1129,19 @@ internal sealed class ShmFrameWriter : IDisposable
                 chunkFlags = MessageFlags.More;
 
             var header = new FrameHeader(FrameType.Message, entry.StreamId, (uint)chunkSize, chunkFlags);
-            FrameProtocol.WriteFrame(_ring, header, fullPayload.Slice(offset, chunkSize), _ct);
+            // Refund quota if WriteFrame throws (RingClosed during
+            // teardown, OperationCanceled): the bytes never reach the
+            // peer, so no WINDOW_UPDATE will refund this credit (same
+            // bug-class as round-5 FrameProtocol.WriteMessage fix).
+            try
+            {
+                FrameProtocol.WriteFrame(_ring, header, fullPayload.Slice(offset, chunkSize), _ct);
+            }
+            catch
+            {
+                fairStream.RefundSendQuota(chunkSize);
+                throw;
+            }
             offset += chunkSize;
         }
         return offset;
@@ -1762,12 +1774,6 @@ internal sealed class ShmFrameWriter : IDisposable
         // protobuf directly into the ring reservation. No CodedOutputStream,
         // no intermediate buffer, no Stream abstraction — one copy from
         // protobuf fields to ring memory.
-        // Track whether the single-frame path already reserved H2 send
-        // quota for the full message. If we fall through to the RFS path
-        // because the ring reservation wrapped, RFS MUST NOT charge the
-        // quota again — outer already paid for framePayloadSize bytes
-        // (gRFC SHM v3.4 FC double-charge fix).
-        bool quotaAlreadyReserved = false;
         if (framePayloadSize <= singleFrameThreshold)
         {
             // Flush pending Ping/Pong control frames before the message
@@ -1776,41 +1782,72 @@ internal sealed class ShmFrameWriter : IDisposable
             // (blocks until peer grants enough WINDOW_UPDATE credit).
             if (fairStream != null) DrainControlFrames();
             fairStream?.ReserveSendQuotaOrBlock(framePayloadSize, fairStream != null ? DrainControlFrames : null, ct);
-            quotaAlreadyReserved = fairStream != null;
+            bool quotaAlreadyReserved = fairStream != null;
             var totalSize = wireHdrSize + framePayloadSize;
-            var reservation = _ring.ReserveWrite(totalSize, ct);
-            if (reservation.Second.IsEmpty)
+            // Refund quota if any post-debit operation throws BEFORE we
+            // commit: ReserveWrite (RingClosed / OperationCanceled), or
+            // message.WriteTo (serializer fault). Without this, the bytes
+            // are debited from our send window but never reach the peer,
+            // so no WINDOW_UPDATE will refund and the stream stalls on
+            // the next send (same bug-class as round-5 fixes in
+            // FrameProtocol.WriteMessage and RingFrameStream).
+            bool committedSingleFrame = false;
+            try
             {
-                // 9-byte HTTP/2 frame header.
-                var isLast = (extraFlags & MessageFlags.More) == 0;
-                var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
-                EncodeMessageWireHeader(reservation.First.Span, streamId, framePayloadSize, flags);
-
-                // 5-byte gRPC LPM header.
-                var grpcHdr = reservation.First.Span.Slice(wireHdrSize, GrpcHeaderSize);
-                grpcHdr[0] = 0; // no compression
-                System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcHdr.Slice(1), (uint)payloadSize);
-
-                // Serialize directly into ring span — zero intermediate buffer.
-                if (payloadSize > 0)
+                var reservation = _ring.ReserveWrite(totalSize, ct);
+                if (reservation.Second.IsEmpty)
                 {
-                    var payloadSpan = reservation.First.Span.Slice(wireHdrSize + GrpcHeaderSize, payloadSize);
-                    message.WriteTo(payloadSpan);
-                }
+                    // 9-byte HTTP/2 frame header.
+                    var isLast = (extraFlags & MessageFlags.More) == 0;
+                    var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
+                    EncodeMessageWireHeader(reservation.First.Span, streamId, framePayloadSize, flags);
 
-                _ring.CommitWrite(reservation, totalSize);
-                return;
+                    // 5-byte gRPC LPM header.
+                    var grpcHdr = reservation.First.Span.Slice(wireHdrSize, GrpcHeaderSize);
+                    grpcHdr[0] = 0; // no compression
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcHdr.Slice(1), (uint)payloadSize);
+
+                    // Serialize directly into ring span — zero intermediate buffer.
+                    if (payloadSize > 0)
+                    {
+                        var payloadSpan = reservation.First.Span.Slice(wireHdrSize + GrpcHeaderSize, payloadSize);
+                        message.WriteTo(payloadSpan);
+                    }
+
+                    _ring.CommitWrite(reservation, totalSize);
+                    committedSingleFrame = true;
+                    return;
+                }
+                // Wrap-around: refund the outer reservation so the
+                // RingFrameStream fall-through below can re-reserve per
+                // chunk without double-charging. Safe because this stream
+                // is single-producer for sends (gRPC contract for an
+                // in-flight body), so no other thread races for the
+                // refunded credit between Refund and the RFS's first
+                // ReserveSendQuotaOrBlock.
+                if (quotaAlreadyReserved)
+                {
+                    fairStream?.RefundSendQuota(framePayloadSize);
+                    quotaAlreadyReserved = false;
+                }
             }
-            // Wrap-around: fall through to RingFrameStream
+            catch
+            {
+                if (quotaAlreadyReserved && !committedSingleFrame)
+                {
+                    fairStream?.RefundSendQuota(framePayloadSize);
+                }
+                throw;
+            }
         }
 
         // Multi-frame or wrap-around: prepend 5-byte gRPC header, then
-        // WriteTo(IBufferWriter) through RingFrameStream. Pass
-        // fairStream=null when wrap fall-through already reserved quota
-        // — RFS must skip its own ReserveSendQuotaOrBlock calls to
-        // avoid double-charging the H2 send window (gRFC SHM v3.4).
-        var rfsFairStream = quotaAlreadyReserved ? null : fairStream;
-        using var rfs = new RingFrameStream(this, streamId, framePayloadSize, chunkSize, extraFlags, ct, rfsFairStream);
+        // WriteTo(IBufferWriter) through RingFrameStream. The single-frame
+        // path above always either commits + returns, or refunds the outer
+        // quota reservation before falling through, so RFS owns the quota
+        // accounting from here \u2014 its per-chunk Reserve + Dispose-refund
+        // logic handles partial-write rollback correctly.
+        using var rfs = new RingFrameStream(this, streamId, framePayloadSize, chunkSize, extraFlags, ct, fairStream);
         // Write gRPC header as first 5 bytes
         Span<byte> grpcHeader = stackalloc byte[GrpcHeaderSize];
         grpcHeader[0] = 0; // no compression

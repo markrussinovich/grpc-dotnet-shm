@@ -1068,10 +1068,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // SHM drip-on-receive: SHM has no intermediate copy buffer
             // (the codec parses directly from the ring), so "received"
             // and "read-by-app" are effectively the same event. We
-            // settle the receive-side drip here instead of waiting for
-            // an OnAppRead call, which may never come for consumers
-            // that don't go through ShmGrpcStream.ReceiveLpmMessagesAsync
-            // (e.g. the gRPC.Net.Client HttpContent stream path).
+            // settle the receive-side drip here at parse time. This is
+            // the SOLE entry point for stream-level WU drip; there is
+            // no separate post-app-read path (avoids the double-credit
+            // footgun a future OnAppRead wiring could introduce).
             // Matches grpc-go-shmem v3.4+ drip-on-receive behavior.
             var streamWu = stream.InFlow.OnRead(payloadLen);
             if (streamWu > 0)
@@ -1214,27 +1214,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         catch (InvalidOperationException)
         {
             // Writer closed; ignore.
-        }
-    }
-
-    /// <summary>
-    /// Stream-level app-Read drip path: invoked by <see cref="ShmGrpcStream"/>
-    /// whenever a complete LPM is yielded to the application. The byte
-    /// count <paramref name="n"/> SHOULD match what was previously
-    /// accounted via <c>InFlow.OnData</c> for the same bytes (i.e. the
-    /// full LPM size in our codec: 5-byte LPM header + body). Refunds
-    /// any outstanding pre-credit debt first, then accumulates toward
-    /// the <c>limit/4</c> drip threshold; emits the stream-level WU
-    /// when the threshold is crossed.
-    /// </summary>
-    internal void OnAppRead(uint streamId, int n)
-    {
-        if (n <= 0) return;
-        if (!_streams.TryGetValue(streamId, out var stream)) return;
-        var wu = stream.InFlow.OnRead((uint)n);
-        if (wu > 0)
-        {
-            EmitWindowUpdate(streamId, wu);
         }
     }
 

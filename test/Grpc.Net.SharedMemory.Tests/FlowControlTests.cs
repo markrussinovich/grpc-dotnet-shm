@@ -281,11 +281,22 @@ public class FlowControlTests
     /// The Reset clears the wake; without the post-Reset re-check
     /// added in this round, <c>Wait(ct=None)</c> would block forever.
     ///
-    /// Stress-races Dispose against fresh entry into the loop with
-    /// <c>ct=None</c>; with the fix, every iteration surfaces
-    /// <see cref="ObjectDisposedException"/>. Without the fix, at
-    /// least one iteration of the 200-run stress deadlocks and the
-    /// <c>[CancelAfter]</c> watchdog fails the test.
+    /// NOTE (round-6 audit): this is a PROBABILISTIC smoke test, not
+    /// a deterministic race reproducer. The dominant scheduling has
+    /// the main thread's <c>Dispose</c> win against the freshly-released
+    /// worker, so most iterations exercise the trivial loop-top
+    /// <c>ThrowIfDisposed</c> path. The true 3-instruction race
+    /// window between loop-top check and <c>Reset</c> cannot be hit
+    /// deterministically without injecting a test-only hook into the
+    /// production hot path, which we deliberately avoid. The
+    /// correctness of the round-5 fix is established by direct
+    /// reasoning (every interleaving of {Reset, TryReserve,
+    /// ThrowIfDisposed, Wait} vs {_disposed=1, Set} either throws at
+    /// a <c>ThrowIfDisposed</c> or returns from <c>Wait</c> via sticky
+    /// Set). This test's value is "no deadlock under any reasonable
+    /// scheduling" \u2014 the 200-iteration stress also catches anything
+    /// else racy in the dispose path that future changes might
+    /// introduce.
     /// </summary>
     [Test]
     [Platform("Win")]

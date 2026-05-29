@@ -370,13 +370,30 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>
     /// Returns <paramref name="n"/> bytes of previously-reserved quota
     /// to the send window (called on rollback when a write fails after
-    /// quota was debited). Always succeeds.
+    /// quota was debited). Caps at <see cref="Synchronization.InFlow.MaxWindowSize"/>
+    /// (HTTP/2 31-bit ceiling) to defend against the race where a
+    /// concurrent <c>AddSendQuota</c> already raised the window near the
+    /// cap: without the cap, the refund could push our local view above
+    /// the peer's advertised window, eventually tripping
+    /// FLOW_CONTROL_ERROR on legitimate traffic.
     /// </summary>
     internal void RefundSendQuota(int n)
     {
         if (n <= 0) return;
-        Interlocked.Add(ref _sendQuota, n);
-        _sendQuotaWake.Set();
+        while (true)
+        {
+            var current = Volatile.Read(ref _sendQuota);
+            var desired = current + n;
+            if (desired > Synchronization.InFlow.MaxWindowSize)
+            {
+                desired = Synchronization.InFlow.MaxWindowSize;
+            }
+            if (Interlocked.CompareExchange(ref _sendQuota, desired, current) == current)
+            {
+                _sendQuotaWake.Set();
+                return;
+            }
+        }
     }
 
     /// <summary>
