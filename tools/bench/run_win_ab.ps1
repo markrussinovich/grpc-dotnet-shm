@@ -15,15 +15,13 @@ try {
 
     $variants = @(
         @{ Name="spin"; Env=@{ "SHM_WIN_ALLOW_SPIN" = "1" } },
-        @{ Name="nospin"; Env=@{} },
-        @{ Name="nospin_coal"; Env=@{ "SHM_ENABLE_COALESCE" = "1" } }
+        @{ Name="nospin"; Env=@{} }
     )
 
     foreach ($v in $variants) {
         for ($t = 1; $t -le $Trials; $t++) {
             # Reset env
             Remove-Item Env:\SHM_WIN_ALLOW_SPIN -ErrorAction SilentlyContinue
-            Remove-Item Env:\SHM_ENABLE_COALESCE -ErrorAction SilentlyContinue
             foreach ($k in $v.Env.Keys) {
                 Set-Item -Path "Env:$k" -Value $v.Env[$k]
             }

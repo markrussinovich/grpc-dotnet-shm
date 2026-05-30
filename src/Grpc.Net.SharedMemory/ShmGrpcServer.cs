@@ -50,6 +50,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     private readonly ulong _ringCapacity;
     private readonly uint _maxStreams;
     private readonly bool _singleStreamMode;
+    private readonly bool _inlineReceiveContinuations;
     private readonly bool _pooledDeserialization;
     private readonly int _maxReceiveMessageSize;
     private readonly int _maxSendMessageSize;
@@ -70,15 +71,27 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     /// <param name="maxReceiveMessageSize">Maximum receive message size in bytes (default: 4MB, 0 = unlimited).</param>
     /// <param name="maxSendMessageSize">Maximum send message size in bytes (default: unlimited).</param>
     /// <param name="compressionOptions">Optional compression options for send/receive.</param>
+    /// <param name="inlineReceiveContinuations">
+    /// When true, accepted connections invoke awaiting inbound-frame
+    /// continuations inline on the reader thread instead of dispatching
+    /// them through the ThreadPool. Saves ~17 µs/receive on Windows but
+    /// is ONLY safe when (a) each connection serves at most one active
+    /// stream at a time and (b) server handlers never perform a
+    /// synchronous wait that depends on the reader thread making further
+    /// progress. Default <c>false</c>. See
+    /// <see cref="ShmConnection.InlineReceiveContinuations"/>.
+    /// </param>
     public ShmGrpcServer(string segmentName, ulong ringCapacity = 64 * 1024 * 1024, uint maxStreams = 100,
         bool singleStreamMode = false, bool pooledDeserialization = false,
         int maxReceiveMessageSize = 4 * 1024 * 1024, int maxSendMessageSize = int.MaxValue,
-        Compression.ShmCompressionOptions? compressionOptions = null)
+        Compression.ShmCompressionOptions? compressionOptions = null,
+        bool inlineReceiveContinuations = false)
     {
         _segmentName = segmentName ?? throw new ArgumentNullException(nameof(segmentName));
         _ringCapacity = ringCapacity;
         _maxStreams = maxStreams;
         _singleStreamMode = singleStreamMode;
+        _inlineReceiveContinuations = inlineReceiveContinuations;
         _pooledDeserialization = pooledDeserialization;
         _maxReceiveMessageSize = maxReceiveMessageSize;
         _maxSendMessageSize = maxSendMessageSize;
@@ -186,6 +199,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         {
             connection.ZeroCopyRead = true;
             connection.FrameWriter?.EnableSingleStreamMode();
+        }
+
+        // Propagate the server's InlineReceiveContinuations opt-in to the
+        // connection so newly-created streams pick it up via
+        // ShmGrpcStream's Channel construction. Independent of
+        // singleStreamMode negotiation: the caller of ShmGrpcServer is
+        // responsible for ensuring its handlers are pure-async.
+        if (_inlineReceiveContinuations)
+        {
+            connection.InlineReceiveContinuations = true;
         }
 
         var activeHandlers = new List<Task>();
@@ -496,18 +519,15 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     // coalescing for large messages so each chunk's commit
                     // signals the peer reader and prevents the deadlock.
                     //
-                    // Strict-fair chunking incompatibility: when
-                    // SHM_FAIR_STREAM_WINDOW is set, SHM_FAIR_MAX_FRAME
-                    // (= 16 KiB by default) forces multi-frame chunking
-                    // even on moderately sized messages. Coalescing the
-                    // wake under chunking deadlocks: each chunk's commit
-                    // is suppressed, so the receiver never drains, and
-                    // the next chunk's ReserveWrite blocks in WaitForSpace
-                    // until the (never-arriving) EndInlineBatch fires.
-                    // Disable coalescing in fair mode so each frame
-                    // signals immediately.
-                    bool coalesce = ShmConstants.FairStreamWindow == int.MaxValue
-                                 && size + Wire.Http2FrameHeader.Size < writer.RingCapacity / 2;
+                    // Coalesce HEADERS+MESSAGE+TRAILERS into a single
+                    // SignalData wake when safe. Safe iff the message
+                    // body fits in ONE H2 DATA frame (no chunking); the
+                    // canonical predicate is ShmFrameWriter.CanCoalesceInlineMessage
+                    // which mirrors WriteInlineDirectMultiFrame's actual
+                    // chunking decision. A gate looser than that lets a
+                    // multi-chunk write into the suppressed-signal batch
+                    // and deadlocks the ring.
+                    bool coalesce = writer.CanCoalesceInlineMessage(5 + size);
                     if (coalesce) writer.BeginInlineBatch();
                     try
                     {
@@ -556,16 +576,11 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     writer.ExecuteInline(() =>
                     {
                         // Same coalescing as TryPause path — single wake for
-                        // HEADERS+MESSAGE+TRAILERS instead of three.
-                        // Size gate: a multi-chunk message under wake
-                        // suppression deadlocks (see TryPause path above
-                        // for full rationale).
-                        // Skip coalescing in strict-fair mode: SHM_FAIR_MAX_FRAME
-                        // forces multi-frame chunking, and chunked writes
-                        // under wake suppression deadlock (see TryPause
-                        // path above for full rationale).
-                        bool coalesce = ShmConstants.FairStreamWindow == int.MaxValue
-                                     && serializedSize + Wire.Http2FrameHeader.Size < writer.RingCapacity / 2;
+                        // HEADERS+MESSAGE+TRAILERS instead of three. Safe
+                        // iff the message body fits in ONE H2 DATA frame
+                        // (see TryPause path / CanCoalesceInlineMessage
+                        // for the chunking/deadlock rationale).
+                        bool coalesce = writer.CanCoalesceInlineMessage(serializedSize);
                         if (coalesce) writer.BeginInlineBatch();
                         try
                         {
@@ -687,12 +702,10 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
                 if (writer.TryPauseWriterLoop())
                 {
-                    // Size-gated wake coalescing (see Unary handler above
-                    // for full rationale; matches FlushBatch's
-                    // willLikelyChunk threshold so multi-chunk writes drop
-                    // out of the batch and the receiver can drain).
-                    bool coalesce = ShmConstants.FairStreamWindow == int.MaxValue
-                                 && size + Wire.Http2FrameHeader.Size < writer.RingCapacity / 2;
+                    // Size-gated wake coalescing (see UnaryHandler above
+                    // for full rationale). Safe iff the message fits in
+                    // ONE H2 DATA frame per ShmFrameWriter.CanCoalesceInlineMessage.
+                    bool coalesce = writer.CanCoalesceInlineMessage(5 + size);
                     if (coalesce) writer.BeginInlineBatch();
                     try
                     {
@@ -740,8 +753,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 {
                     writer.ExecuteInline(() =>
                     {
-                        bool coalesce = ShmConstants.FairStreamWindow == int.MaxValue
-                                     && serializedSize + Wire.Http2FrameHeader.Size < writer.RingCapacity / 2;
+                        bool coalesce = writer.CanCoalesceInlineMessage(serializedSize);
                         if (coalesce) writer.BeginInlineBatch();
                         try
                         {

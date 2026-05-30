@@ -44,6 +44,17 @@ internal sealed class ShmFrameWriter : IDisposable
         public byte[]? ReturnToPool;
         public ManualResetEventSlim? CompletionSignal; // set after ring write; caller waits if non-null
         public StrongBox<bool>? CancelFlag; // shared with caller; true = skip this entry
+
+        /// <summary>
+        /// Number of payload bytes already written when this Message
+        /// entry was parked in <c>_deferred</c>. 0 = fresh; equal to
+        /// <see cref="Length"/> = fully done. Non-zero means a partial
+        /// chunked write — resume from this offset. Only used for
+        /// <see cref="FrameType.Message"/> entries on the chunked-write
+        /// path (Length &gt; window). Mirrors grpc-go-shmem's
+        /// <c>deferredMessage{entry, offset}</c> resume state.
+        /// </summary>
+        public int BytesWritten;
     }
 
     /// <summary>
@@ -87,6 +98,24 @@ internal sealed class ShmFrameWriter : IDisposable
     // Parallel kernel handle for SAW-WriterLoop (env SHM_SAW_WRITERLOOP=1).
     private readonly EventWaitHandle _kernelReadySignal;
     private readonly IntPtr _kernelReadyHandle;
+
+    // Phase B deferred-on-quota-fail: when a queued Message's per-stream
+    // send window is insufficient, FlushBatch parks it here keyed by
+    // streamId instead of blocking the writer task on
+    // ReserveSendQuotaOrBlock. WU arrival on that stream wakes the
+    // writer (via NotifyQuotaUpdated) which then drains _deferred.
+    // Matches grpc-go-shmem's writer-side deferred[streamID] map.
+    //
+    // Per-stream FIFO is preserved by the inner LinkedList: AddLast on
+    // park, RemoveFirst when fully drained. LinkedList (rather than
+    // Queue) so a partial chunked-write entry at the head can be
+    // updated in place via <c>First.Value = updatedEntry</c> when its
+    // <see cref="FrameEntry.BytesWritten"/> advances without going to
+    // a fresh dequeue cycle. Single-threaded: only the writer task
+    // mutates this map; other threads only call NotifyQuotaUpdated
+    // which signals _readySignal.
+    private readonly Dictionary<uint, LinkedList<FrameEntry>> _deferred = new();
+    private int _deferredCount; // fast empty-check; mirrors _deferred values' sum of Count
 
     // Bench-only: lookup from streamId → ShmGrpcStream, used by WriterLoop to
     // route per-chunk fair-window gating into the right stream when the
@@ -148,17 +177,93 @@ internal sealed class ShmFrameWriter : IDisposable
     internal void EndInlineBatch() => _ring.EndBatchWrite();
 
     /// <summary>
-    /// Capacity (in bytes) of the underlying TX ring buffer. Used by
-    /// callers of <see cref="BeginInlineBatch"/> to decide whether the
-    /// message they are about to write is small enough to wake-coalesce
-    /// safely. Coalescing a multi-chunk message that exceeds
-    /// <c>Capacity / 2</c> deadlocks: the chunks fill the ring before the
-    /// batch closes (so no peer wake fires), the peer cannot drain, and
-    /// the next <c>ReserveWrite</c> blocks in <c>WaitForSpace</c>.
-    /// Matches the <c>willLikelyChunk</c> threshold inside
-    /// <see cref="FlushBatch"/>.
+    /// Capacity (in bytes) of the underlying TX ring buffer. Exposed
+    /// for callers that need to size-gate before opening an inline
+    /// batch — prefer <see cref="CanCoalesceInlineMessage"/> which uses
+    /// the canonical single-frame threshold and is what the writer
+    /// itself uses to decide whether to chunk.
     /// </summary>
     internal int RingCapacity => (int)_ring.Capacity;
+
+    /// <summary>
+    /// Canonical single-frame payload threshold used by
+    /// <see cref="WriteInlineDirectMultiFrame"/>: a MESSAGE frame whose
+    /// payload (5-byte gRPC LPM header + protobuf body) is &lt;= this
+    /// value is emitted as ONE H2 DATA frame on the first attempt.
+    /// Above this, the writer chunks into <c>cap/8</c>-sized pieces.
+    /// The formula caps cap/3 by both the HTTP/2 24-bit hard limit and
+    /// the strict-fair <see cref="ShmConstants.FairMaxFramePayload"/>
+    /// bench env.
+    /// </summary>
+    /// <remarks>
+    /// NOT the right threshold for wake-coalesce gates — see
+    /// <see cref="CanCoalesceInlineMessage"/> / <see cref="ComputeCoalesceSafeThreshold"/>
+    /// which also accounts for the wrap-fall-through path's chunk size.
+    /// </remarks>
+    private static int ComputeSingleFrameThreshold(int ringCapacity)
+    {
+        var t = Math.Max(1, ringCapacity / 3);
+        if (t > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+            t = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
+        if (ShmConstants.FairMaxFramePayload < t)
+            t = ShmConstants.FairMaxFramePayload;
+        return t;
+    }
+
+    /// <summary>
+    /// Returns the maximum LPM payload size that
+    /// <see cref="WriteInlineDirectMultiFrame"/> is GUARANTEED to emit
+    /// as a single H2 DATA frame, regardless of whether the ring
+    /// reservation hits a wrap-around boundary. Use this for
+    /// wake-coalesce gates — single-frame threshold alone is NOT
+    /// safe because on wrap fall-through the writer chunks at
+    /// <c>cap/8</c> via <see cref="RingFrameStream"/>.
+    /// </summary>
+    /// <remarks>
+    /// Derivation (round-2 review fix): the wrap fall-through path
+    /// chunks at <c>chunkSize = min(cap/8, H2max, FairMaxFramePayload)</c>.
+    /// Combined with the non-wrap single-frame threshold
+    /// <c>min(cap/3, H2max, FairMaxFramePayload)</c>, the threshold
+    /// safe for BOTH paths is the more restrictive of the two —
+    /// i.e. <c>min(cap/8, H2max, FairMaxFramePayload)</c>. Without
+    /// this tightening, a 10 MiB Unary response on a 64 MiB ring
+    /// would pass the gate (10 &lt;= cap/3 = 21 MiB), but on wrap
+    /// would chunk into 2 frames of cap/8 = 8 MiB each, each chunk's
+    /// signal suppressed by the open batch -> deadlock.
+    /// </remarks>
+    private static int ComputeCoalesceSafeThreshold(int ringCapacity)
+    {
+        var t = Math.Max(1, ringCapacity / 8);
+        if (t > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+            t = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
+        if (ShmConstants.FairMaxFramePayload < t)
+            t = ShmConstants.FairMaxFramePayload;
+        return t;
+    }
+
+    /// <summary>
+    /// Returns true iff a MESSAGE whose LPM payload (5-byte gRPC
+    /// header + protobuf body) is <paramref name="lpmPayloadBytes"/>
+    /// is GUARANTEED to be emitted as ONE H2 DATA frame by
+    /// <see cref="WriteInlineDirectMultiFrame"/> on BOTH the non-wrap
+    /// single-frame path AND the wrap fall-through to
+    /// <see cref="RingFrameStream"/> — i.e. safe to wrap in a
+    /// wake-coalesce <see cref="BeginInlineBatch"/> /
+    /// <see cref="EndInlineBatch"/> pair without risking deadlock.
+    /// </summary>
+    /// <remarks>
+    /// Single source of truth for the coalesce-safety predicate. The
+    /// server-side <c>ShmGrpcServer.UnaryHandler</c> and
+    /// <c>ClientStreamingHandler</c> gate their
+    /// <see cref="BeginInlineBatch"/> on this. The threshold (see
+    /// <see cref="ComputeCoalesceSafeThreshold"/>) is tighter than
+    /// <see cref="ComputeSingleFrameThreshold"/> because the wrap-
+    /// fall-through chunks at <c>cap/8</c>, not <c>cap/3</c>.
+    /// </remarks>
+    internal bool CanCoalesceInlineMessage(int lpmPayloadBytes)
+    {
+        return lpmPayloadBytes <= ComputeCoalesceSafeThreshold((int)_ring.Capacity);
+    }
 
 
     public ShmFrameWriter(ShmRing ring, CancellationTokenSource cts,
@@ -412,14 +517,32 @@ internal sealed class ShmFrameWriter : IDisposable
                     continue;
                 }
 
-                // Phase 2: spin-wait for data.
-                // In streaming ping-pong, the consumer typically enqueues the
-                // next frame within ~30-50µs (one full cross-ring round-trip).
-                // A brief spin here avoids falling through to the heavier
-                // ManualResetEventSlim.Wait (~80µs OS penalty).
+                // Phase 1.5: nothing in _queue, but Phase B might have
+                // deferred entries waiting on WU credit. Try to drain
+                // them — cheap when _deferredCount == 0, else wraps
+                // BeginBatch/EndBatch around a TryDrainDeferredLocked.
                 //
+                // Continue only when FlushDeferred returns true (made
+                // progress, i.e. at least one entry fully drained).
+                // Otherwise fall through to Phase 2/3 wait — spinning
+                // the FlushDeferred loop with no quota would burn CPU
+                // until the next WU arrives.
+                if (_deferredCount > 0)
+                {
+                    if (FlushDeferred())
+                        continue;
+                }
+
+                // Phase 2: spin-wait for data.
+                // Default is NO SPIN (matches grpc-go-shmem's
+                // shmSpinDefault = 0 policy — see Doug's "no
+                // lock-spinning" requirement for fair UDS/TCP
+                // comparison). Operators can opt in via env var
+                // SHM_WRITER_SPIN_ITERATIONS for sub-µs latency at
+                // the cost of idle CPU. See FrameTypes.cs.
                 var found = false;
-                for (int spin = 0; spin < ShmConstants.SpinIterationsMin; spin++)
+                var spinBudget = ShmConstants.WriterLoopSpinIterations;
+                for (int spin = 0; spin < spinBudget; spin++)
                 {
                     // Check for inline write request (singleStreamMode).
                     if (_inlineAction != null || _paused)
@@ -517,6 +640,33 @@ internal sealed class ShmFrameWriter : IDisposable
                     continue;
                 }
 
+                // Lost-wake guard for the partial-write deferred path:
+                // a WU may have landed (via NotifyQuotaUpdated) between
+                // the previous FlushDeferred returning empty and Reset
+                // above. The sticky wake design lets _readySignal stay
+                // Set across our Reset only if NotifyQuotaUpdated fires
+                // AFTER the Reset; one that fired BEFORE Reset (in the
+                // narrow window between the Phase 1.5 FlushDeferred and
+                // Reset) leaves the wake lost. Drain deferred here so
+                // such a stale WU has a chance to advance an entry
+                // before we commit to the kernel wait. Keep _waiting=1
+                // during the drain so any concurrent
+                // NotifyQuotaUpdated re-fires the sticky Set — racy
+                // but harmless (one extra wake cycle at worst).
+                if (_deferredCount > 0)
+                {
+                    if (FlushDeferred())
+                    {
+                        Volatile.Write(ref _waiting, 0);
+                        continue;
+                    }
+                    // No progress drained; fall through to wait. The
+                    // sticky NotifyQuotaUpdated Set is guaranteed to
+                    // fire on the next WU (its early-return is gated
+                    // only on _deferredCount==0 which is non-zero
+                    // here), so Wait will return promptly.
+                }
+
                 _idleInWait = true;
                 try
                 {
@@ -598,6 +748,20 @@ internal sealed class ShmFrameWriter : IDisposable
                 {
                     ref var entry = ref batch[i];
 
+                    // Skip slots cleared to default by the partial-write
+                    // defer path (parked entries set batch[i]=default to
+                    // hand ownership of the pooled buffer + completion
+                    // signal off to _deferred). The original cancel-flag
+                    // check below would NOT catch these because their
+                    // CancelFlag is null. Real frames enqueued to _queue
+                    // always carry StreamId != 0 (only WindowUpdate /
+                    // Ping / Pong are streamId==0 and they go to
+                    // _controlQueue, not _queue), so this is a safe
+                    // sentinel for "default-initialised slot, do not
+                    // process".
+                    if (entry.StreamId == 0 && entry.Payload.IsEmpty && entry.Length == 0 && entry.ReturnToPool == null && entry.CompletionSignal == null)
+                        continue;
+
                     // Skip entries cancelled by the caller (e.g. OperationCanceledException
                     // in EnqueueZeroCopyAndWait). The caller is responsible for
                     // releasing any pooled buffer; writing a cancelled entry
@@ -607,73 +771,226 @@ internal sealed class ShmFrameWriter : IDisposable
 
                     var payload = entry.Payload.Span;
 
-                    // Before writing a large message that may block in
-                    // WaitForSpace, drain any newly queued priority control
-                    // frames (Ping, Pong; WindowUpdate is a no-op slot under
-                    // SHM no-WU). These are tiny (20-30 bytes) and always
-                    // fit. Keeping keepalive responsive matters when 16+
-                    // concurrent streams compete for the WriterLoop and a
-                    // large Message would otherwise stall the queue head.
+                    // Phase B (writer-task FC defer): for Message entries
+                    // whose total length fits in the H/2 window AND whose
+                    // stream's current send-quota is insufficient, park the
+                    // entry in _deferred instead of doing the willLikelyChunk
+                    // batch-mode dance and blocking inside WriteMessage.
+                    // This keeps the writer task unblocked so other
+                    // streams' messages in the batch can still be flushed.
                     //
-                    // Also exit batch mode for ANY message that may need to
-                    // chunk on the current ring (payload + 9-byte H2 header
-                    // bigger than ~half the ring). Otherwise a small ring +
-                    // multi-frame message deadlocks: chunk N reserves, fills,
-                    // commits silently (no OS signal under batch); the next
-                    // ReserveWrite blocks because reader is asleep waiting for
-                    // a signal that won't fire until EndBatchWrite — which
-                    // never runs because we're stuck in WaitForSpace.
-                    //
-                    // Strict-fair mode (SHM_FAIR_MAX_FRAME): the cap forces
-                    // chunking at 16 KiB, well below the 64 KiB
-                    // willLikelyChunk threshold. If we stayed in batch
-                    // mode, already-written chunks would not have signalled
-                    // the peer reader, stalling progress until EndBatchWrite.
-                    // Drop out of batch for ANY multi-frame Message in fair
-                    // mode.
-                    var ringCap = (int)_ring.Capacity;
-                    var hdrSize = Wire.Http2FrameHeader.Size;
-                    var fairChunking = entry.Type == FrameType.Message
-                        && ShmConstants.FairMaxFramePayload != int.MaxValue
-                        && payload.Length > ShmConstants.FairMaxFramePayload;
-                    var willLikelyChunk = fairChunking
-                        || (entry.Type == FrameType.Message
-                            && payload.Length >= 65536)
-                        || (entry.Type == FrameType.Message
-                            && payload.Length + hdrSize >= ringCap / 2);
-                    if (willLikelyChunk)
+                    // Messages larger than the window (e.g. a 256 MB unary
+                    // through a 32 MiB window) can NEVER pass the "quota >=
+                    // length" drain check, so they MUST fall through to
+                    // the chunked WriteMessage path which blocks per-chunk
+                    // and rides the WU drip cadence. This is a Phase B
+                    // simplification vs grpc-go-shmem's partial-write
+                    // deferred (which tracks bytes already written and
+                    // resumes from offset); supporting that here would
+                    // require richer DeferredEntry state.
+                    if (entry.Type == FrameType.Message
+                        && entry.Length <= ShmConstants.InitialWindowSize)
                     {
-                        _ring.EndBatchWrite();
-                        DrainControlFrames();
-                    }
-
-                    if (entry.Type == FrameType.Message)
-                    {
-                        var isLast = (entry.Flags & MessageFlags.More) == 0;
-                        var extraFlags = (byte)(entry.Flags & ~MessageFlags.More);
                         ShmGrpcStream? fairStream = null;
                         StreamMap?.TryGetValue(entry.StreamId, out fairStream);
-                        // Pass DrainControlFrames as preChunkDrain so each
-                        // chunk write flushes pending Ping/Pong control
-                        // traffic; keeps keepalive responsive during long
-                        // chunked sends. (FairAwaitWindow is a no-op under
-                        // SHM no-WU alignment — see ShmGrpcStream.)
-                        FrameProtocol.WriteMessage(_ring, entry.StreamId, payload, isLast, _ct, extraFlags, fairStream,
-                            fairStream != null ? DrainControlFrames : null);
-                        // Re-enter batch mode after large messages to coalesce
-                        // OS signals for the rest of the batch (previously
-                        // removed due to suspected deadlock, but trace confirmed
-                        // no deadlock — the "TIMEOUT" was performance regression
-                        // from 32× extra signals per batch).
-                        if (willLikelyChunk)
-                            _ring.BeginBatchWrite();
+                        if (fairStream != null)
+                        {
+                            var hasDeferred = _deferred.TryGetValue(entry.StreamId, out var dq)
+                                && dq.Count > 0;
+                            if (hasDeferred || fairStream.SendQuota < entry.Length)
+                            {
+                                if (dq == null)
+                                {
+                                    dq = new LinkedList<FrameEntry>();
+                                    _deferred[entry.StreamId] = dq;
+                                }
+                                dq.AddLast(entry);
+                                _deferredCount++;
+                                // Ownership of pooled buffer + completion
+                                // signal transfers to _deferred. Clear the
+                                // batch slot so the finally block does NOT
+                                // release the buffer or set the signal.
+                                batch[i] = default;
+                                // Stream-ordering preservation: also park
+                                // forward same-stream entries (HalfClose,
+                                // Trailers, follow-up Messages) so the
+                                // wire order behind our parked Message is
+                                // never re-ordered through the LARGE-
+                                // message TryDrain resume.
+                                ParkForwardSameStreamLocked(batch, i + 1, count, entry.StreamId, dq);
+                                continue;
+                            }
+                        }
+
+                        WriteMessageEntryInBatch(in entry, fairStream);
+                    }
+                    else if (entry.Type == FrameType.Message)
+                    {
+                        // Large message (> window): chunked-write path.
+                        // Partial-write deferred (2026-05-28): if the
+                        // first reserve fails, park the entry in
+                        // <see cref="_deferred"/> with its current
+                        // <see cref="FrameEntry.BytesWritten"/> offset
+                        // and move to the next batch entry. This is
+                        // the fix for the fair_conc 10×64KB hang where
+                        // the blocking <c>WriteMessageEntryInBatch</c>
+                        // path serialised all 10 streams' 64 KiB
+                        // messages through a single per-chunk wait,
+                        // exceeding the bench's 120 s stepTimeout per
+                        // <c>WriteAsync</c> once contention pushed WU
+                        // RT past a few ms. Mirrors grpc-go-shmem's
+                        // <c>writerLoop</c> partial-write defer.
+                        //
+                        // STREAM ORDERING NOTE: when we park, ALL
+                        // subsequent batch entries for the same stream
+                        // MUST also be parked behind us so the wire
+                        // order stays {chunk-1..N, HalfClose, Trailers}
+                        // and the peer's LPM accumulator doesn't see
+                        // an out-of-order END_STREAM mid-LPM (the H2
+                        // codec rejects that with
+                        // "stream ended mid-LPM" — see
+                        // Http2Codec.Read.cs ~line 695).
+                        ShmGrpcStream? fairStream = null;
+                        StreamMap?.TryGetValue(entry.StreamId, out fairStream);
+
+                        // Partial-write defer path: applies to BOTH
+                        // signal-bearing (EnqueueZeroCopyAndWait) and
+                        // fire-and-forget (SendFrameZeroCopy) entries.
+                        // For fire-and-forget callers (Unary server-side
+                        // response), the stream may be disposed before
+                        // the writer drains the queue; the "stream
+                        // gone" branch in TryDrainDeferredLocked
+                        // handles that by calling
+                        // WriteRemainingChunksNoQuota so the peer's
+                        // LPM accumulator gets all bytes.
+                        if (fairStream != null)
+                        {
+                            var hasDeferred = _deferred.TryGetValue(entry.StreamId, out var dq)
+                                && dq.Count > 0;
+                            if (hasDeferred)
+                            {
+                                // Pre-existing entry on this stream is
+                                // ahead of us in FIFO; just park behind
+                                // it and let TryDrainDeferredLocked
+                                // process us when it gets here.
+                                if (dq == null)
+                                {
+                                    dq = new LinkedList<FrameEntry>();
+                                    _deferred[entry.StreamId] = dq;
+                                }
+                                dq.AddLast(entry);
+                                _deferredCount++;
+                                batch[i] = default;
+                                continue;
+                            }
+
+                            // Exit batch mode for chunked writes — peer
+                            // reader must be signaled per chunk to drive
+                            // the WU drip cadence.
+                            _ring.EndBatchWrite();
+                            DrainControlFrames();
+                            int writtenOffset;
+                            try
+                            {
+                                writtenOffset = TryWriteChunkedMessageNonBlocking(in entry, fairStream, 0);
+                            }
+                            finally
+                            {
+                                _ring.BeginBatchWrite();
+                            }
+
+                            if (writtenOffset < entry.Length)
+                            {
+                                // Partial write — park the rest, AND scan
+                                // forward in batch[] to also park any
+                                // subsequent entries for this stream
+                                // (HalfClose, Trailers, more Messages)
+                                // so wire ordering is preserved.
+                                var parked = entry;
+                                parked.BytesWritten = writtenOffset;
+                                if (dq == null)
+                                {
+                                    dq = new LinkedList<FrameEntry>();
+                                    _deferred[entry.StreamId] = dq;
+                                }
+                                dq.AddLast(parked);
+                                _deferredCount++;
+                                batch[i] = default;
+                                ParkForwardSameStreamLocked(batch, i + 1, count, entry.StreamId, dq);
+                                continue;
+                            }
+                            // else: fully written — fall through to the
+                            // finally-block ownership release at end of
+                            // loop iter.
+                        }
+                        else
+                        {
+                            // No fair stream (e.g. test shim or
+                            // singleton-stream-mode path that doesn't
+                            // register in StreamMap): use the legacy
+                            // blocking chunked path. This still serialises
+                            // but is rare in fair-mode benchmarks.
+                            WriteMessageEntryInBatch(in entry, fairStream);
+                        }
                     }
                     else
                     {
+                        // Non-Message frames (Headers, Trailers, HalfClose,
+                        // Ping, Pong, GoAway, WindowUpdate, RstStream):
+                        // small enough to stay inside the current batch.
+                        //
+                        // STREAM-ORDERING GUARD: if this stream has a
+                        // parked Message in <see cref="_deferred"/>
+                        // (typically a partial-write deferred chunked
+                        // body whose tail is still waiting on WU
+                        // credit), this Trailers / HalfClose / etc
+                        // MUST stay behind those chunks so the peer's
+                        // LPM accumulator sees {chunk-1..N, END_STREAM}
+                        // in order. Without this guard, fire-and-forget
+                        // Unary server-side path emits the response
+                        // Message, parks chunks 4-N, then the gRPC
+                        // framework synchronously enqueues Trailers in
+                        // a SEPARATE batch — and Trailers would hit
+                        // this branch and go straight to the ring,
+                        // arriving at the peer BEFORE the parked
+                        // chunks. Client codec sees Trailers mid-LPM,
+                        // marks the stream done, discards the late
+                        // chunks → "Failed to deserialise response
+                        // message".
+                        if (entry.StreamId != 0
+                            && _deferred.TryGetValue(entry.StreamId, out var dqNon)
+                            && dqNon.Count > 0)
+                        {
+                            dqNon.AddLast(entry);
+                            _deferredCount++;
+                            batch[i] = default;
+                            continue;
+                        }
                         var header = new FrameHeader(entry.Type, entry.StreamId, (uint)entry.Length, entry.Flags);
                         FrameProtocol.WriteFrame(_ring, header, payload, _ct);
                     }
                 }
+
+                // Phase B piggyback: drain any control frames (WindowUpdate,
+                // Ping, Pong) that arrived during the batch's writes — these
+                // are emitted by the codec reader thread when it parses DATA
+                // we just wrote on the peer side, so under multi-stream
+                // streaming load there's typically at least one WU pending
+                // by the end of FlushBatch. Draining here, INSIDE the active
+                // BeginBatchWrite scope, coalesces those control frames into
+                // the same ring batch signal as the messages, avoiding a
+                // second wakeup of the peer reader. Saves ~250ns of ring
+                // signal cost per WU under sustained streaming. Matches
+                // grpc-go-shmem's piggybackWUFn pattern.
+                if (!_controlQueue.IsEmpty)
+                    DrainControlFrames();
+
+                // Phase B: try to drain any deferred entries whose stream's
+                // quota has been replenished while this batch was writing
+                // (the peer's WU emission for our just-written DATA arrives
+                // asynchronously; some deferred entries may now be sendable).
+                if (_deferredCount > 0)
+                    TryDrainDeferredLocked();
             }
             finally
             {
@@ -709,6 +1026,506 @@ internal sealed class ShmFrameWriter : IDisposable
                 batch[i] = default;
             }
         }
+    }
+
+    /// <summary>
+    /// Writes a single Message FrameEntry inside the writer-loop's
+    /// active <see cref="ShmRing.BeginBatchWrite"/> scope. Handles the
+    /// "willLikelyChunk" batch-mode dance: for large or fair-mode
+    /// chunked messages we MUST exit the batch (so each chunk
+    /// individually signals the peer reader to make progress) and
+    /// re-enter afterwards to coalesce the remaining batch entries'
+    /// signals.
+    /// </summary>
+    private void WriteMessageEntryInBatch(in FrameEntry entry, ShmGrpcStream? fairStream)
+    {
+        var payload = entry.Payload.Span;
+        var isLast = (entry.Flags & MessageFlags.More) == 0;
+        var extraFlags = (byte)(entry.Flags & ~MessageFlags.More);
+
+        // willLikelyChunk: see FlushBatch's original comment block —
+        // multi-frame Messages must NOT stay inside a single batch
+        // because per-chunk ReserveWrite waits for ring space, which
+        // requires the peer reader to be signaled.
+        var ringCap = (int)_ring.Capacity;
+        var hdrSize = Wire.Http2FrameHeader.Size;
+        var fairChunking = ShmConstants.FairMaxFramePayload != int.MaxValue
+            && payload.Length > ShmConstants.FairMaxFramePayload;
+        var willLikelyChunk = fairChunking
+            || payload.Length >= 65536
+            || payload.Length + hdrSize >= ringCap / 2;
+
+        if (willLikelyChunk)
+        {
+            _ring.EndBatchWrite();
+            DrainControlFrames();
+        }
+
+        FrameProtocol.WriteMessage(_ring, entry.StreamId, payload, isLast, _ct, extraFlags, fairStream,
+            fairStream != null ? DrainControlFrames : null);
+
+        if (willLikelyChunk)
+            _ring.BeginBatchWrite();
+    }
+
+    /// <summary>
+    /// Non-blocking chunked-write helper used by the partial-write
+    /// deferred path (commit ad029a17 / 2026-05-28). Starts at
+    /// <paramref name="startOffset"/> bytes into <paramref name="entry"/>'s
+    /// payload and writes as many H/2 DATA frames as
+    /// <see cref="ShmGrpcStream.TryReserveSendQuota"/> allows without
+    /// blocking. Returns the new offset (==
+    /// <see cref="FrameEntry.Length"/> if fully drained, otherwise the
+    /// offset to resume from when the next
+    /// <c>WINDOW_UPDATE</c> arrives).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Caller MUST have exited batch mode (<see cref="ShmRing.EndBatchWrite"/>)
+    /// before calling so peer reader is signaled per chunk — the WU
+    /// drip cadence depends on that.
+    /// </para>
+    /// <para>
+    /// The chunk-size computation mirrors
+    /// <see cref="FrameProtocol.WriteMessage"/> exactly so that the
+    /// blocking and non-blocking paths produce bit-identical wire
+    /// output up to interleaving across streams. End-of-message flag
+    /// handling: only the chunk that consumes the final byte sets
+    /// <c>!MessageFlags.More</c>; preceding chunks always set
+    /// <c>MessageFlags.More</c>.
+    /// </para>
+    /// </remarks>
+    private int TryWriteChunkedMessageNonBlocking(in FrameEntry entry, ShmGrpcStream fairStream, int startOffset)
+    {
+        var fullPayload = entry.Payload.Span;
+        var totalLen = fullPayload.Length;
+        if (startOffset >= totalLen) return totalLen;
+
+        var isLast = (entry.Flags & MessageFlags.More) == 0;
+        var extraFlags = (byte)(entry.Flags & ~MessageFlags.More);
+
+        var ringCap = (int)_ring.Capacity;
+        var maxFramePayload = Math.Max(1, ringCap / 3);
+        if (maxFramePayload > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+            maxFramePayload = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
+        if (ShmConstants.FairMaxFramePayload < maxFramePayload)
+            maxFramePayload = ShmConstants.FairMaxFramePayload;
+
+        var offset = startOffset;
+        while (offset < totalLen)
+        {
+            var remainingLen = totalLen - offset;
+            var chunkSize = Math.Min(maxFramePayload, remainingLen);
+            if (!fairStream.TryReserveSendQuota(chunkSize))
+            {
+                return offset;
+            }
+
+            var isLastChunk = (offset + chunkSize == totalLen);
+            byte chunkFlags;
+            if (isLastChunk)
+                chunkFlags = (byte)(isLast ? extraFlags : (MessageFlags.More | extraFlags));
+            else
+                chunkFlags = MessageFlags.More;
+
+            var header = new FrameHeader(FrameType.Message, entry.StreamId, (uint)chunkSize, chunkFlags);
+            // Refund quota if WriteFrame throws (RingClosed during
+            // teardown, OperationCanceled): the bytes never reach the
+            // peer, so no WINDOW_UPDATE will refund this credit (same
+            // bug-class as round-5 FrameProtocol.WriteMessage fix).
+            try
+            {
+                FrameProtocol.WriteFrame(_ring, header, fullPayload.Slice(offset, chunkSize), _ct);
+            }
+            catch
+            {
+                fairStream.RefundSendQuota(chunkSize);
+                throw;
+            }
+            offset += chunkSize;
+        }
+        return offset;
+    }
+
+    /// <summary>
+    /// Stream-gone resume: write all remaining chunks of a partial
+    /// Message without any per-stream FC reservation. Called from
+    /// <see cref="TryDrainDeferredLocked"/>'s
+    /// <c>fairStream == null</c> branch when the local stream object
+    /// has been disposed (typically the Unary server-side path where
+    /// the handler returned before the response was fully written to
+    /// the ring). The peer is still reading the LPM and needs these
+    /// bytes; the credit was already committed when chunks 1..N were
+    /// reserved, so writing N+1..end is wire-consistent.
+    /// </summary>
+    private void WriteRemainingChunksNoQuota(in FrameEntry entry, int startOffset)
+    {
+        var fullPayload = entry.Payload.Span;
+        var totalLen = fullPayload.Length;
+        if (startOffset >= totalLen) return;
+
+        var isLast = (entry.Flags & MessageFlags.More) == 0;
+        var extraFlags = (byte)(entry.Flags & ~MessageFlags.More);
+
+        var ringCap = (int)_ring.Capacity;
+        var maxFramePayload = Math.Max(1, ringCap / 3);
+        if (maxFramePayload > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+            maxFramePayload = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
+        if (ShmConstants.FairMaxFramePayload < maxFramePayload)
+            maxFramePayload = ShmConstants.FairMaxFramePayload;
+
+        var offset = startOffset;
+        while (offset < totalLen)
+        {
+            var remainingLen = totalLen - offset;
+            var chunkSize = Math.Min(maxFramePayload, remainingLen);
+            var isLastChunk = (offset + chunkSize == totalLen);
+            byte chunkFlags;
+            if (isLastChunk)
+                chunkFlags = (byte)(isLast ? extraFlags : (MessageFlags.More | extraFlags));
+            else
+                chunkFlags = MessageFlags.More;
+
+            var header = new FrameHeader(FrameType.Message, entry.StreamId, (uint)chunkSize, chunkFlags);
+            FrameProtocol.WriteFrame(_ring, header, fullPayload.Slice(offset, chunkSize), _ct);
+            offset += chunkSize;
+        }
+    }
+
+    /// <summary>
+    /// Stream-ordering preservation helper: scans the remaining slots
+    /// of <paramref name="batch"/> starting at <paramref name="startIdx"/>
+    /// and parks any entry whose <see cref="FrameEntry.StreamId"/>
+    /// matches <paramref name="streamId"/> into the supplied per-stream
+    /// deferred queue. Called when a Message for <paramref name="streamId"/>
+    /// was just parked (either as a partial chunked write or because
+    /// its full quota wasn't available): any later entry on the same
+    /// stream — HalfClose, Trailers, follow-up Messages — MUST stay
+    /// behind it on the wire, otherwise the peer's H2 codec sees an
+    /// END_STREAM mid-LPM or trailers without prior message body and
+    /// rejects the stream.
+    /// </summary>
+    /// <remarks>
+    /// Subsequent entries for OTHER streams keep their batch slot —
+    /// they can still be flushed in this batch pass, which is the
+    /// whole point of the partial-write defer (multiplex across
+    /// streams while one stream is parked on credit).
+    /// </remarks>
+    private void ParkForwardSameStreamLocked(FrameEntry[] batch, int startIdx, int count, uint streamId, LinkedList<FrameEntry> dq)
+    {
+        for (var j = startIdx; j < count; j++)
+        {
+            ref var later = ref batch[j];
+            if (later.StreamId != streamId) continue;
+            if (later.CancelFlag != null && Volatile.Read(ref later.CancelFlag.Value)) continue;
+            dq.AddLast(later);
+            _deferredCount++;
+            batch[j] = default;
+        }
+    }
+
+    /// <summary>
+    /// Phase B: drain <see cref="_deferred"/> entries whose stream's send
+    /// quota has been replenished since they were parked. Called by
+    /// <see cref="FlushBatch"/> after writing the live batch (so any WU
+    /// arrived since we entered FlushBatch is picked up) and from
+    /// <see cref="WriterLoop"/> after wake from kernel wait.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Single-threaded: only invoked by the writer task. The
+    /// <see cref="_deferred"/> dictionary is therefore not concurrent.
+    /// </para>
+    /// <para>
+    /// Per-stream FIFO is preserved by the per-stream <see cref="Queue{T}"/>.
+    /// Across streams the drain order is unspecified — H/2 has no
+    /// cross-stream ordering requirement.
+    /// </para>
+    /// <para>
+    /// MUST be called inside an active <see cref="ShmRing.BeginBatchWrite"/>
+    /// scope (the same scope as the parent <see cref="FlushBatch"/>) so
+    /// drained entries piggyback the same ring signal.
+    /// </para>
+    /// </remarks>
+    private bool TryDrainDeferredLocked()
+    {
+        if (_deferredCount == 0) return false;
+
+        bool anyProgress = false;
+        List<uint>? toRemove = null;
+        foreach (var kvp in _deferred)
+        {
+            var streamId = kvp.Key;
+            var queue = kvp.Value;
+            if (queue.Count == 0)
+            {
+                (toRemove ??= new List<uint>()).Add(streamId);
+                continue;
+            }
+
+            ShmGrpcStream? fairStream = null;
+            StreamMap?.TryGetValue(streamId, out fairStream);
+            if (fairStream == null)
+            {
+                // Stream was removed from StreamMap (typically because
+                // <see cref="ShmGrpcStream.Dispose"/> ran after the
+                // caller used the fire-and-forget
+                // <c>SendFrameZeroCopy</c> path — common for Unary
+                // server-side: handler returns, stream is disposed,
+                // but our partial-write defer still has the response
+                // body's last chunks parked here). The PEER is still
+                // reading and expecting the full LPM — silently
+                // dropping the rest would surface as a deserialise
+                // failure on the client. Write any remaining bytes
+                // best-effort (no FC reservation — the bytes already
+                // fit in the peer-advertised window since the FIRST
+                // chunks were reserved on this stream's quota and the
+                // peer's drip-on-receive is matching them with WUs
+                // back), then drain the queue.
+                while (queue.First != null)
+                {
+                    var ent = queue.First.Value;
+                    queue.RemoveFirst();
+                    _deferredCount--;
+                    if (ent.Type == FrameType.Message && ent.BytesWritten > 0 && ent.BytesWritten < ent.Length)
+                    {
+                        // Resume the partial chunked write without FC
+                        // (the stream is gone so there's no
+                        // <see cref="ShmGrpcStream.TryReserveSendQuota"/>
+                        // to call). The peer's accumulator is mid-LPM
+                        // and needs these bytes to deliver the
+                        // message to the application.
+                        WriteRemainingChunksNoQuota(in ent, ent.BytesWritten);
+                    }
+                    else if (ent.Type == FrameType.Message && ent.BytesWritten == 0)
+                    {
+                        // Fresh chunked Message that hadn't begun
+                        // sending — peer never saw an LPM header for
+                        // this one, no obligation to deliver. Just
+                        // drop. (Stream is gone anyway.)
+                    }
+                    else if (ent.Type != FrameType.Message)
+                    {
+                        // HalfClose / Trailers / etc parked behind the
+                        // Message. Write them out so the peer sees
+                        // proper stream termination.
+                        var hdr = new FrameHeader(ent.Type, ent.StreamId, (uint)ent.Length, ent.Flags);
+                        FrameProtocol.WriteFrame(_ring, hdr, ent.Payload.Span, _ct);
+                    }
+                    if (ent.ReturnToPool != null)
+                        ArrayPool<byte>.Shared.Return(ent.ReturnToPool);
+                    ent.CompletionSignal?.Set();
+                    anyProgress = true;
+                }
+                (toRemove ??= new List<uint>()).Add(streamId);
+                continue;
+            }
+
+            // Drain entries whose stream now has enough quota. Per-stream
+            // FIFO is preserved: we always inspect the head first and bail
+            // at the first entry that can't make progress.
+            //
+            // Three paths share this loop:
+            //   * Chunked-write resume (Message with Length > window
+            //     OR BytesWritten > 0): partial-write via
+            //     TryWriteChunkedMessageNonBlocking; update offset in
+            //     place if still partial, drain fully if complete.
+            //   * Small Message (<= window): wait for full quota then
+            //     dispatch through WriteMessageEntryInBatch (legacy
+            //     behaviour).
+            //   * Non-Message entry parked behind a stream-ordering
+            //     hold (HalfClose, Trailers, etc): no FC concerns —
+            //     just write the single frame. Reached only after the
+            //     preceding Message ahead of it has fully drained, so
+            //     wire order {Message…, HalfClose, Trailers} is
+            //     guaranteed.
+            while (queue.First != null)
+            {
+                var ent = queue.First.Value;
+
+                if (ent.Type != FrameType.Message)
+                {
+                    // HalfClose / Trailers / etc parked behind a Message
+                    // on this stream by ParkForwardSameStreamLocked.
+                    // No FC required for these frame types — write
+                    // immediately.
+                    queue.RemoveFirst();
+                    _deferredCount--;
+                    var header = new FrameHeader(ent.Type, ent.StreamId, (uint)ent.Length, ent.Flags);
+                    FrameProtocol.WriteFrame(_ring, header, ent.Payload.Span, _ct);
+                    if (ent.ReturnToPool != null)
+                        ArrayPool<byte>.Shared.Return(ent.ReturnToPool);
+                    ent.CompletionSignal?.Set();
+                    anyProgress = true;
+                    continue;
+                }
+
+                if (ent.Length > ShmConstants.InitialWindowSize || ent.BytesWritten > 0)
+                {
+                    // Chunked-write entry. Use non-blocking helper so the
+                    // writer task can hop to other streams between WU
+                    // round-trips instead of blocking per chunk.
+                    _ring.EndBatchWrite();
+                    DrainControlFrames();
+                    int writtenOffset;
+                    try
+                    {
+                        writtenOffset = TryWriteChunkedMessageNonBlocking(in ent, fairStream, ent.BytesWritten);
+                    }
+                    finally
+                    {
+                        _ring.BeginBatchWrite();
+                    }
+
+                    if (writtenOffset == ent.Length)
+                    {
+                        // Fully done.
+                        queue.RemoveFirst();
+                        _deferredCount--;
+                        if (ent.ReturnToPool != null)
+                            ArrayPool<byte>.Shared.Return(ent.ReturnToPool);
+                        ent.CompletionSignal?.Set();
+                        anyProgress = true;
+                        continue;
+                    }
+
+                    if (writtenOffset > ent.BytesWritten)
+                    {
+                        // Made some progress but still parked. Update the
+                        // head's offset in place; LinkedList<T> supports
+                        // mutating LinkedListNode.Value directly.
+                        ent.BytesWritten = writtenOffset;
+                        queue.First!.Value = ent;
+                        anyProgress = true;
+                    }
+                    // Whether we made progress or not, the next chunk's
+                    // reserve failed — give up on this stream until WU
+                    // arrives again.
+                    break;
+                }
+
+                // Small message (<= window) legacy path: defer until full
+                // quota is available, then dispatch in one go.
+                if (fairStream.SendQuota < ent.Length) break;
+                queue.RemoveFirst();
+                _deferredCount--;
+                WriteMessageEntryInBatch(in ent, fairStream);
+                if (ent.ReturnToPool != null)
+                    ArrayPool<byte>.Shared.Return(ent.ReturnToPool);
+                ent.CompletionSignal?.Set();
+                anyProgress = true;
+            }
+
+            if (queue.Count == 0)
+                (toRemove ??= new List<uint>()).Add(streamId);
+        }
+
+        if (toRemove != null)
+        {
+            foreach (var sid in toRemove)
+                _deferred.Remove(sid);
+        }
+        return anyProgress;
+    }
+
+    /// <summary>
+    /// Phase B: invoked by <see cref="ShmConnection.AddSendQuota"/>
+    /// when a per-stream <c>WINDOW_UPDATE</c> arrives. Wakes the
+    /// writer task so it can re-evaluate <see cref="_deferred"/> for
+    /// entries that the new quota now admits. Cheap — just a signal
+    /// set; the actual drain is deferred to the writer task to keep
+    /// the codec reader hot path lock-free.
+    /// </summary>
+    internal void NotifyQuotaUpdated(uint streamId)
+    {
+        if (_disposed != 0) return;
+        // Sticky wake (unconditional): always Set the ready signal on
+        // every per-stream WU arrival. The earlier `_deferredCount == 0`
+        // gate had a lost-wake race window:
+        //   T1 (writer task)              T2 (codec reader)
+        //   -----------------             ------------------
+        //   FlushBatch enters
+        //   processing entry,
+        //   about to park to _deferred
+        //                                 WU arrives, AddSendQuota,
+        //                                 NotifyQuotaUpdated:
+        //                                   _deferredCount==0 → return
+        //   parks entry, _deferredCount=1
+        //   continues processing batch
+        //   Phase 1.5 FlushDeferred
+        //   (no progress, quota not
+        //    yet seen because the WU's
+        //    AddSendQuota happened before
+        //    we parked)
+        //   Phase 3 Reset+Wait → parks forever
+        //
+        // Sticky semantics of MRES means Set on a non-waiting writer
+        // costs a few ns and persists until the next Reset+Wait, which
+        // will see the wake immediately. Set on a fully-idle writer
+        // (no deferred, no queue) wakes it for one harmless iteration
+        // — net cost is on the order of per-WU Channel<T> hop noise.
+        // NotifyQuotaUpdated is only called from the codec reader hot
+        // path when an inbound WINDOW_UPDATE actually grants per-stream
+        // credit, so the rate is per WU RT, not per byte.
+        try { _readySignal.Set(); _kernelReadySignal.Set(); }
+        catch (ObjectDisposedException) { }
+    }
+
+    /// <summary>
+    /// Standalone drain pass for <see cref="_deferred"/>, used when
+    /// <see cref="_queue"/> is empty but deferred entries exist (e.g.
+    /// the writer just woke from a kernel wait triggered by
+    /// <see cref="NotifyQuotaUpdated"/>). Wraps its own
+    /// <see cref="ShmRing.BeginBatchWrite"/> /
+    /// <see cref="ShmRing.EndBatchWrite"/> pair so drained entries
+    /// share a single ring signal.
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> if at least one entry was fully drained
+    /// (so <see cref="_deferredCount"/> decreased), <see langword="false"/>
+    /// otherwise. The caller uses this to decide whether to continue
+    /// the main loop (progress made — may have more work in
+    /// <see cref="_queue"/>) or fall through to the wait phase (no
+    /// progress — wait for the next <c>WINDOW_UPDATE</c>). Returning
+    /// false from a no-progress drain prevents the WriterLoop from
+    /// spinning when a partial-write deferred entry can't advance
+    /// without more credit.
+    /// </returns>
+    private bool FlushDeferred()
+    {
+        if (_deferredCount == 0) return false;
+        int before = _deferredCount;
+        bool partialProgress = false;
+        try
+        {
+            _ring.BeginBatchWrite();
+            try
+            {
+                partialProgress = TryDrainDeferredLocked();
+            }
+            finally
+            {
+                if (s_sawWriterLoop)
+                {
+                    _ring.EndBatchWriteSuppressSignal();
+                    _pendingDeferredSignal = true;
+                }
+                else
+                {
+                    _ring.EndBatchWrite();
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (RingClosedException) { }
+        // "Progress" = either an entry fully drained (count dropped) OR
+        // at least one partial-write entry advanced its BytesWritten
+        // offset by one or more chunks. The latter matters for the
+        // partial-write resume path: the chunked Message stays in
+        // <see cref="_deferred"/> after a partial advance, so
+        // <c>_deferredCount</c> alone misses that bytes went out on
+        // the wire and a follow-up peer drip is imminent.
+        return _deferredCount < before || partialProgress;
     }
 
     /// <summary>
@@ -932,26 +1749,18 @@ internal sealed class ShmFrameWriter : IDisposable
 
         var wireHdrSize = WireHeaderSize;
         var cap = (int)_ring.Capacity;
-        // Single-frame threshold: payload ≤ cap/3 → WriteTo(Span) direct ring write.
-        // Kept high to maximize speculative zero-copy on the reader side.
-        var singleFrameThreshold = Math.Max(1, cap / 3);
+        // Single-frame threshold: payload <= cap/3 -> WriteTo(Span) direct
+        // ring write, capped further by H2 24-bit limit and the
+        // strict-fair SHM_FAIR_MAX_FRAME bench env. See
+        // ComputeSingleFrameThreshold for the canonical formula —
+        // server / client coalesce gates also use it to stay aligned
+        // with what this method actually treats as single-frame.
+        var singleFrameThreshold = ComputeSingleFrameThreshold(cap);
         // Multi-frame chunk size: cap/8 for deeper pipeline (~8 chunks in-flight).
         // More reader/writer overlap reduces WaitForSpace stalls on large messages.
         var chunkSize = Math.Max(1, cap / 8);
-
-        // HTTP/2 hard limit (RFC 7540 §4.2 / §6.5.2): per-frame payload must
-        // fit in 24 bits (≤ 2^24 - 1). Cap both thresholds below that so a
-        // 16 MiB protobuf (which yields a 16 MiB + 5 B framePayloadSize) is
-        // not handed to Http2FrameHeader.Encode where it would throw.
-        if (singleFrameThreshold > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
-            singleFrameThreshold = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
         if (chunkSize > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
             chunkSize = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
-
-        // Strict-fair bench cap (SHM_FAIR_MAX_FRAME): force same multi-frame
-        // splitting as TCP/UDS gRPC. No-op when env var is unset.
-        if (ShmConstants.FairMaxFramePayload < singleFrameThreshold)
-            singleFrameThreshold = ShmConstants.FairMaxFramePayload;
         if (ShmConstants.FairMaxFramePayload < chunkSize)
             chunkSize = ShmConstants.FairMaxFramePayload;
 
@@ -968,40 +1777,76 @@ internal sealed class ShmFrameWriter : IDisposable
         if (framePayloadSize <= singleFrameThreshold)
         {
             // Flush pending Ping/Pong control frames before the message
-            // write so keepalive stays responsive during long batches.
-            // FairAwaitWindow is a no-op under SHM no-WU alignment (kept
-            // for API stability).
+            // write so keepalive stays responsive during long batches,
+            // then reserve per-stream H2 send quota for the chunk
+            // (blocks until peer grants enough WINDOW_UPDATE credit).
             if (fairStream != null) DrainControlFrames();
-            fairStream?.FairAwaitWindow(framePayloadSize, fairStream != null ? DrainControlFrames : null);
+            fairStream?.ReserveSendQuotaOrBlock(framePayloadSize, fairStream != null ? DrainControlFrames : null, ct);
+            bool quotaAlreadyReserved = fairStream != null;
             var totalSize = wireHdrSize + framePayloadSize;
-            var reservation = _ring.ReserveWrite(totalSize, ct);
-            if (reservation.Second.IsEmpty)
+            // Refund quota if any post-debit operation throws BEFORE we
+            // commit: ReserveWrite (RingClosed / OperationCanceled), or
+            // message.WriteTo (serializer fault). Without this, the bytes
+            // are debited from our send window but never reach the peer,
+            // so no WINDOW_UPDATE will refund and the stream stalls on
+            // the next send (same bug-class as round-5 fixes in
+            // FrameProtocol.WriteMessage and RingFrameStream).
+            bool committedSingleFrame = false;
+            try
             {
-                // 9-byte HTTP/2 frame header.
-                var isLast = (extraFlags & MessageFlags.More) == 0;
-                var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
-                EncodeMessageWireHeader(reservation.First.Span, streamId, framePayloadSize, flags);
-
-                // 5-byte gRPC LPM header.
-                var grpcHdr = reservation.First.Span.Slice(wireHdrSize, GrpcHeaderSize);
-                grpcHdr[0] = 0; // no compression
-                System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcHdr.Slice(1), (uint)payloadSize);
-
-                // Serialize directly into ring span — zero intermediate buffer.
-                if (payloadSize > 0)
+                var reservation = _ring.ReserveWrite(totalSize, ct);
+                if (reservation.Second.IsEmpty)
                 {
-                    var payloadSpan = reservation.First.Span.Slice(wireHdrSize + GrpcHeaderSize, payloadSize);
-                    message.WriteTo(payloadSpan);
-                }
+                    // 9-byte HTTP/2 frame header.
+                    var isLast = (extraFlags & MessageFlags.More) == 0;
+                    var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
+                    EncodeMessageWireHeader(reservation.First.Span, streamId, framePayloadSize, flags);
 
-                _ring.CommitWrite(reservation, totalSize);
-                return;
+                    // 5-byte gRPC LPM header.
+                    var grpcHdr = reservation.First.Span.Slice(wireHdrSize, GrpcHeaderSize);
+                    grpcHdr[0] = 0; // no compression
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcHdr.Slice(1), (uint)payloadSize);
+
+                    // Serialize directly into ring span — zero intermediate buffer.
+                    if (payloadSize > 0)
+                    {
+                        var payloadSpan = reservation.First.Span.Slice(wireHdrSize + GrpcHeaderSize, payloadSize);
+                        message.WriteTo(payloadSpan);
+                    }
+
+                    _ring.CommitWrite(reservation, totalSize);
+                    committedSingleFrame = true;
+                    return;
+                }
+                // Wrap-around: refund the outer reservation so the
+                // RingFrameStream fall-through below can re-reserve per
+                // chunk without double-charging. Safe because this stream
+                // is single-producer for sends (gRPC contract for an
+                // in-flight body), so no other thread races for the
+                // refunded credit between Refund and the RFS's first
+                // ReserveSendQuotaOrBlock.
+                if (quotaAlreadyReserved)
+                {
+                    fairStream?.RefundSendQuota(framePayloadSize);
+                    quotaAlreadyReserved = false;
+                }
             }
-            // Wrap-around: fall through to RingFrameStream
+            catch
+            {
+                if (quotaAlreadyReserved && !committedSingleFrame)
+                {
+                    fairStream?.RefundSendQuota(framePayloadSize);
+                }
+                throw;
+            }
         }
 
         // Multi-frame or wrap-around: prepend 5-byte gRPC header, then
-        // WriteTo(IBufferWriter) through RingFrameStream.
+        // WriteTo(IBufferWriter) through RingFrameStream. The single-frame
+        // path above always either commits + returns, or refunds the outer
+        // quota reservation before falling through, so RFS owns the quota
+        // accounting from here \u2014 its per-chunk Reserve + Dispose-refund
+        // logic handles partial-write rollback correctly.
         using var rfs = new RingFrameStream(this, streamId, framePayloadSize, chunkSize, extraFlags, ct, fairStream);
         // Write gRPC header as first 5 bytes
         Span<byte> grpcHeader = stackalloc byte[GrpcHeaderSize];
@@ -1054,12 +1899,27 @@ internal sealed class ShmFrameWriter : IDisposable
         {
             var chunkPayload = Math.Min(_maxFramePayload, _remainingPayload);
             // Flush pending Ping/Pong control traffic before each chunk
-            // for keepalive responsiveness. FairAwaitWindow is a no-op
-            // under SHM no-WU alignment; retained for API stability.
+            // for keepalive responsiveness, then reserve per-stream H2
+            // send quota for this chunk (blocks until peer grants enough
+            // WINDOW_UPDATE credit). gRFC SHM v3.4+ FC.
             if (_fairStream != null) _owner.DrainControlFrames();
-            _fairStream?.FairAwaitWindow(chunkPayload, _fairStream != null ? _owner.DrainControlFrames : null);
-            var totalSize = _wireHeaderSize + chunkPayload;
-            _currentReservation = _ring.ReserveWrite(totalSize, _ct);
+            _fairStream?.ReserveSendQuotaOrBlock(chunkPayload, _fairStream != null ? _owner.DrainControlFrames : null, _ct);
+            // Refund send quota if ring reservation throws (e.g., RingClosed,
+            // OperationCanceled): we have debited chunkPayload bytes but
+            // never put them on the wire, so peer will never emit WU to
+            // refund. Without this, future sends on this stream block
+            // forever waiting for credit that the peer doesn't owe.
+            WriteReservation reservation;
+            try
+            {
+                reservation = _ring.ReserveWrite(_wireHeaderSize + chunkPayload, _ct);
+            }
+            catch
+            {
+                _fairStream?.RefundSendQuota(chunkPayload);
+                throw;
+            }
+            _currentReservation = reservation;
             _currentFrameCapacity = chunkPayload;
             _currentFrameWritten = 0;
             _reservationActive = true;
@@ -1247,6 +2107,17 @@ internal sealed class ShmFrameWriter : IDisposable
                 }
                 catch { /* ring may be closed */ }
                 _reservationActive = false;
+                // Refund the unused portion of H2 send quota: we reserved
+                // _currentFrameCapacity bytes but only put _currentFrameWritten
+                // bytes on the wire, so the peer will only emit WU for the
+                // bytes it received. Without this refund we permanently
+                // over-debit by (capacity - written) per partial frame,
+                // causing future sends on the stream to stall.
+                var unused = _currentFrameCapacity - _currentFrameWritten;
+                if (unused > 0)
+                {
+                    _fairStream?.RefundSendQuota(unused);
+                }
             }
             base.Dispose(disposing);
         }

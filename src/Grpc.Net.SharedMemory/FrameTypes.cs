@@ -178,27 +178,6 @@ public static class ShmConstants
             System.Globalization.CultureInfo.InvariantCulture, out var v) && v > 0
             ? v : int.MaxValue;
 
-    /// <summary>
-    /// Bench-only "strict fair" wire-format parity signal (env var
-    /// <c>SHM_FAIR_STREAM_WINDOW</c>, default <see cref="int.MaxValue"/>).
-    /// When set to a positive integer, the SHM transport disables
-    /// HEADERS+DATA+Trailers coalescing on the server (so each H2 frame
-    /// is dispatched separately, mirroring TCP/UDS behaviour) and bypasses
-    /// the single-stream send fast-path.
-    ///
-    /// <b>Does NOT enforce per-stream HTTP/2 flow control.</b> SHM is
-    /// no-WU in all modes (gRFC SHM alignment with grpc-go-shmem v3.4+
-    /// <c>shmNoWU</c>); the ring's <see cref="ShmRing.ReserveWrite"/>
-    /// <c>WaitForSpace</c> is the sole back-pressure primitive. The
-    /// constant value is retained as a threshold input only; its
-    /// numeric magnitude is not used to cap any send window.
-    /// </summary>
-    public static readonly int FairStreamWindow =
-        int.TryParse(Environment.GetEnvironmentVariable("SHM_FAIR_STREAM_WINDOW"),
-            System.Globalization.NumberStyles.Integer,
-            System.Globalization.CultureInfo.InvariantCulture, out var w) && w > 0
-            ? w : int.MaxValue;
-
     /// <summary>Default ring buffer capacity (64 MiB).</summary>
     public const int DefaultRingCapacity = 64 * 1024 * 1024;
 
@@ -206,21 +185,32 @@ public static class ShmConstants
     public const uint DefaultMaxStreams = 100;
 
     /// <summary>
-    /// Legacy constant retained for H2 codec parity. SHM is no-WU in
-    /// all modes — the per-stream send window is not enforced and the
-    /// ring's <c>WaitForSpace</c> is the sole back-pressure primitive.
+    /// Initial per-stream and per-conn HTTP/2 receive window size.
+    /// Default is 32 MiB (SHM-tuned: matches grpc-go-shmem's tuned default;
+    /// reduces WU traffic vs the spec 64 KiB for the common large-message
+    /// case). Override at process start via env var
+    /// <c>SHM_INITIAL_WINDOW</c> — set to <c>65535</c> for "fair" mode
+    /// matching the HTTP/2 spec default (RFC 7540 §6.9.2). The drip
+    /// threshold (<c>limit/4</c>) inside <see cref="Synchronization.InFlow"/>
+    /// and <see cref="Synchronization.TrInFlow"/> follows this value.
     /// </summary>
-    public const int InitialWindowSize = 32 * 1024 * 1024;
+    public static readonly int InitialWindowSize =
+        int.TryParse(Environment.GetEnvironmentVariable("SHM_INITIAL_WINDOW"),
+            System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out var iw) && iw > 0
+            ? iw : 32 * 1024 * 1024;
 
     /// <summary>Maximum window size.</summary>
     public const int MaxWindowSize = int.MaxValue;
 
     /// <summary>
-    /// Legacy threshold retained for H2 codec parity. SHM never emits
-    /// <c>WINDOW_UPDATE</c> frames in any mode (gRFC SHM no-WU
-    /// alignment with grpc-go-shmem v3.4+ <c>shmNoWU</c>).
+    /// Drip threshold for batched <c>WINDOW_UPDATE</c> emission
+    /// (matches Go's <c>limit/4</c> cadence). Computed from
+    /// <see cref="InitialWindowSize"/> at process start; not used directly
+    /// in code (the InFlow/TrInFlow classes recompute the same value
+    /// from their <c>_limit</c> field) but exported for observability.
     /// </summary>
-    public const uint WindowUpdateBatchThreshold = (uint)(InitialWindowSize / 4);
+    public static readonly uint WindowUpdateBatchThreshold = (uint)(InitialWindowSize / 4);
 
     /// <summary>Maximum stream ID for client (odd numbers).</summary>
     public const uint MaxStreamId = uint.MaxValue - 1;
@@ -243,6 +233,34 @@ public static class ShmConstants
 
     /// <summary>Maximum spin iterations to prevent excessive CPU use.</summary>
     public const int SpinIterationsMax = 10000;
+
+    /// <summary>
+    /// Writer-loop Phase 2 spin budget (iterations). Default 0 = NO SPIN,
+    /// matching grpc-go-shmem's <c>shmSpinDefault = 0</c> policy
+    /// (see <c>internal/transport/shm_spin_config.go</c>). With spin
+    /// disabled the WriterLoop's Phase 2 falls straight through to
+    /// Phase 2.5 (Thread.Yield, matches Go's <c>runtime.Gosched()</c>)
+    /// and then Phase 3 (kernel <c>ManualResetEventSlim.Wait</c>).
+    /// <para>
+    /// Operators that want sub-µs RPC latency can opt in by setting
+    /// the env var <c>SHM_WRITER_SPIN_ITERATIONS</c> to a positive
+    /// value (typically 500-4000). 2000 (~60 µs window) is the legacy
+    /// value tuned for single-stream ping-pong. Larger values (up to
+    /// <see cref="SpinIterationsMax"/>) burn more idle CPU for tighter
+    /// catch of next-batch arrival in the 10-100 stream regime.
+    /// </para>
+    /// <para>
+    /// MUST be opt-in for fair-comparison benches (Doug's request
+    /// mirrored from grpc-go-shmem): comparing SHM to UDS/TCP with
+    /// SHM idle-spinning skews the result unfairly.
+    /// </para>
+    /// </summary>
+    public static readonly int WriterLoopSpinIterations =
+        int.TryParse(Environment.GetEnvironmentVariable("SHM_WRITER_SPIN_ITERATIONS"),
+            System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out var ws) && ws >= 0
+            ? Math.Min(ws, SpinIterationsMax)
+            : 0;
 
     /// <summary>Suffix for control segment names.</summary>
     public const string ControlSegmentSuffix = "_ctl";

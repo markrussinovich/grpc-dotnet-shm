@@ -49,24 +49,32 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     // in creating streams, exceeding the server's maxConcurrentStreams limit.
     private int _clientStreamCount;
 
-    // Connection-level and stream-level HTTP/2 flow control are
-    // ELIDED in ALL modes, matching grpc-go-shmem's v3.4+ no-WU
-    // baseline (will be specified normatively in the gRFC):
-    //
-    //   - Senders never emit WINDOW_UPDATE frames.
-    //   - Receivers parse incoming WINDOW_UPDATE for RFC 7540 §6.9.1
-    //     validation at the H2 codec layer, then discard the
-    //     increment (AddSendQuota is an unconditional no-op).
-    //   - Per-stream and per-connection windows are not tracked.
-    //   - Ring WaitForSpace is the canonical SHM back-pressure primitive.
-    //
-    // The opt-in SHM_FAIR_STREAM_WINDOW / SHM_FAIR_MAX_FRAME
-    // env vars only affect wire-format parity for benchmarking against
-    // TCP+HTTP/2 (smaller DATA frame payload, disabled coalescing); they
-    // do NOT re-enable flow control. Both endpoints (.NET and
-    // grpc-go-shmem) are no-WU in every mode, so there is no interop
-    // restriction.
+    // Atomic counter for server-side max-stream enforcement AND for the
+    // hot-path ActiveStreamCount probe in ShmGrpcServer / ShmGrpcStream
+    // SingleStreamMode fast-path checks. Avoids ConcurrentDictionary.Count
+    // which acquires every bucket lock — at N=1000 streams that was 65%+
+    // CPU on Monitor.Enter_Slowpath in the profile (see fair-conc 1000/64B).
+    // Incremented after _streams.TryAdd succeeds, decremented after
+    // _streams.TryRemove succeeds. Both ops in HandleHeadersFrame /
+    // DeliverStreamAsync / RemoveStream keep this in sync with _streams.
+    private int _serverStreamCount;
 
+    // HTTP/2 stream-level flow control: ACTIVE on this branch (see
+    // InFlow / TrInFlow / EmitWindowUpdate). Both endpoints emit and
+    // consume WINDOW_UPDATE per gRFC SHM v3.4+; per-stream send quota
+    // is enforced by ShmGrpcStream.ReserveSendQuotaOrBlock.
+    //
+    // Connection-level FC is still elided (per-stream is sufficient
+    // for SHM since the ring itself provides connection-level
+    // back-pressure via WaitForSpace).
+    //
+    // The opt-in SHM_FAIR_MAX_FRAME env var further constrains
+    // wire-format parity for benchmarking against TCP/UDS gRPC
+    // (smaller per-frame DATA cap forcing multi-frame splitting).
+    // SHM_INITIAL_WINDOW sets the per-stream FC advertisement
+    // (default 32 MiB; set to 65535 to match the HTTP/2 spec).
+    // Defaults leave the SHM transport with its native 32 MiB
+    // initial window and ringCapacity/3 per-frame payload cap.
     // Write lock: the SPSC ring buffer requires single-producer semantics.
     // All writes to TxRing are serialised through the ShmFrameWriter's
     // dedicated consumer thread (Channel SingleReader=true).
@@ -74,6 +82,34 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
     /// <summary>Gets the frame writer (for singleStreamMode direct write).</summary>
     internal ShmFrameWriter? FrameWriter => _frameWriter;
+
+    // Receive-side fan-out dispatcher. Reader thread enqueues parsed
+    // frames here; per-stripe Threads call ShmGrpcStream.OnFrameReceived
+    // inline. This is the win path for the 1000-stream tiny-payload
+    // cell where Channel<T>.SetResult + ThreadPool.UnsafeQueueUserWorkItem
+    // dispatch costs ~0.5-1 us/frame on Linux and ~17 us/frame on
+    // Windows. With 4 stripes a single stripe Thread serves
+    // ~250 streams in the 1000-stream bench cell; HOL within a stripe
+    // is bounded to that 250-stream subset.
+    //
+    // Disabled by setting SHM_RECEIVE_STRIPER=0 (default ON). When
+    // null the legacy path runs: reader Thread calls
+    // stream.OnFrameReceived directly, one TryWrite per frame, paying
+    // the per-channel SetResult dispatch tax.
+    private static readonly bool s_useReceiveStriper =
+        !string.Equals(Environment.GetEnvironmentVariable("SHM_RECEIVE_STRIPER"),
+            "0", StringComparison.Ordinal);
+    private readonly Synchronization.ReceiveStriper? _receiveStriper;
+
+    /// <summary>
+    /// True when the receive-side striper is wired in. Read by
+    /// ShmGrpcStream's ctor to decide whether the per-stream inbound
+    /// channel can safely set <c>AllowSynchronousContinuations=true</c>
+    /// (the stripe Thread is the only writer of that channel and is a
+    /// dedicated dispatch point, so the user-code continuation can
+    /// inline-run on the stripe without HOL-blocking other stripes).
+    /// </summary>
+    internal bool UseReceiveStriper => _receiveStriper != null;
 
     /// <summary>
     /// When true, ReadFramePayload returns ring memory directly (zero-copy)
@@ -103,6 +139,32 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
     }
     private bool _singleStreamMode;
+
+    /// <summary>
+    /// When true, the inbound <see cref="System.Threading.Channels.Channel{T}"/>
+    /// of every <see cref="ShmGrpcStream"/> created on this connection
+    /// is constructed with <c>AllowSynchronousContinuations=true</c>,
+    /// causing the reader thread to invoke awaiting consumer
+    /// continuations inline instead of dispatching them through the
+    /// ThreadPool. Eliminates ~17 µs of per-receive ThreadPool dispatch
+    /// latency on Windows (about 41 % of the streaming-0B round-trip).
+    /// <para>
+    /// SAFE ONLY when the application guarantees that (1) the
+    /// connection carries at most one active stream at a time and
+    /// (2) the receive-side continuations never perform a synchronous
+    /// wait (e.g. <c>.Result</c> / <c>.Wait()</c> / blocking on another
+    /// completion) that depends on the reader thread making further
+    /// progress. Violating either property head-of-line-blocks the
+    /// reader and can deadlock the connection.
+    /// </para>
+    /// Default <c>false</c>; opt-in via
+    /// <c>ShmGrpcServer(inlineReceiveContinuations: true)</c> or
+    /// <c>ShmClientTransportOptions.InlineReceiveContinuations = true</c>.
+    /// Channel options are immutable after stream construction, so
+    /// flipping this flag only affects streams created afterwards.
+    /// </summary>
+    internal bool InlineReceiveContinuations { get; set; }
+
 
     // Keepalive (A73 RFC)
     private readonly ShmKeepaliveOptions _keepaliveOptions;
@@ -162,9 +224,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <summary>
     /// Gets the number of active streams on this connection.
     /// </summary>
+    /// <remarks>
+    /// Both client and server use atomic counters (NOT
+    /// <c>_streams.Count</c>): <c>ConcurrentDictionary.Count</c> acquires
+    /// every bucket lock and at high stream concurrency (N=1000) burned
+    /// 60%+ of server CPU in <c>Monitor.Enter_Slowpath</c> per the
+    /// fair-conc 1000/64B profile. The counters are kept in sync with
+    /// <c>_streams</c> at every <c>TryAdd</c> / <c>TryRemove</c> site.
+    /// </remarks>
     public int ActiveStreamCount => _isClient
         ? Volatile.Read(ref _clientStreamCount)
-        : _streams.Count;
+        : Volatile.Read(ref _serverStreamCount);
 
     /// <summary>
     /// Gets the maximum number of concurrent streams allowed.
@@ -301,13 +371,35 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // enforcement — see ShmGrpcStream.FairAwaitWindow no-op).
         _frameWriter = new ShmFrameWriter(TxRing, _disposeCts, _streams);
 
-        // No-WU design (matches grpc-go-shmem shmNoWU mode, gRFC SHM
-        // alignment v3.4+): never emit WINDOW_UPDATE frames; incoming
-        // WU frames are validated by the H2 codec for spec compliance
-        // (RFC 7540 §6.9.1 increment != 0, length == 4) then their
-        // increment is discarded in AddSendQuota. The SHM ring's
-        // WaitForSpace backpressure is the sole flow control.
-        // Hence no OnDataFrameConsumed callback is wired here.
+        // Initialize the receive striper BEFORE the reader so the
+        // reader's ProcessFrame can route frames through it on the
+        // very first dispatch. ALSO before any ShmGrpcStream is
+        // constructed via CreateStream / accepted from incoming, so the
+        // per-stream inbound-channel ctor sees the correct
+        // UseReceiveStriper value when picking AllowSynchronousContinuations.
+        // Server-side CreateStream is gated by the reader's HEADERS
+        // arrival, which can only happen after _frameReaderTask starts
+        // a few lines below; client-side CreateStream is user-driven
+        // after the connection object is returned from CreateAsServer /
+        // ConnectAsClient — also after this ctor completes.
+        if (s_useReceiveStriper)
+        {
+            _receiveStriper = new Synchronization.ReceiveStriper(_streams);
+        }
+
+        // gRFC SHM v3.4+ HTTP/2-compatible flow control: wire the
+        // per-DATA-frame hook (conn-level drip via TrInFlow.OnData +
+        // per-stream over-window enforcement via InFlow.OnData) and the
+        // LPM-header parse-time hook (stream-level pre-credit via
+        // InFlow.MaybeAdjustAdditive — MUST per gRFC because the SHM
+        // codec aggregates DATA frames into a complete LPM before
+        // delivering to the application, so the app-Read-driven
+        // maybeAdjust path from stock HTTP/2 is unreachable). Both
+        // hooks fire on the single frame-reader thread; wiring them
+        // BEFORE _frameReaderTask starts gives happens-before via the
+        // task launch.
+        Wire.Http2Codec.SetOnDataFrame(RxRing, OnDataFrame);
+        Wire.Http2Codec.SetOnMessageStart(RxRing, OnMessageStart);
 
         // Start background frame reader
         _frameReaderTask = FrameReaderLoopAsync();
@@ -458,6 +550,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             {
                 Interlocked.Decrement(ref _clientStreamCount);
             }
+            else
+            {
+                Interlocked.Decrement(ref _serverStreamCount);
+            }
 
             StreamRemoved?.Invoke(streamId);
         }
@@ -491,12 +587,14 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _frameWriter!.EnqueueZeroCopyAndWait(type, streamId, flags, payload, cancellationToken);
     }
 
-    // Regression guard: SHM is no-WU in all modes (gRFC SHM alignment with
-    // grpc-go-shmem v3.4+ shmNoWU). Incremented inside the H2 codec's
-    // WriteH2WindowUpdate — the single structural emission point — so any
-    // future code path that puts a WINDOW_UPDATE frame on the wire
-    // automatically trips the EndToEndTests.NoWindowUpdate_EmittedInDefault
-    // Mode_GrpcGoInteropAlignment assertion without further wiring.
+    // Diagnostic counter: incremented inside the H2 codec's
+    // WriteH2WindowUpdate (the single structural emission point) so
+    // tests can verify exactly when WUs are emitted. With the HTTP/2
+    // FC stack active on this branch, WUs ARE emitted on the drip path
+    // (per-stream send quota tracking + EmitWindowUpdate at limit/4).
+    // The legacy test name 'NoWindowUpdate_EmittedInDefaultMode...' is
+    // a historical artefact from the pre-FC baseline; current invariant
+    // is just that the counter is observable for diagnostics.
     private static long s_wuFramesEmitted;
     internal static long WindowUpdateFramesEmittedForTest()
         => Volatile.Read(ref s_wuFramesEmitted);
@@ -583,8 +681,19 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             case FrameType.Trailers:
             case FrameType.HalfClose:
             case FrameType.Cancel:
-                // Route to stream — transfer pooled buffer ownership
-                if (_streams.TryGetValue(header.StreamId, out var stream))
+                // Route to stream — transfer pooled buffer ownership.
+                // When the receive striper is enabled (default) the
+                // dispatch is fanned out across N stripe Threads so the
+                // reader Thread does NOT pay the Channel<InboundFrame>
+                // SetResult + ThreadPool.UnsafeQueueUserWorkItem tax for
+                // every frame. The legacy direct path remains as the
+                // fallback when SHM_RECEIVE_STRIPER=0.
+                if (_receiveStriper != null)
+                {
+                    var frame = new InboundFrame(header.Type, payload, header.Flags);
+                    _receiveStriper.Enqueue(header.StreamId, frame);
+                }
+                else if (_streams.TryGetValue(header.StreamId, out var stream))
                 {
                     var frame = new InboundFrame(header.Type, payload, header.Flags);
                     stream.OnFrameReceived(frame);
@@ -594,9 +703,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                     payload.Release();
                 }
 
-                // Connection-level back-pressure: none. SHM is no-WU in all
-                // modes (gRFC SHM alignment with grpc-go-shmem shmNoWU);
-                // the ring's WaitForSpace is the sole flow control.
+                // Connection-level back-pressure: none (ring's
+                // WaitForSpace is sufficient). Per-stream HTTP/2 FC IS
+                // active on this branch via InFlow / TrInFlow, so
+                // inbound WUs do affect per-stream send quota — see
+                // ProcessFrame's WindowUpdate case.
                 break;
 
             case FrameType.Ping:
@@ -678,8 +789,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 return;
             }
 
-            // Check max concurrent streams
-            if (_streams.Count >= (int)_maxConcurrentStreams)
+            // Check max concurrent streams. Use the atomic counter
+            // (mirrors client-side enforcement) instead of
+            // _streams.Count to avoid the all-bucket Monitor.Enter that
+            // dominated the server-side profile at N=1000.
+            if (Volatile.Read(ref _serverStreamCount) >= (int)_maxConcurrentStreams)
             {
                 RejectStream(streamId, "max concurrent streams exceeded");
                 payload.Release();
@@ -712,6 +826,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 newStream.Dispose();
                 return;
             }
+            Interlocked.Increment(ref _serverStreamCount);
 
             // Publish to incoming streams channel.
             // Channel capacity is 2x maxConcurrentStreams to absorb the window
@@ -757,6 +872,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // Timed out, disposed, or cancelled — reject the stream.
             if (_streams.TryRemove(streamId, out var orphaned))
             {
+                Interlocked.Decrement(ref _serverStreamCount);
                 orphaned.Dispose();
             }
             RejectStream(streamId, "server overloaded");
@@ -801,26 +917,304 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     #region Connection-Level Flow Control
 
     /// <summary>
-    /// Handler for incoming WINDOW_UPDATE frames. No-op in all modes: SHM
-    /// is no-WU (gRFC SHM alignment with grpc-go-shmem v3.4+ shmNoWU);
-    /// the H2 codec layer has already validated the frame per RFC 7540
-    /// §6.9.1 (increment != 0, length == 4) by the time the dispatcher
-    /// routes it here, and the increment is then discarded. We never
-    /// emit WINDOW_UPDATE either — see
-    /// <see cref="WindowUpdateFramesEmittedForTest"/> and the structural
-    /// counter inside <c>Http2Codec.Write.WriteH2WindowUpdate</c>.
+    /// Conn-level send-window quota. Bytes the peer has granted via the
+    /// initial SETTINGS plus accumulated <c>WINDOW_UPDATE(streamId=0)</c>.
+    /// Drained by every outbound DATA chunk; refilled by inbound conn-level
+    /// WU frames. Per HTTP/2 §6.9.1 starts at <see cref="ShmConstants.InitialWindowSize"/>;
+    /// senders MUST observe both this and the per-stream window.
+    /// <para>
+    /// Phase A note: the inline-send path consults the per-stream quota
+    /// only. Conn-level enforcement is wired but its CAS happens at the
+    /// writer-task boundary (Phase B); intermediate state is correct
+    /// because every outbound DATA flows through the writer task after
+    /// Phase B refactor.
+    /// </para>
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822", Justification = "No-op stub kept instance-method for API stability and interop with the WINDOW_UPDATE dispatch path.")]
+    private long _connSendQuota = ShmConstants.InitialWindowSize;
+
+    /// <summary>
+    /// Wake signal for senders blocked on insufficient conn-level quota.
+    /// Set by <see cref="AddSendQuota"/>(streamId=0, …); reset by
+    /// senders before re-checking quota to avoid missed wakes.
+    /// </summary>
+    private readonly ManualResetEventSlim _connSendQuotaWake = new(initialState: false);
+
+    /// <summary>
+    /// Conn-level inbound flow-control bookkeeping. Tracks total DATA
+    /// bytes received across all streams against the conn-level limit
+    /// we advertised; paces conn-level <c>WINDOW_UPDATE(streamId=0)</c>
+    /// drip emission. SHM-tuned threshold may differ from stock
+    /// <c>limit/4</c>; the SHM transport may flush via
+    /// <see cref="Synchronization.TrInFlow.Reset"/> at its own cadence.
+    /// </summary>
+    internal Synchronization.TrInFlow ConnInFlow { get; } = new(initialLimit: (uint)ShmConstants.InitialWindowSize);
+
+    /// <summary>
+    /// Pending conn-level WINDOW_UPDATE credit awaiting emission.
+    /// Mirrors grpc-go-shmem's <c>t.pendingConnWU</c> in the lockless
+    /// WU emission path (shm_client_transport.go:620-635). Producers
+    /// (the reader Thread's drip on every inbound DATA frame)
+    /// atomically <c>Add</c> their delta; a producer that crosses
+    /// the <see cref="_wuThreshold"/> gate <c>Exchange(0)</c>s the
+    /// accumulator to claim the full sum for a single coalesced
+    /// frame. Eliminates the per-drip frame-writer Enqueue cost on
+    /// 65535 windows where the previous per-call emit triggered
+    /// O(frames / drip-threshold) ManualResetEventSlim.Set
+    /// thundering-herd wakes on every stalled sender.
+    /// </summary>
+    private long _pendingConnWU;
+
+    /// <summary>Snapshot of the current conn-level send quota.</summary>
+    internal long ConnSendQuota => Volatile.Read(ref _connSendQuota);
+
+    /// <summary>
+    /// Routes an inbound <c>WINDOW_UPDATE</c> frame from the H2 codec
+    /// to the appropriate quota.
+    /// </summary>
+    /// <param name="streamId">
+    /// Frame stream ID. <c>0</c> = conn-level (refills
+    /// <see cref="_connSendQuota"/>); non-zero = per-stream (looks up
+    /// the <see cref="ShmGrpcStream"/> and calls
+    /// <see cref="ShmGrpcStream.AddSendQuota"/>).
+    /// </param>
+    /// <param name="delta">Credit increment. RFC 7540 §6.9.1 forbids 0;
+    /// caller (H2 codec) has already validated.</param>
+    /// <remarks>
+    /// gRFC SHM v3.4+ "Flow Control": SHM transports run an
+    /// HTTP/2-compatible FC state machine that follows RFC 7540 §5.2 and
+    /// §6.9 wire semantics exactly. WU dispatching here is the receiver-side
+    /// half of the per-stream/conn quota dance. Records every emission to
+    /// <c>s_wuFramesEmitted</c> so test code can verify FC traffic levels.
+    /// </remarks>
     internal void AddSendQuota(uint streamId, uint delta)
     {
-        // No-op (all modes). Aligns with grpc-go-shmem shmNoWU design:
-        // SHM ring's WaitForSpace backpressure is the sole flow control;
-        // per-stream H2 windows are not enforced over shared memory.
-        // Incoming WINDOW_UPDATE frames are still parsed for spec
-        // compliance (RFC 7540 §6.9.1) and validated by the H2 codec,
-        // but their increment is discarded here.
-        _ = streamId;
-        _ = delta;
+        if (delta == 0) return; // codec already RST'd; defensive
+        var clamped = delta > int.MaxValue ? int.MaxValue : (int)delta;
+        if (streamId == 0)
+        {
+            // Conn-level WU. Cap conn quota at int.MaxValue (H2 31-bit
+            // ceiling enforced via OnReceive validation at codec layer).
+            while (true)
+            {
+                var current = Volatile.Read(ref _connSendQuota);
+                var desired = current + clamped;
+                if (desired > int.MaxValue) desired = int.MaxValue;
+                if (Interlocked.CompareExchange(ref _connSendQuota, desired, current) == current)
+                {
+                    _connSendQuotaWake.Set();
+                    return;
+                }
+            }
+        }
+        // Per-stream WU. Unknown stream IDs (e.g. RST'd already) are dropped.
+        if (_streams.TryGetValue(streamId, out var stream))
+        {
+            stream.AddSendQuota(clamped);
+            // Phase B: nudge the writer task to drain any deferred
+            // entries on this stream whose quota is now sufficient.
+            _frameWriter?.NotifyQuotaUpdated(streamId);
+        }
+        else
+        {
+            // Stream was disposed locally (e.g. Unary server-side
+            // handler returned and disposed the stream right after
+            // fire-and-forget SendFrameZeroCopy of the response body)
+            // but our partial-write defer may still hold the last
+            // chunks parked under this streamId. Wake the writer so
+            // its <see cref="TryDrainDeferredLocked"/> can take the
+            // fairStream-null branch and write the remaining chunks
+            // best-effort to the peer (who is still reading the
+            // mid-LPM bytes and waiting on the full message).
+            _frameWriter?.NotifyQuotaUpdated(streamId);
+        }
+    }
+
+    /// <summary>
+    /// HTTP/2 codec hook: invoked synchronously by the frame reader for
+    /// every inbound DATA frame (RFC 7540 §6.9.1 — Pad Length and padding
+    /// included). Updates conn-level inbound accounting, emits the
+    /// conn-level <c>WINDOW_UPDATE</c> drip if the threshold is crossed,
+    /// and updates the per-stream inbound accounting (closing the stream
+    /// with <c>FLOW_CONTROL_ERROR</c> per RFC 7540 §5.2.2 on over-window
+    /// receive).
+    /// </summary>
+    private void OnDataFrame(uint streamId, uint payloadLen)
+    {
+        // Conn-level drip-on-receive. Stock HTTP/2 cadence (limit/4).
+        // Phase B may add SHM-tuned threshold + piggyback WU.
+        var connWu = ConnInFlow.OnData(payloadLen);
+        if (connWu > 0)
+        {
+            EmitWindowUpdate(streamId: 0, delta: connWu);
+        }
+
+        // Per-stream inbound accounting + over-window enforcement.
+        if (_streams.TryGetValue(streamId, out var stream))
+        {
+            var err = stream.InFlow.OnData(payloadLen);
+            if (err != null)
+            {
+                // RFC 7540 §5.2.2: receivers MUST treat over-window inbound
+                // DATA as STREAM_ERROR with FLOW_CONTROL_ERROR. Send
+                // RST_STREAM(FLOW_CONTROL_ERROR) and tear down the local
+                // stream so the partial LPM is dropped.
+                System.Diagnostics.Debug.WriteLine($"[shm-fc] stream {streamId} FLOW_CONTROL_ERROR: {err}");
+                EmitRstStream(streamId, Wire.Http2ErrorCode.FlowControlError);
+                // Local teardown — best-effort; stream may already be closing.
+                try { stream.AbortForFlowControl(err); } catch { /* ignore */ }
+                return;
+            }
+
+            // SHM drip-on-receive: SHM has no intermediate copy buffer
+            // (the codec parses directly from the ring), so "received"
+            // and "read-by-app" are effectively the same event. We
+            // settle the receive-side drip here at parse time. This is
+            // the SOLE entry point for stream-level WU drip; there is
+            // no separate post-app-read path (avoids the double-credit
+            // footgun a future OnAppRead wiring could introduce).
+            // Matches grpc-go-shmem v3.4+ drip-on-receive behavior.
+            var streamWu = stream.InFlow.OnRead(payloadLen);
+            if (streamWu > 0)
+            {
+                EmitWindowUpdate(streamId, streamWu);
+            }
+        }
+    }
+
+    /// <summary>
+    /// HTTP/2 codec hook: invoked the moment the codec finishes parsing
+    /// the 5-byte LPM header for an inbound message. Drives the gRFC
+    /// SHM v3.4+ MUST stream-level pre-credit:
+    /// <c>InFlow.MaybeAdjustAdditive(lpmSize)</c> returns the additional
+    /// stream WU bytes needed to admit the announced message; we emit
+    /// the WU immediately bypassing the drip threshold (force-emit) so
+    /// the sender does not stall waiting for a drip that never reaches
+    /// the threshold before the LPM completes.
+    /// </summary>
+    private void OnMessageStart(uint streamId, uint lpmSize)
+    {
+        if (!_streams.TryGetValue(streamId, out var stream)) return;
+        var wu = stream.InFlow.MaybeAdjustAdditive(lpmSize);
+        if (wu > 0)
+        {
+            // gRFC SHM v3.4+ additive pre-credit MUST be emitted
+            // immediately so the sender does not stall waiting for
+            // a drip that won't arrive before the LPM completes.
+            // force=true bypasses the coalescing threshold gate.
+            EmitWindowUpdate(streamId, wu, force: true);
+        }
+    }
+
+    /// <summary>
+    /// Emits a single <c>WINDOW_UPDATE</c> frame on the TX ring.
+    /// <paramref name="streamId"/> = 0 for connection-level, &gt; 0 for
+    /// per-stream. Uses the existing <c>FrameProtocol.WriteWindowUpdate</c>
+    /// path which is bit-identical to the H2 codec emit path verified
+    /// by <c>NoWindowUpdate_*</c> tests in PR #20 (the test will be
+    /// updated to "WindowUpdate_Emitted_PerHttp2Semantics" in Phase A
+    /// step A10).
+    /// </summary>
+    private void EmitWindowUpdate(uint streamId, uint delta)
+    {
+        EmitWindowUpdate(streamId, delta, force: false);
+    }
+
+    /// <summary>
+    /// Accumulating WINDOW_UPDATE emit path. Mirrors grpc-go-shmem's
+    /// <c>sendConnWindowUpdate</c> / <c>sendStreamWindowUpdate</c>
+    /// lockless coalescing (shm_client_transport.go:620-680). Each
+    /// caller atomically adds its <paramref name="delta"/> to the
+    /// per-scope pending accumulator. When the pending value crosses
+    /// <see cref="_wuThreshold"/> (or when <paramref name="force"/>
+    /// is true, e.g. for additive pre-credit on LPM start) the
+    /// caller <c>Exchange(0)</c>s the accumulator and emits one WU
+    /// frame for the entire swept sum. A producer that observes
+    /// <c>Exchange</c> returning 0 means a concurrent producer has
+    /// already swept its delta and will emit the combined frame;
+    /// bytes are never lost.
+    /// </summary>
+    private void EmitWindowUpdate(uint streamId, uint delta, bool force)
+    {
+        if (_disposed != 0 || _frameWriter == null || delta == 0) return;
+
+        // 2026-05-28 — threshold gate disabled while we debug a hang at
+        // fair_conc 10×64KB on Linux Xeon (window=65535 forces multi-
+        // round-trip WU pressure that the gate failed to keep liveness
+        // on). The accumulator is preserved so concurrent producers
+        // still combine their deltas into one frame when they race,
+        // but we now ALWAYS Exchange + emit per call, matching the
+        // pre-ad029a17 emit cadence on the slow path. If a future
+        // commit re-introduces a gate it MUST be paired with a
+        // periodic flush so deferred bytes can never be stuck when
+        // the sender stalls waiting for the deferred WU.
+        long claimed;
+        if (streamId == 0)
+        {
+            Interlocked.Add(ref _pendingConnWU, delta);
+            // _ = force; // intentionally ignored: gate is off
+            claimed = Interlocked.Exchange(ref _pendingConnWU, 0);
+        }
+        else
+        {
+            if (!_streams.TryGetValue(streamId, out var stream)) return;
+            Interlocked.Add(ref stream.PendingWU, delta);
+            claimed = Interlocked.Exchange(ref stream.PendingWU, 0);
+        }
+
+        if (claimed == 0)
+        {
+            // A concurrent producer already swept the accumulator and
+            // will emit the combined frame carrying our delta.
+            return;
+        }
+
+        EmitWindowUpdateFrame(streamId, (uint)Math.Min(claimed, int.MaxValue));
+        _ = force; // silence unused-warning while gate is disabled
+    }
+
+    /// <summary>
+    /// Writes a single WINDOW_UPDATE frame to the TX ring via the
+    /// frame-writer queue. Called only by <see cref="EmitWindowUpdate"/>
+    /// after the lockless accumulator has been swept; do not call
+    /// directly from drip / pre-credit paths or coalescing is
+    /// bypassed.
+    /// </summary>
+    private void EmitWindowUpdateFrame(uint streamId, uint delta)
+    {
+        if (_disposed != 0 || _frameWriter == null || delta == 0) return;
+        try
+        {
+            Span<byte> payload = stackalloc byte[4];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, delta);
+            _frameWriter.Enqueue(FrameType.WindowUpdate, streamId, 0, payload);
+        }
+        catch (InvalidOperationException)
+        {
+            // Writer closed; ignore.
+        }
+    }
+
+    /// <summary>
+    /// Emits a single <c>RST_STREAM</c> frame with the given H2 error
+    /// code. Used by FC enforcement (RFC 7540 §5.2.2 / §6.9.1) to abort
+    /// an over-window stream with <c>FLOW_CONTROL_ERROR</c>. Goes through
+    /// the same <see cref="ShmFrameWriter"/> queue as application frames
+    /// so it serializes with in-flight DATA on the same stream.
+    /// </summary>
+    private void EmitRstStream(uint streamId, Wire.Http2ErrorCode error)
+    {
+        if (_disposed != 0 || _frameWriter == null || streamId == 0) return;
+        try
+        {
+            Span<byte> payload = stackalloc byte[4];
+            // The Cancel codec path expects 4-byte big-endian H2 error code.
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(payload, (uint)error);
+            _frameWriter.Enqueue(FrameType.Cancel, streamId, 0, payload);
+        }
+        catch (InvalidOperationException)
+        {
+            // Writer closed; ignore.
+        }
     }
 
     #endregion
@@ -972,6 +1366,24 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _incomingStreamsChannel.Writer.TryComplete();
         _disposeCts.Cancel();
 
+        // Early wake all stream consumers. The per-stream Channel waits
+        // now run with CancellationToken.None (so the runtime can use
+        // its pooled _waiterSingleton fast path; see GPT-5.5 review
+        // notes in ShmGrpcStream.ReceiveFrameSync). Without an explicit
+        // TryComplete here those consumers would sleep until step ~6
+        // below (foreach stream.Dispose), incurring up to the 5-second
+        // reader-wait budget of dispose-latency for any consumer
+        // currently parked on WaitToReadAsync. TryComplete is
+        // idempotent and races safely with future writes from the
+        // reader (the reader will simply get TryWrite=false and
+        // release the frame, which is the correct teardown
+        // behaviour).
+        foreach (var stream in _streams.Values)
+        {
+            try { stream.CompleteInbound(); }
+            catch { /* best effort */ }
+        }
+
         // Wait for the reader thread to fully exit BEFORE disposing the
         // Segment (which unmaps the ring header pages). If the reader is
         // still inside ShmRing.WaitForDataAfter when the unmap happens it
@@ -992,6 +1404,18 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 "leaking Segment to avoid use-after-free.");
         }
 
+        // Stop the receive-side fan-out AFTER the reader Thread has
+        // exited so we know no more frames will be Enqueued into the
+        // stripes. Disposing the striper TryCompletes each stripe queue
+        // and Joins the stripe Threads; the stripe shutdown drain
+        // releases any frame whose payload was queued but never
+        // dispatched (e.g., reader enqueued during the cancellation
+        // window). MUST happen before the Segment is unmapped (below)
+        // because the drain may still touch the payload backing buffer
+        // for ring-backed zero-copy frames.
+        try { _receiveStriper?.Dispose(); }
+        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.Dispose: striper: {ex.Message}"); }
+
         if (_keepaliveTask != null)
         {
             try { _keepaliveTask.Wait(TimeSpan.FromMilliseconds(200)); }
@@ -1004,6 +1428,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.Dispose: stream {stream.StreamId}: {ex.Message}"); }
         }
         _streams.Clear();
+        // Keep ActiveStreamCount accessor consistent with _streams after
+        // disposal (post-dispose queries should report 0, not the last
+        // pre-dispose count).
+        Interlocked.Exchange(ref _clientStreamCount, 0);
+        Interlocked.Exchange(ref _serverStreamCount, 0);
 
         // Only dispose the Segment if the reader has confirmed it is
         // outside any header.WriteIdx read.
@@ -1040,6 +1469,14 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _incomingStreamsChannel.Writer.TryComplete();
         _disposeCts.Cancel();
 
+        // Early wake all stream consumers \u2014 see sync Dispose for
+        // rationale.
+        foreach (var stream in _streams.Values)
+        {
+            try { stream.CompleteInbound(); }
+            catch { /* best effort */ }
+        }
+
         // See sync Dispose for rationale on the 5 s timeout + leak-on-
         // timeout policy.
         try { await _frameReaderTask.WaitAsync(TimeSpan.FromSeconds(5)); }
@@ -1051,6 +1488,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 "ShmConnection.DisposeAsync: frame reader did not exit in 5 s; " +
                 "leaking Segment to avoid use-after-free.");
         }
+
+        // See sync Dispose for rationale on striper-after-reader ordering.
+        try { _receiveStriper?.Dispose(); }
+        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.DisposeAsync: striper: {ex.Message}"); }
 
         if (_keepaliveTask != null)
         {
@@ -1064,6 +1505,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.DisposeAsync: stream {stream.StreamId}: {ex.Message}"); }
         }
         _streams.Clear();
+        // See Dispose() for rationale.
+        Interlocked.Exchange(ref _clientStreamCount, 0);
+        Interlocked.Exchange(ref _serverStreamCount, 0);
 
         // Only dispose the Segment if the reader has confirmed it is
         // outside any header.WriteIdx read.

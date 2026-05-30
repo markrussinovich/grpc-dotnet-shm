@@ -81,6 +81,38 @@ internal static partial class Http2Codec
         // call before the ring is touched, preserving FIFO order between
         // synthetic frames and any subsequent wire frames.
         public readonly Queue<(FrameHeader Header, FramePayload Payload)> PendingFrames = new();
+
+        /// <summary>
+        /// Bench-only and HTTP/2-FC hook. Invoked synchronously the moment
+        /// <see cref="FeedAccumulator"/> finishes parsing a gRPC LPM's
+        /// 5-byte header, BEFORE any DATA frame body bytes have been
+        /// accumulated. Receives <c>(streamId, lpmSize)</c> where
+        /// <c>lpmSize = 5 + bodyLen</c>. Wired by <see cref="ShmConnection"/>
+        /// to drive stream-level pre-credit via
+        /// <c>InFlow.MaybeAdjustAdditive(lpmSize)</c> per the gRFC SHM
+        /// v3.4+ MUST requirement (stream-level pre-credit at LPM parse
+        /// — see <c>shm-rfc/A-shared-memory-transport.md</c> §"Stream-level
+        /// pre-credit at LPM parse"). Fires once per LPM at the
+        /// HeaderBytesSeen 4→5 transition.
+        ///
+        /// Thread-safety contract: set exclusively by
+        /// <see cref="ShmConnection"/> BEFORE the frame reader task starts
+        /// (happens-before via task launch). Read exclusively by the
+        /// single reader thread inside <see cref="FeedAccumulator"/>.
+        /// </summary>
+        public Action<uint, uint>? OnMessageStart;
+
+        /// <summary>
+        /// HTTP/2-FC hook. Invoked synchronously by <see cref="TryReadDataFrame"/>
+        /// once per inbound H2 DATA frame, receiving
+        /// <c>(streamId, payloadLen)</c> where <c>payloadLen</c> is the full
+        /// on-wire payload size (including Pad Length byte and padding,
+        /// per RFC 7540 §6.9.1 "the entire DATA frame payload is included
+        /// in flow control"). Wired by <see cref="ShmConnection"/> to drive
+        /// conn-level drip-on-receive via <c>TrInFlow.OnData</c> and
+        /// stream-level over-window enforcement via <c>InFlow.OnData</c>.
+        /// </summary>
+        public Action<uint, uint>? OnDataFrame;
     }
 
     private static void EnqueuePendingFrame(
@@ -129,6 +161,40 @@ internal static partial class Http2Codec
     private static Http2DecoderState GetState(ShmRing ring)
     {
         return s_decoderState.GetValue(ring, _ => new Http2DecoderState());
+    }
+
+    /// <summary>
+    /// Wires a stream-level pre-credit hook on the per-ring decoder
+    /// state. The callback is invoked synchronously by the frame
+    /// reader thread the moment <see cref="FeedAccumulator"/> finishes
+    /// parsing a gRPC LPM's 5-byte header. Receives
+    /// <c>(streamId, lpmSize)</c> where <c>lpmSize = 5 + bodyLen</c>.
+    /// </summary>
+    /// <remarks>
+    /// MUST be called BEFORE the connection's frame reader task is
+    /// started; the field is plain (no volatile) and relies on the
+    /// task-launch happens-before edge for visibility. A <c>null</c>
+    /// callback disables the hook (legacy mode); set to a real callback
+    /// to drive <c>InFlow.MaybeAdjustAdditive</c> per gRFC SHM v3.4+
+    /// stream-level pre-credit MUST.
+    /// </remarks>
+    internal static void SetOnMessageStart(ShmRing ring, Action<uint, uint>? cb)
+    {
+        GetState(ring).OnMessageStart = cb;
+    }
+
+    /// <summary>
+    /// Wires a per-DATA-frame inbound accounting hook on the per-ring
+    /// decoder state. The callback is invoked synchronously by the
+    /// frame reader thread once per inbound H2 DATA frame, receiving
+    /// <c>(streamId, payloadLen)</c> where <c>payloadLen</c> is the
+    /// full on-wire payload size (including Pad Length byte and
+    /// padding) per RFC 7540 §6.9.1. Same wiring lifetime contract as
+    /// <see cref="SetOnMessageStart"/>.
+    /// </summary>
+    internal static void SetOnDataFrame(ShmRing ring, Action<uint, uint>? cb)
+    {
+        GetState(ring).OnDataFrame = cb;
     }
 
     // ===== LPM accumulator dict access helpers (single-threaded reader) =====
@@ -312,10 +378,18 @@ internal static partial class Http2Codec
         ShmRing ring, ulong baseCommitReadIdx, uint streamId, byte h2Flags, int payloadLen,
         bool zeroCopy, Http2DecoderState state, CancellationToken ct)
     {
-        // SHM is no-WU in all modes (gRFC SHM alignment with grpc-go-shmem
-        // shmNoWU). DATA frame consumption does not trigger WINDOW_UPDATE
-        // emission; the ring's WaitForSpace backpressure is the sole flow
-        // control.
+        // Per RFC 7540 §6.9.1, the entire DATA frame payload (including
+        // Pad Length byte and padding) is included in flow control. Fire
+        // the per-DATA-frame hook here so the connection can drive
+        // conn-level drip-on-receive via TrInFlow.OnData and stream-level
+        // over-window enforcement via InFlow.OnData. The hook is invoked
+        // even for zero-length payloads to keep the bookkeeping
+        // semantically consistent with stock HTTP/2.
+        if (payloadLen > 0)
+        {
+            state.OnDataFrame?.Invoke(streamId, (uint)payloadLen);
+        }
+
         var endStream = (h2Flags & Http2Flags.EndStream) != 0;
         var padded = (h2Flags & Http2Flags.Padded) != 0;
 
@@ -459,7 +533,7 @@ internal static partial class Http2Codec
             {
                 while (remaining.Length > 0)
                 {
-                    var (completed, consumed) = FeedAccumulator(acc, remaining);
+                    var (completed, consumed) = FeedAccumulator(acc, remaining, streamId, state.OnMessageStart);
                     if (consumed == 0)
                     {
                         // Defensive: FeedAccumulator made no progress on a
@@ -648,7 +722,7 @@ internal static partial class Http2Codec
     /// surface multiple completed messages (head returned to the upper
     /// layer; rest stashed in <see cref="Http2DecoderState.PendingFrames"/>).
     /// </remarks>
-    private static (FramePayload? Completed, int Consumed) FeedAccumulator(LpmAccumulator acc, ReadOnlySpan<byte> body)
+    private static (FramePayload? Completed, int Consumed) FeedAccumulator(LpmAccumulator acc, ReadOnlySpan<byte> body, uint streamId = 0, Action<uint, uint>? onMessageStart = null)
     {
         var src = body;
         var consumed = 0;
@@ -688,6 +762,25 @@ internal static partial class Http2Codec
             // Stamp header at start of buffer.
             acc.HeaderBuf.AsSpan(0, 5).CopyTo(acc.Buffer);
             acc.Pos = 5;
+
+            // Fire the parse-time pre-credit hook. The 5-byte LPM header
+            // just transitioned ExpectedTotal: 0 → N, so the receiver
+            // can decide BEFORE any body bytes flow whether the announced
+            // message needs a stream-level WINDOW_UPDATE pre-credit to
+            // admit the rest of the LPM. This is the gRFC SHM v3.4+ MUST
+            // (see shm-rfc/A-shared-memory-transport.md §"Stream-level
+            // pre-credit at LPM parse"). lpmSize includes the 5-byte
+            // header so the caller's MaybeAdjustAdditive cap math is
+            // self-consistent with the on-the-wire bytes actually
+            // counted by inFlow.OnData per DATA frame.
+            //
+            // streamId == 0 means the legacy caller pre-LPM-hook signature;
+            // skip the hook in that case. All real callsites pass the
+            // streamId from the H2 DATA frame header.
+            if (streamId != 0 && onMessageStart != null && acc.ExpectedTotal > 0)
+            {
+                onMessageStart(streamId, (uint)acc.ExpectedTotal);
+            }
         }
 
         // Phase 2: copy body bytes into accumulator buffer. Stop at this

@@ -94,6 +94,30 @@ public sealed class ShmRing : IDisposable
     private volatile bool _localClosed;
     private ulong _pendingReadIdx;
 
+    // Process-local count of threads currently inside the
+    // "post-sync.Wait" danger zone of WaitForDataAfter / WaitForSpace
+    // (where touching the shared header would AV if the Segment has
+    // been unmapped by a racing Dispose). Close() spin-waits on this
+    // dropping to 0 before returning, so ShmRing.Dispose -> _sync.Dispose
+    // -> Segment.Dispose can't unmap memory while a waiter is mid-flight.
+    // Always incremented at the start of the try block that wraps the
+    // sync.Wait call, and always decremented in the matching finally
+    // (independent of the cross-process header.{Data,Space}Waiters
+    // counters which are gated on _localClosed for grpc-go-shmem
+    // interop reasons).
+    private int _localWaitInflight;
+
+    // Process-wide diagnostic counter: how many times any ShmRing has
+    // actually invoked the OS-level SignalData wake (excludes Close()
+    // teardown signals). Used by client-coalesce tests (next PR) to
+    // verify "this Unary RT collapsed N wire frames into ≤1 SignalData".
+    // Increment paths: Write(), CommitWrite(), EndBatchWrite() — the
+    // three steady-state SignalData emission sites. Read via
+    // <see cref="GetSignalDataCountForTest"/>.
+    private static long s_signalDataCount;
+
+    internal static long GetSignalDataCountForTest() => Volatile.Read(ref s_signalDataCount);
+
     // Adaptive spin state
     private int _dataSpinCutoff = ShmConstants.SpinIterationsDefault;
     private int _spaceSpinCutoff = ShmConstants.SpinIterationsDefault;
@@ -749,6 +773,7 @@ public sealed class ShmRing : IDisposable
                     Interlocked.Increment(ref header.DataSeq);
                     if (_batchWriteDepth == 0 && Volatile.Read(ref header.DataWaiters) > 0)
                     {
+                        Interlocked.Increment(ref s_signalDataCount);
                         _sync?.SignalData();
                     }
                 }
@@ -944,6 +969,7 @@ public sealed class ShmRing : IDisposable
             Interlocked.Increment(ref header.DataSeq);
             if (_batchWriteDepth == 0 && Volatile.Read(ref header.DataWaiters) > 0)
             {
+                Interlocked.Increment(ref s_signalDataCount);
                 _sync?.SignalData();
             }
         }
@@ -968,6 +994,7 @@ public sealed class ShmRing : IDisposable
             ref var header = ref GetHeader();
             if (Volatile.Read(ref header.DataWaiters) > 0)
             {
+                Interlocked.Increment(ref s_signalDataCount);
                 _sync?.SignalData();
             }
         }
@@ -1300,6 +1327,29 @@ public sealed class ShmRing : IDisposable
         _sync?.SignalData();
         _sync?.SignalSpace();
         _sync?.SignalContig();
+
+        // Dispose-race barrier: spin-wait for any thread currently in
+        // the post-sync.Wait region of WaitForDataAfter / WaitForSpace
+        // to unwind through its finally block before returning. Without
+        // this barrier the caller (typically ShmRing.Dispose ->
+        // Segment.Dispose) would unmap the shared header while the woken
+        // waiter was still doing its layer-3 Volatile.Read(WriteIdx)
+        // post-wake check, manifesting as a process-fatal
+        // AccessViolationException. The bounded timeout (~500 ms) is a
+        // safety net for permanently stuck waiters; in normal teardown
+        // every signal wakes a single waiter that exits in microseconds.
+        var deadline = Environment.TickCount64 + 500;
+        while (Volatile.Read(ref _localWaitInflight) > 0)
+        {
+            if (Environment.TickCount64 > deadline)
+            {
+                // Give up rather than hang the test process. A stuck
+                // waiter past this point will probably AV on its next
+                // header read; that's a separate bug we'd want surfaced.
+                break;
+            }
+            Thread.SpinWait(64);
+        }
     }
 
     public void Dispose()
@@ -1322,6 +1372,19 @@ public sealed class ShmRing : IDisposable
 
     private void WaitForSpace(ref RingHeader header, ulong needed, CancellationToken cancellationToken)
     {
+        // Dispose-race barrier: outer Increment/Decrement covers the
+        // ENTIRE method body, including the pre-block adaptive spin
+        // loop. Without this, a thread that reads header.WriteIdx in
+        // the spin loop could AV if Close() set _localClosed (returns
+        // immediately because counter==0), Ring.Dispose disposed sync,
+        // and Segment.Dispose unmapped memory all between two spin
+        // iterations. With the outer wrap, Close()'s spin-wait blocks
+        // until our finally decrements below, so memory stays mapped
+        // for the entirety of any in-flight WaitForSpace call.
+        // (GPT-5.5 round-3 HIGH finding.)
+        Interlocked.Increment(ref _localWaitInflight);
+        try
+        {
         // Adaptive spin before blocking (skipped when the sync primitive
         // self-identifies as low-latency, e.g. eventfd whose blocking
         // read is ~5-10 us and beats spinning).
@@ -1415,6 +1478,16 @@ public sealed class ShmRing : IDisposable
 
             _sync?.WaitForSpace(seq, timeout: null, cancellationToken);
 
+            // Dispose-race guard: if Close() set _localClosed while we
+            // were blocked in the syscall, the shared header may be
+            // about to be unmapped by Segment.Dispose(). Throw without
+            // touching it; Close()'s wait on _localWaitInflight ensures
+            // it does not return until our finally decrements below.
+            if (_localClosed)
+            {
+                throw new RingClosedException();
+            }
+
             // Layer-3 cascade for shared-fd wake primitives (eventfd):
             // if our condition is STILL unmet after the wake the kernel
             // probably handed the wake to a wrong parker on the shared
@@ -1436,6 +1509,11 @@ public sealed class ShmRing : IDisposable
             {
                 Interlocked.Decrement(ref header.SpaceWaiters);
             }
+        }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _localWaitInflight);
         }
     }
 
@@ -1473,6 +1551,12 @@ public sealed class ShmRing : IDisposable
     /// </remarks>
     private void WaitForDataAfter(ref RingHeader header, ulong watermark, CancellationToken cancellationToken)
     {
+        // Dispose-race barrier: see WaitForSpace for the rationale
+        // (outer wrap covers the pre-block spin path as well as the
+        // post-sync.Wait region). (GPT-5.5 round-3 HIGH finding.)
+        Interlocked.Increment(ref _localWaitInflight);
+        try
+        {
         if (!_skipSpinWait)
         {
             var spinLimit = Volatile.Read(ref _dataSpinCutoff);
@@ -1536,6 +1620,16 @@ public sealed class ShmRing : IDisposable
 
             _sync?.WaitForData(seq, timeout: null, cancellationToken);
 
+            // Dispose-race guard: if Close() set _localClosed while we
+            // were blocked in the syscall, the shared header may be
+            // about to be unmapped by Segment.Dispose(). Throw without
+            // touching it; Close()'s wait on _localWaitInflight ensures
+            // it does not return until our finally decrements below.
+            if (_localClosed)
+            {
+                throw new RingClosedException();
+            }
+
             // Layer-3 cascade (see WaitForSpace for details).
             var writeIdxPost = Volatile.Read(ref header.WriteIdx);
             if (writeIdxPost <= watermark)
@@ -1549,6 +1643,11 @@ public sealed class ShmRing : IDisposable
             {
                 Interlocked.Decrement(ref header.DataWaiters);
             }
+        }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _localWaitInflight);
         }
     }
 
