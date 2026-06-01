@@ -31,8 +31,14 @@ internal sealed class ShmServerCallContext : ServerCallContext, IDisposable
     private readonly HeadersV1 _requestHeaders;
     private readonly CancellationTokenSource _callCts;
     private readonly Timer? _deadlineTimer;
-    private readonly Metadata _requestMetadata;
-    private readonly Metadata _responseTrailers;
+    // Round-9 PR-H: lazy-allocate request metadata + response trailers.
+    // The dominant unary/server-streaming case (no per-call metadata,
+    // no response trailers from the handler) never reads these, so
+    // pre-allocating per RPC was a pure per-call object/list waste.
+    // Lazy via Interlocked.CompareExchange so handlers that touch the
+    // properties from arbitrary threads still get a stable instance.
+    private Metadata? _requestMetadata;
+    private Metadata? _responseTrailers;
     private Status _status;
     private WriteOptions? _writeOptions;
     private bool _headersSent;
@@ -44,8 +50,8 @@ internal sealed class ShmServerCallContext : ServerCallContext, IDisposable
         _stream = stream;
         _requestHeaders = requestHeaders;
         _callCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, stream.CancellationToken);
-        _requestMetadata = ConvertFromShmMetadata(requestHeaders.Metadata);
-        _responseTrailers = new Metadata();
+        // _requestMetadata + _responseTrailers stay null until first read
+        // (RequestHeadersCore / ResponseTrailersCore getters lazily build).
         _status = Status.DefaultSuccess;
 
         if (requestHeaders.DeadlineUnixNano != 0)
@@ -102,9 +108,36 @@ internal sealed class ShmServerCallContext : ServerCallContext, IDisposable
         }
     }
 
-    protected override Metadata RequestHeadersCore => _requestMetadata;
+    protected override Metadata RequestHeadersCore
+    {
+        get
+        {
+            var existing = _requestMetadata;
+            if (existing != null) return existing;
+            var fresh = ConvertFromShmMetadata(_requestHeaders.Metadata);
+            return Interlocked.CompareExchange(ref _requestMetadata, fresh, null) ?? fresh;
+        }
+    }
     protected override CancellationToken CancellationTokenCore => _callCts.Token;
-    protected override Metadata ResponseTrailersCore => _responseTrailers;
+    protected override Metadata ResponseTrailersCore
+    {
+        get
+        {
+            var existing = _responseTrailers;
+            if (existing != null) return existing;
+            var fresh = new Metadata();
+            return Interlocked.CompareExchange(ref _responseTrailers, fresh, null) ?? fresh;
+        }
+    }
+
+    /// <summary>
+    /// Round-9 PR-H: peek the response-trailers field WITHOUT triggering
+    /// lazy allocation. Returns null if the handler never touched
+    /// <see cref="ServerCallContext.ResponseTrailers"/>. Used by
+    /// <see cref="ShmGrpcServer"/>'s trailers-send paths so the common
+    /// no-trailers case avoids the per-RPC Metadata allocation entirely.
+    /// </summary>
+    internal Metadata? ResponseTrailersOrNull => _responseTrailers;
     protected override Status StatusCore { get => _status; set => _status = value; }
     protected override WriteOptions? WriteOptionsCore { get => _writeOptions; set => _writeOptions = value; }
 

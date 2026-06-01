@@ -82,6 +82,14 @@ public readonly struct ReadReservation
 /// </summary>
 public sealed class ShmRing : IDisposable
 {
+    // Bench-only kill switch — set SHM_DISABLE_CHAIN_ZC=1 to force
+    // IsChainZcStartEligible to return false (every multi-frame LPM
+    // takes the existing accumulator copy path). Lets us A/B the
+    // chain-ZC receive optimisation without rebuilding.
+    private static readonly bool s_disableChainZc =
+        string.Equals(Environment.GetEnvironmentVariable("SHM_DISABLE_CHAIN_ZC"),
+            "1", StringComparison.Ordinal);
+
     private readonly Memory<byte> _memory;
     private readonly ulong _capacity;
     private readonly ulong _capMask;
@@ -640,8 +648,154 @@ public sealed class ShmRing : IDisposable
         // At-most-one-ZC.
         if (Volatile.Read(ref SpeculativeReservedBytes) != 0) return false;
 
+        // Chain-ZC interaction defense (2026-06-01 PR): even when
+        // SpeculativeReservedBytes == 0, a chain anchor may still be
+        // open (all currently-surfaced ZC chunks released but the chain
+        // hasn't emitted its final chunk yet, so _chainOpen=true and
+        // _zcActive=true). Starting a single-frame ZC in that window
+        // would call BeginSingleFrameZcCommit and overwrite the still-
+        // active _deferredReadIdxTarget; the chain's subsequent commits
+        // would land on a stale anchor. Refuse the single-frame ZC
+        // path until the chain fully closes.
+        if (Volatile.Read(ref _zcActive)) return false;
+        if (Volatile.Read(ref _chainOpen)) return false;
+
         // Back-pressure auto-degrade — see remarks.
         if (UsedBytesApprox() * 4 > _capacity * 3) return false;
+
+        return true;
+    }
+
+    /// <summary>
+    /// Eligibility check for STARTING a multi-frame chain-ZC reservation
+    /// from the H2 reader's first DATA frame of a new LPM. Distinct from
+    /// <see cref="IsSpeculativeZcEligible"/> because chain-ZC's lifetime
+    /// is bounded by the entire LPM (not a single frame), so the budget
+    /// constraint is per-LPM (<see cref="ChainZcBudget"/>) rather than
+    /// per-frame, and we need to inspect both the first frame's body
+    /// length and the LPM's compression flag.
+    /// </summary>
+    /// <param name="lpmTotal">Total LPM bytes (5-byte header + body length).</param>
+    /// <param name="firstFrameBodyLength">H2 DATA payload length of the first chain frame.</param>
+    /// <param name="compFlag">First byte of the LPM (gRPC compression flag).</param>
+    /// <returns><c>true</c> if chain-ZC may begin.</returns>
+    /// <remarks>
+    /// <para>
+    /// <b>Compression gate:</b> chain-ZC requires <c>compFlag == 0</c> because
+    /// the downstream LazyChainRos consumer in
+    /// <c>ShmControlResponseContent.ReadNextMessage</c> (and
+    /// server-side <c>ShmGrpcServer</c>) builds a multi-segment
+    /// ReadOnlySequence over the frame stream; a compressed LPM needs a
+    /// contiguous decompressor input buffer and cannot consume a
+    /// segmented ROS. Compressed messages fall through to the existing
+    /// accumulator copy path.
+    /// </para>
+    /// <para>
+    /// <b>Minimum sizes:</b> chain-ZC pays for itself only when (a) the
+    /// LPM is large enough that the avoided receive-side memcpy
+    /// dominates the per-frame surfacing overhead, and (b) the per-frame
+    /// chunk is large enough that the consumer's per-frame channel
+    /// dispatch + LazyChainRos trampoline cost is amortized. Two
+    /// thresholds:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><c>lpmTotal >= ChainZcMinLpmBytes</c> (default 1 MiB) — below
+    /// this, single-frame ZC has already handled the case in max profile
+    /// and the accumulator copy is fast enough in fair profile.</item>
+    /// <item><c>firstFrameBodyLength >= ChainZcMinChunkBytes</c> (default
+    /// 256 KiB) — below this, fair-mode messages (16 KiB chunk cap) would
+    /// suffer 5+ µs/frame channel dispatch × N chunks instead of one
+    /// bounded memcpy. Keeps chain-ZC out of fair-mode large messages
+    /// where chunk count is high.</item>
+    /// </list>
+    /// <para>
+    /// <b>Budget gate:</b> <c>lpmTotal &lt;= ChainZcBudget</c>. The budget
+    /// is <c>cap - 1 KiB</c> in <see cref="SingleStreamMode"/> and
+    /// <c>cap / 2</c> in multi-stream mode (see
+    /// <see cref="ChainZcBudget"/>). The multi-stream half-cap protects
+    /// concurrent-unary cases where a peer stream would otherwise starve
+    /// while one chain holds nearly the whole ring.
+    /// </para>
+    /// <para>
+    /// <b>At-most-one-ZC + back-pressure:</b> mirrors
+    /// <see cref="IsSpeculativeZcEligible"/>'s gates so the existing
+    /// at-most-one-ZC FIFO invariant on <see cref="SpeculativeReservedBytes"/>
+    /// extends transparently to chain-ZC.
+    /// </para>
+    /// </remarks>
+    internal bool IsChainZcStartEligible(long lpmTotal, int firstFrameBodyLength, byte compFlag)
+    {
+        // Bench-only kill switch — set SHM_DISABLE_CHAIN_ZC=1 to force
+        // the H2 codec's chain-ZC start path to be ineligible (every
+        // multi-frame LPM falls through to the existing accumulator
+        // copy path). Used to A/B chain-ZC vs accumulator without
+        // rebuilding.
+        if (s_disableChainZc) return false;
+
+        // SingleStreamMode invariant (2026-06-01 PR): today the only
+        // callers that set ZeroCopyRead=true also negotiate SingleStreamMode
+        // (see ShmControlHandler.cs#L498 / ShmGrpcServer.cs#L200). The
+        // entire chain-ZC design relies on this: with concurrent streams
+        // the ChainZc-frozen header.ReadIdx would starve every peer stream
+        // for the chain's duration (potentially tens of ms on a 32 MiB
+        // LPM). Document the invariant here so a future change that
+        // unlocks ZeroCopyRead in multi-stream mode cannot silently
+        // engage chain-ZC.
+        if (!SingleStreamMode) return false;
+
+        // Compression: chain ZC cannot feed segmented buffers to a decompressor.
+        if (compFlag != 0) return false;
+
+        // Disable on small rings.
+        const ulong MinRingForZeroCopy = 1024UL * 1024UL;
+        if (_capacity < MinRingForZeroCopy) return false;
+
+        // Minimum LPM and minimum first-chunk size — see remarks.
+        const long ChainZcMinLpmBytes = 1L * 1024 * 1024;
+        const int ChainZcMinChunkBytes = 256 * 1024;
+        if (lpmTotal < ChainZcMinLpmBytes) return false;
+        if (firstFrameBodyLength < ChainZcMinChunkBytes) return false;
+
+        // Per-LPM budget: cap-1KB (single-stream) or cap/2 (multi-stream)
+        // — see ChainZcBudget remarks. ChainZcBudget on the default 64 MiB
+        // ring is well below MaxLpmBodyLength (1 GiB), so the budget gate
+        // implicitly enforces the absolute receive cap too.
+        if (lpmTotal > ChainZcBudget) return false;
+
+        // At-most-one-ZC: chain shares the SpeculativeReservedBytes FIFO
+        // with single-frame ZC. A non-zero value means another ZC anchor
+        // (single-frame or chain) is in flight; fall through to copy.
+        if (Volatile.Read(ref SpeculativeReservedBytes) != 0) return false;
+
+        // Additional defense (per Opus 4.8 review 2026-06-01): even when
+        // SpeculativeReservedBytes == 0, the chain anchor may still be open
+        // (all ZC chunks released but final CloseZcChain not yet called, or
+        // a prior abnormal teardown left _chainOpen=true). Starting a new
+        // chain in that window would call BeginZcReservation and overwrite
+        // the still-active deferred target. Refuse to start if either flag
+        // is set; the next eligible request observes the cleared state.
+        if (Volatile.Read(ref _zcActive)) return false;
+        if (Volatile.Read(ref _chainOpen)) return false;
+
+        // Back-pressure auto-degrade — same gate as single-frame ZC.
+        if (UsedBytesApprox() * 4 > _capacity * 3) return false;
+
+        // Anti-deadlock: ensure the REMAINING chain body can actually fit
+        // in the ring's currently-free space (2026-06-01 PR final review).
+        // Once the chain opens, _zcActive=true freezes header.ReadIdx for
+        // the entire LPM duration. The cross-process peer must keep
+        // writing the remaining chunks; if they don't fit in current free
+        // space, the peer blocks in WaitForSpace, the reader is parked
+        // waiting for the next DATA frame, and ReadIdx cannot advance
+        // until the chain closes — a hard hang. The back-pressure gate
+        // above guarantees free ≥ cap/4 but a remaining chain larger
+        // than that would still wedge. Reserve a small slack (64 KiB)
+        // for control frames the peer may interleave (Ping, WindowUpdate,
+        // etc.) so they can still flow through.
+        const ulong InterleaveSlack = 64UL * 1024UL;
+        var remainingBody = (ulong)(lpmTotal - firstFrameBodyLength);
+        var free = _capacity - UsedBytesApprox();
+        if (free < remainingBody + InterleaveSlack) return false;
 
         return true;
     }

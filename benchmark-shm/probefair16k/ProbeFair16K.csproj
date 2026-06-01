@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Grpc.Net.SharedMemory.ProbeFair16K</RootNamespace>
+    <AssemblyName>ProbeFair16K</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <RunAnalyzers>false</RunAnalyzers>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Source-link to local patched Grpc.Net.Client (via the SHM project)
+         so IDirectMessageReader and other internal SHM-aware interfaces
+         resolve correctly at runtime. The PackageReference fallback to the
+         public NuGet 2.70.0 doesn't have these. -->
+    <ProjectReference Include="..\..\src\Grpc.Net.SharedMemory\Grpc.Net.SharedMemory.csproj" />
+  </ItemGroup>
+</Project>

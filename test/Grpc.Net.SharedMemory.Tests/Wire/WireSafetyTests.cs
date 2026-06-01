@@ -84,12 +84,14 @@ public class WireSafetyTests
     [Test]
     public void DecodeConnectRequest_ValidH2Advertisement_Roundtrips()
     {
+        var nonce = ControlWire.NewConnectNonce();
         var encoded = ControlWire.EncodeConnectRequest(
-            ringA: 4096, ringB: 4096, singleStreamMode: true);
-        var (a, b, ss) = ControlWire.DecodeConnectRequest(encoded);
+            ringA: 4096, ringB: 4096, singleStreamMode: true, nonce: nonce);
+        var (a, b, ss, n) = ControlWire.DecodeConnectRequest(encoded);
         Assert.That(a, Is.EqualTo(4096UL));
         Assert.That(b, Is.EqualTo(4096UL));
         Assert.That(ss, Is.True);
+        Assert.That(n, Is.EqualTo(nonce));
     }
 
     // ---- ControlWire ACCEPT response validation ----
@@ -127,9 +129,44 @@ public class WireSafetyTests
     [Test]
     public void DecodeConnectResponse_Http2_Roundtrips()
     {
-        var encoded = ControlWire.EncodeConnectResponse("seg");
-        var name = ControlWire.DecodeConnectResponse(encoded);
+        var nonce = ControlWire.NewConnectNonce();
+        var encoded = ControlWire.EncodeConnectResponse("seg", nonce);
+        var (name, n) = ControlWire.DecodeConnectResponse(encoded);
         Assert.That(name, Is.EqualTo("seg"));
+        Assert.That(n, Is.EqualTo(nonce));
+    }
+
+    [Test]
+    public void DecodeConnectReject_Http2_Roundtrips()
+    {
+        var nonce = ControlWire.NewConnectNonce();
+        var encoded = ControlWire.EncodeConnectReject("go away", nonce);
+        var (msg, n) = ControlWire.DecodeConnectReject(encoded);
+        Assert.That(msg, Is.EqualTo("go away"));
+        Assert.That(n, Is.EqualTo(nonce));
+    }
+
+    [Test]
+    public void NewConnectNonce_ProducesNonZeroAndUnique()
+    {
+        // CSPRNG: not strictly guaranteed non-zero, but probability
+        // of zero is 2^-64; if this ever fails we genuinely want to
+        // know (could indicate a broken RNG fallback). Likewise the
+        // duplicate check is statistical, not strict.
+        var a = ControlWire.NewConnectNonce();
+        var b = ControlWire.NewConnectNonce();
+        Assert.That(a, Is.Not.EqualTo(0UL));
+        Assert.That(b, Is.Not.EqualTo(0UL));
+        Assert.That(a, Is.Not.EqualTo(b));
+    }
+
+    [Test]
+    public void EncodeConnectRequest_Is28Bytes()
+    {
+        // Lock the wire-format size so any change here surfaces in CI
+        // as a deliberate ABI change (must be lock-step with grpc-go-shmem).
+        var bytes = ControlWire.EncodeConnectRequest(0, 0, false, 0);
+        Assert.That(bytes.Length, Is.EqualTo(28));
     }
 
     // ---- LPM body length DoS guard ----

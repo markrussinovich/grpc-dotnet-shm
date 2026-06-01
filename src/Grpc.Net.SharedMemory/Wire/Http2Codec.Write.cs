@@ -332,4 +332,49 @@ internal static partial class Http2Codec
         p2.CopyTo(combined[p1.Length..]);
         return TrailersV1.Decode(combined);
     }
+
+    /// <summary>
+    /// Round-7 PR-B object-passthrough write: emits a HEADERS frame directly
+    /// from a <see cref="HeadersV1"/> object, skipping the
+    /// <c>HeadersV1.Encode → bytes → DecodeHeadersV1</c> round-trip the
+    /// byte path requires. Saves ~4.36 µs + 312 B per Unary RPC (measured by
+    /// HeaderPathProfileTests). Used by ShmFrameWriter's inline-write fast
+    /// paths (client SendRequestHeaders, server SendResponseHeadersInline,
+    /// staged-headers flush).
+    /// </summary>
+    internal static void WriteH2HeadersFromObject(
+        ShmRing ring, uint streamId, HeadersV1 headers, CancellationToken ct)
+    {
+        var (hpackBuf, hpackLen) = HpackHeadersAdapter.EncodeHeaders(headers);
+        try
+        {
+            WriteH2FrameRaw(ring, Http2FrameType.Headers, Http2Flags.EndHeaders,
+                streamId, hpackBuf.AsSpan(0, hpackLen), ReadOnlySpan<byte>.Empty, ct);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(hpackBuf);
+        }
+    }
+
+    /// <summary>
+    /// Round-7 PR-B object-passthrough write: emits a TRAILERS frame directly
+    /// from a <see cref="TrailersV1"/> object. Companion to
+    /// <see cref="WriteH2HeadersFromObject"/>.
+    /// </summary>
+    internal static void WriteH2TrailersFromObject(
+        ShmRing ring, uint streamId, TrailersV1 trailers, CancellationToken ct)
+    {
+        var (hpackBuf, hpackLen) = HpackHeadersAdapter.EncodeTrailers(trailers);
+        try
+        {
+            byte flags = (byte)(Http2Flags.EndHeaders | Http2Flags.EndStream);
+            WriteH2FrameRaw(ring, Http2FrameType.Headers, flags,
+                streamId, hpackBuf.AsSpan(0, hpackLen), ReadOnlySpan<byte>.Empty, ct);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(hpackBuf);
+        }
+    }
 }

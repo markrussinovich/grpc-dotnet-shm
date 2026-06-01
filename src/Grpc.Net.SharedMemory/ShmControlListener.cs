@@ -156,16 +156,23 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
                 continue;
             }
 
-            // Decode and validate CONNECT request
-            (ulong clientRingA, ulong clientRingB, bool clientSingleStream) connectParams;
+            // Decode and validate CONNECT request. Capture the
+            // per-CONNECT correlation nonce so we can echo it in the
+            // matching ACCEPT/REJECT (closes the stale-response
+            // misbinding race — dialer correlates response to its own
+            // in-flight CONNECT by nonce). On decode failure we echo 0
+            // per the gRFC: a 0 nonce signals "server could not decode
+            // your CONNECT" so matched-version dialers treat it as
+            // stale and skip it.
+            (ulong clientRingA, ulong clientRingB, bool clientSingleStream, ulong clientNonce) connectParams;
             try
             {
                 connectParams = ControlWire.DecodeConnectRequest(payload.Span);
             }
             catch (Exception ex)
             {
-                // Send REJECT
-                await SendRejectAsync(ex.Message, ct).ConfigureAwait(false);
+                // Send REJECT with nonce = 0 (we couldn't decode it).
+                await SendRejectAsync(ex.Message, nonce: 0, ct).ConfigureAwait(false);
                 continue;
             }
 
@@ -197,15 +204,17 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
             {
                 dataSegment?.Dispose();
                 Segment.TryRemoveSegment(segmentName);
-                await SendRejectAsync($"Failed to create segment: {ex.Message}", ct).ConfigureAwait(false);
+                await SendRejectAsync($"Failed to create segment: {ex.Message}", connectParams.clientNonce, ct).ConfigureAwait(false);
                 continue;
             }
 
             // Send ACCEPT with the data segment name.
             // Wire format is always HTTP/2 — the protocol layer in
             // <see cref="ControlWire.DecodeConnectRequest"/> already
-            // rejected any peer that did not advertise H2.
-            await SendAcceptAsync(segmentName, ct).ConfigureAwait(false);
+            // rejected any peer that did not advertise H2. Echo the
+            // CONNECT nonce so the dialer can correlate this response
+            // to its in-flight request.
+            await SendAcceptAsync(segmentName, connectParams.clientNonce, ct).ConfigureAwait(false);
 
             // Wait for client to map the segment
             try
@@ -482,15 +491,15 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         return Task.FromResult((header.Type, payload));
     }
 
-    private Task SendAcceptAsync(string segmentName, CancellationToken ct)
+    private Task SendAcceptAsync(string segmentName, ulong nonce, CancellationToken ct)
     {
-        var payload = ControlWire.EncodeConnectResponse(segmentName);
+        var payload = ControlWire.EncodeConnectResponse(segmentName, nonce);
         return WriteControlFrameAsync(FrameType.Accept, payload, ct);
     }
 
-    private Task SendRejectAsync(string message, CancellationToken ct)
+    private Task SendRejectAsync(string message, ulong nonce, CancellationToken ct)
     {
-        var payload = ControlWire.EncodeConnectReject(message);
+        var payload = ControlWire.EncodeConnectReject(message, nonce);
         return WriteControlFrameAsync(FrameType.Reject, payload, ct);
     }
 

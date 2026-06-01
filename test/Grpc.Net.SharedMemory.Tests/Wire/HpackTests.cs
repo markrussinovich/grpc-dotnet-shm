@@ -462,4 +462,103 @@ public class HpackHeadersAdapterTests
             ArrayPool<byte>.Shared.Return(buf);
         }
     }
+
+    // ------------------------------------------------------------------
+    // Round-7 PR-A: HPACK constant caching + ToHeaderName fast-path tests
+    // ------------------------------------------------------------------
+
+    [Test]
+    public void EncodeHeaders_ClientInitial_RepeatedEncodesProduceIdenticalBytes()
+    {
+        // Round-7 perf: pseudo-header values ("POST", "http",
+        // "application/grpc", "trailers", "200") and grpc-status[0..16]
+        // are now emitted from cached `static readonly byte[]` arrays
+        // instead of allocating fresh byte[] per call. Verify two
+        // encodes of the same HeadersV1 produce bit-identical wire
+        // bytes \u2014 catches a regression where a cached array got
+        // mutated by a caller or replaced with the wrong constant.
+        var v1 = new HeadersV1
+        {
+            HeaderType = 0,
+            Method = "/svc/SayHello",
+            Authority = "h",
+            Metadata = new[] { new MetadataKV("k", "v") },
+        };
+        var (b1, l1) = HpackHeadersAdapter.EncodeHeaders(v1);
+        var (b2, l2) = HpackHeadersAdapter.EncodeHeaders(v1);
+        try
+        {
+            Assert.That(l1, Is.EqualTo(l2));
+            Assert.That(b1.AsSpan(0, l1).SequenceEqual(b2.AsSpan(0, l2)), Is.True,
+                "Cached pseudo-header bytes must produce identical encodes across calls");
+            var rt = HpackHeadersAdapter.DecodeHeaders(b1.AsSpan(0, l1));
+            Assert.That(rt.Method, Is.EqualTo("/svc/SayHello"));
+            Assert.That(rt.Authority, Is.EqualTo("h"));
+            Assert.That(rt.Metadata.Count, Is.EqualTo(1));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(b1);
+            ArrayPool<byte>.Shared.Return(b2);
+        }
+    }
+
+    [Test]
+    public void EncodeTrailers_EveryStatusCode_CachedTableRoundTrips()
+    {
+        // Round-7 perf: grpc-status integer 0..16 ASCII bytes are
+        // pre-computed in a static table. Verify EVERY enum value
+        // round-trips correctly via the cached path.
+        foreach (global::Grpc.Core.StatusCode code in Enum.GetValues(typeof(global::Grpc.Core.StatusCode)))
+        {
+            var v1 = new TrailersV1 { GrpcStatusCode = code };
+            var (buf, len) = HpackHeadersAdapter.EncodeTrailers(v1);
+            try
+            {
+                var rt = HpackHeadersAdapter.DecodeTrailers(buf.AsSpan(0, len));
+                Assert.That(rt.GrpcStatusCode, Is.EqualTo(code),
+                    $"Cached grpc-status table mis-encodes StatusCode.{code}");
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+            }
+        }
+    }
+
+    [Test]
+    public void EncodeHeaders_LowercaseMetadataKey_PreservedOnWire()
+    {
+        // Round-7 perf: ToHeaderName skips ToLowerInvariant when the key
+        // is already lowercase (the common case \u2014 Grpc.Core's Metadata.Entry
+        // validates lowercase). Verify the fast-path emits the same bytes
+        // on the wire as a key that needed lowercasing.
+        var lowerOnly = new HeadersV1
+        {
+            HeaderType = 0, Method = "/m", Authority = "a",
+            Metadata = new[] { new MetadataKV("custom-key", "value") },
+        };
+        var mixedCase = new HeadersV1
+        {
+            HeaderType = 0, Method = "/m", Authority = "a",
+            Metadata = new[] { new MetadataKV("Custom-Key", "value") },
+        };
+        var (b1, l1) = HpackHeadersAdapter.EncodeHeaders(lowerOnly);
+        var (b2, l2) = HpackHeadersAdapter.EncodeHeaders(mixedCase);
+        try
+        {
+            // Both must decode to the same lowercase header on the wire.
+            var r1 = HpackHeadersAdapter.DecodeHeaders(b1.AsSpan(0, l1));
+            var r2 = HpackHeadersAdapter.DecodeHeaders(b2.AsSpan(0, l2));
+            Assert.That(r1.Metadata.Any(k => k.Key == "custom-key"), Is.True,
+                "Already-lowercase key must survive the no-alloc fast-path");
+            Assert.That(r2.Metadata.Any(k => k.Key == "custom-key"), Is.True,
+                "Mixed-case key must be lowercased to match HTTP/2 wire convention");
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(b1);
+            ArrayPool<byte>.Shared.Return(b2);
+        }
+    }
 }

@@ -50,6 +50,36 @@ public readonly struct InboundFrame
     /// <summary>True if this frame's payload is a ring-backed ZC view.</summary>
     public bool IsSpeculativeZeroCopy => _payload.IsSpeculativeZeroCopy;
 
+    /// <summary>
+    /// Round-7 PR-B object passthrough: when set, contains the already-
+    /// decoded <see cref="HeadersV1"/> or <see cref="TrailersV1"/> for a
+    /// HEADERS / TRAILERS frame. Consumers MUST prefer this over decoding
+    /// <see cref="Memory"/> bytes whenever it is non-null for HEADERS or
+    /// TRAILERS frame types, to avoid the redundant
+    /// <c>HeadersV1.Encode</c> &#x2192; bytes &#x2192; <c>HeadersV1.Decode</c>
+    /// round-trip. <see langword="null"/> for all other frame types and for
+    /// HEADERS frames that took the byte-fallback path.
+    /// </summary>
+    public object? DecodedHeader => _payload.DecodedHeader;
+
+    /// <summary>
+    /// Round-7 PR-B: returns the <see cref="HeadersV1"/> for a HEADERS
+    /// frame, preferring the pre-decoded object attached by the codec
+    /// (zero-cost fast-path); falls back to decoding <see cref="Memory"/>
+    /// bytes if no object is attached (byte fallback path).
+    /// </summary>
+    public HeadersV1 AsHeaders()
+        => DecodedHeader as HeadersV1 ?? HeadersV1.Decode(Memory.Span);
+
+    /// <summary>
+    /// Round-7 PR-B: returns the <see cref="TrailersV1"/> for a TRAILERS
+    /// frame, preferring the pre-decoded object attached by the codec
+    /// (zero-cost fast-path); falls back to decoding <see cref="Memory"/>
+    /// bytes if no object is attached (byte fallback path).
+    /// </summary>
+    public TrailersV1 AsTrailers()
+        => DecodedHeader as TrailersV1 ?? TrailersV1.Decode(Memory.Span);
+
     /// <summary>Returns the buffer to the pool or commits the ring read.</summary>
     public void ReturnToPool()
     {
@@ -72,8 +102,33 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 {
     private readonly ShmConnection _connection;
     private readonly Channel<InboundFrame> _inboundFrames;
+    // Round-14 N1: per-stream decision made ONCE at construction. When
+    // true, ShmConnection.ProcessFrame skips ReceiveStriper.Enqueue and
+    // writes directly into _inboundFrames from the reader thread. Saves
+    // one ThreadPool wake-hop per frame (~10-17 us x64, ~25-45 us ARM64)
+    // for the single-stream Unary hot path while preserving per-stream
+    // FIFO (the decision never changes mid-stream, so every frame for
+    // this stream follows the same route).
+    //
+    // Inline continuations stay enabled in default (non-Fair) mode
+    // even when bypassing \u2014 the reader thread runs the consumer's
+    // awaiter continuation directly, saving an additional ThreadPool
+    // hop. The existing FairMaxFramePayload == int.MaxValue guard on
+    // inlineContinuations is sufficient to prevent the LazyChainRos
+    // sync-pull self-deadlock (multi-frame messages only occur under
+    // Fair caps, and only then can a sync-pull stall the reader
+    // waiting on a chunk only the reader can deliver).
+    internal readonly bool _bypassStriper;
     private readonly CancellationTokenSource _disposeCts;
-    private readonly CancellationTokenSource _cancellationCts;
+    // Round-9 PR-I: lazy-allocate the call-cancellation CTS. The CLIENT-
+    // side stream never reads CancellationToken (only the server-side
+    // ShmServerCallContext ctor reads it once), so client RPCs paid for
+    // an unused CTS per call. Lazy via interlocked CAS so concurrent
+    // first-read + Cancel race deterministically: a Cancel that arrives
+    // before the CTS is created sets _cancelRequested, and the lazy
+    // creator returns a CTS that is *already* cancelled.
+    private CancellationTokenSource? _cancellationCts;
+    private int _cancelRequested; // 1 = Cancel happened (possibly pre-CTS)
     private readonly SemaphoreSlim _sendLock;
 
     private HeadersV1? _requestHeaders;
@@ -81,8 +136,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private TrailersV1? _trailers;
     private string? _responseEncoding;
     private int _halfCloseSent; // 0=not sent, 1=sent; use Interlocked for thread safety
-    private bool _halfCloseReceived;
-    private bool _cancelled;
+    // Round-10 BUG-FIX (Opus #7): _halfCloseReceived + _cancelled are
+    // written on the stripe/reader thread (OnFrameReceived) and read
+    // on user-call threads (via IsRemoteHalfClosed / IsCancelled
+    // getters AND ReserveSendQuotaOrBlock's loop guard added by
+    // round-10 FIX-1). Plain bool reads have no cross-thread barrier
+    // and could observe a stale value for an unbounded time,
+    // contradicting the wake-and-abort contract the Cancel path now
+    // depends on. Use `volatile bool` so every read/write is a
+    // releasing/acquiring access consistent with the other state
+    // flags in this type (_disposed, _halfCloseSent both use
+    // Volatile/Interlocked).
+    private volatile bool _halfCloseReceived;
+    private volatile bool _cancelled;
     private int _disposed;
     private volatile Exception? _sendFailure; // set by SendBodyAsync on failure
 
@@ -105,8 +171,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     // batch -> 1 SignalData wake for the whole request. If the body is
     // too big or non-protobuf, FlushStagedHeadersAsync sends the staged
     // Headers via the existing queued path (today's behavior preserved).
-    private byte[]? _stagedHeadersPayload;
-    private int _stagedHeadersPayloadLength;
+    //
+    // Round-7 PR-B: stores the HeadersV1 OBJECT directly (no upfront
+    // Encode to bytes). WriteStagedHeadersInline HPACK-encodes from the
+    // object via the new object-passthrough API; FlushStagedHeadersAsync
+    // encodes on demand only for the (cold) queued fallback path.
+    private HeadersV1? _stagedHeaders;
     private int _stagedHeadersConsumed; // 0=available, 1=already sent or aborted
 
     // Diagnostic counters for the wake-coalescing path. Static across
@@ -219,40 +289,170 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public bool IsServerStream { get; }
 
-    internal CancellationToken CancellationToken => _cancellationCts.Token;
+    internal CancellationToken CancellationToken
+    {
+        get
+        {
+            // Round-9 PR-I lazy init. Common client-side case: never
+            // read, never allocated. Server-side reads once at
+            // ShmServerCallContext ctor.
+            //
+            // Round-10 BUG-FIX (Opus #5): guard against Dispose races.
+            // (a) Pre-check _disposed so we don't allocate a CTS that
+            //     Dispose has already missed (which would leak it).
+            // (b) Wrap existing.Token in ODE-catch so a getter that
+            //     races with the Dispose that disposed our published
+            //     CTS returns a clean cancelled token instead of
+            //     surfacing ObjectDisposedException to user code.
+            // (c) Post-CAS re-check of _disposed: if Dispose ran
+            //     between (a) and our CAS publish, atomically swap our
+            //     CTS back out of the field and dispose it ourselves
+            //     (Dispose may have already drained the field).
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return new CancellationToken(canceled: true);
+            }
+
+            var existing = _cancellationCts;
+            if (existing != null)
+            {
+                try { return existing.Token; }
+                catch (ObjectDisposedException)
+                {
+                    return new CancellationToken(canceled: true);
+                }
+            }
+
+            var fresh = new CancellationTokenSource();
+            // Pre-cancel if a Cancel raced ahead while we were
+            // allocating but before we publish below.
+            if (Volatile.Read(ref _cancelRequested) != 0)
+            {
+                fresh.Cancel();
+            }
+            var prev = Interlocked.CompareExchange(ref _cancellationCts, fresh, null);
+            if (prev != null)
+            {
+                // Lost the publish race — another reader beat us. Throw
+                // away our local CTS and use the winner. Cancel-flag
+                // propagation already handled by the winning thread.
+                fresh.Dispose();
+                try { return prev.Token; }
+                catch (ObjectDisposedException)
+                {
+                    return new CancellationToken(canceled: true);
+                }
+            }
+            // Won. Round-10 BUG-FIX (Opus #5): if Dispose ran between
+            // our pre-check and our CAS publish, the freshly-published
+            // CTS would leak. Detect by re-reading _disposed; if set,
+            // atomically swap our CTS back out. If we win the swap we
+            // own dispose; if Dispose already drained the field, it
+            // disposed the CTS already.
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                if (Interlocked.CompareExchange(ref _cancellationCts, null, fresh) == fresh)
+                {
+                    fresh.Dispose();
+                }
+                return new CancellationToken(canceled: true);
+            }
+            // If Cancel raced between our flag pre-check and our
+            // CAS publish, it would have observed _cancellationCts as
+            // null and done nothing; close the gap by re-checking the
+            // flag after publish.
+            if (Volatile.Read(ref _cancelRequested) != 0 && !fresh.IsCancellationRequested)
+            {
+                try { fresh.Cancel(); } catch (ObjectDisposedException) { }
+            }
+            return fresh.Token;
+        }
+    }
 
     internal ShmGrpcStream(uint streamId, ShmConnection connection, bool isServerStream = false)
     {
         StreamId = streamId;
         _connection = connection;
         IsServerStream = isServerStream;
-        // Inline continuations: enabled when ANY of:
-        //   (a) The connection has the receive striper enabled (default).
-        //       Each stream's inbound frames are dispatched from
-        //       exactly one stripe Thread, so the stripe Thread can
-        //       safely inline-run the user's awaiter continuation
-        //       \u2014 the per-frame ThreadPool dispatch this saves is
-        //       the main win path for the 1000\u00d764B Windows cell
-        //       (where each ThreadPool wake costs ~17 us).
-        //   (b) The explicit per-connection opt-in
-        //       ShmConnection.InlineReceiveContinuations is set
-        //       (the Stage 1A path, gated on caller-promised
-        //       single-active-stream semantics).
-        //   (c) The legacy process-wide env var SHM_CHANNEL_INLINE=1.
+        // Round-14 N1: decide ONCE here whether this stream will bypass
+        // the ReceiveStriper. We bypass only when (a) the striper is
+        // enabled at all (otherwise the question is moot — DATA already
+        // goes direct), and (b) at the moment THIS stream was created
+        // there were no other active streams on the connection. The
+        // snapshot is intentionally taken before this stream is
+        // _streams.TryAdd'd (server) or before the increment is
+        // observable (client side is increment-then-construct, so
+        // ActiveStreamCount already includes this stream — hence the
+        // \u201c<= 1\u201d check, not \u201c== 0\u201d).
+        //
+        // The decision is locked in for the lifetime of the stream so
+        // every frame of this stream takes the same route, preserving
+        // per-stream FIFO. A second stream starting after us will get
+        // its own independent _bypassStriper decision (likely false at
+        // ActiveStreamCount=2) and route through the striper — that's
+        // fine, the two streams don't interfere because each has its
+        // own _inboundFrames Channel<T>.
+        _bypassStriper = connection.UseReceiveStriper
+            && connection.ActiveStreamCount <= 1;
+        // Inline continuations: enables `AllowSynchronousContinuations=true`
+        // on the per-stream inbound channel. When enabled, the user's
+        // awaiter continuation runs synchronously on whatever Thread
+        // produced the frame, avoiding a ~17 us ThreadPool hop per
+        // received frame on Windows.
+        //
+        // HARD CORRECTNESS INVARIANT: an inline continuation MUST NOT
+        // run on the SHM frame-reader Thread. If it does, the user's
+        // awaiter can issue a follow-up flow-controlled blocking send
+        // (`ReserveSendQuotaOrBlock` parking on `_sendQuotaWake`) that
+        // parks the reader Thread itself — at which point no inbound
+        // WINDOW_UPDATE can be processed and the call deadlocks.
+        // Repro: max-profile 32+ MiB unary, where the LPM exceeds the
+        // 32 MiB initial window and the test loop's continuation
+        // issues the NEXT warmup inline from the previous Trailers'
+        // completion. Bug masked in earlier rounds because tiny diag
+        // perturbations rescheduled the continuation off the reader
+        // Thread.
+        //
+        // The reader Thread delivers frames inline iff there is NO
+        // stripe Thread between the reader and the inbound channel
+        // writer — i.e. `_bypassStriper == true` (the Round-14 N1
+        // single-stream Unary fast path) OR `!connection.UseReceiveStriper`.
+        // Only the *contrapositive* — `UseReceiveStriper && !_bypassStriper`
+        // — has a STRIPE Thread (not the reader Thread) as the channel
+        // writer, and only THAT configuration is safe for inline
+        // continuations.
+        //
+        // (a) Default striper path: safe iff `!_bypassStriper`. Saves
+        //     ~17 us/hop on the 1000×64B Windows cell.
+        // (b) Per-connection opt-in `ShmConnection.InlineReceiveContinuations`:
+        //     callers MAY force inline even on the unsafe reader-Thread
+        //     delivery path IF AND ONLY IF they guarantee their
+        //     awaiter continuations will NOT issue a large
+        //     flow-controlled send (else the deadlock above is
+        //     unavoidable). Treated as a caller-owned footgun.
+        // (c) Legacy env var `SHM_CHANNEL_INLINE=1`: same caller-owned
+        //     footgun semantics as (b), process-wide.
         // Safety guard: when the strict-fair frame cap is in effect,
         // multi-frame messages activate LazyChainRos's sync-pull path
         // which would self-deadlock if the same Thread is doing both
         // chunk delivery and chunk consumption. Disable inline
         // continuations in that case regardless of opt-in.
         //
-        // Self-join correctness: when a user awaiter continuation
-        // runs inline on the stripe Thread and that continuation
-        // synchronously calls connection.Dispose, the resulting
-        // ReceiveStriper.Dispose \u2192 Stripe.Dispose path would
-        // self-Join the stripe Thread. ReceiveStriper.Stripe.Dispose
-        // detects this and skips the Join (the stripe Thread exits
-        // on its own once the queue is observed completed).
-        var inlineContinuations = (connection.UseReceiveStriper
+        // The same deadlock previously applied in MAX mode whenever
+        // multi-frame chain-ZC was reachable, because chain-ZC's
+        // per-chunk More-flagged surface drove the same LazyChainRos
+        // sync-pull from the consumer. The 2026-06-01 hybrid eager
+        // pre-fetch refactor (see <c>InboundChainHelper</c>) replaces
+        // the sync-pull <c>LazyChainRos</c> activation in chain-ZC
+        // streams with an async pre-fetch loop that unwinds the reader
+        // Thread between chunks; the > <c>ChainZcBudget</c> non-ZC
+        // path keeps <c>LazyChainRos</c> but hops off the reader
+        // Thread first via <see cref="ShmReaderThreadContext"/>. With
+        // those fixes inline continuations are safe on chain-ZC
+        // streams; only the strict-fair frame cap remains as a
+        // structural inline-cont blocker.
+        var inlineContinuations = (
+                (connection.UseReceiveStriper && !_bypassStriper)
                 || s_channelInlineContinuations
                 || connection.InlineReceiveContinuations)
             && ShmConstants.FairMaxFramePayload == int.MaxValue;
@@ -263,7 +463,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             AllowSynchronousContinuations = inlineContinuations
         });
         _disposeCts = new CancellationTokenSource();
-        _cancellationCts = new CancellationTokenSource();
+        // _cancellationCts stays null until first CancellationToken read
+        // (lazy init via interlocked CAS — see CancellationToken getter
+        // for the race-free flag-then-publish protocol).
         _sendLock = new SemaphoreSlim(1, 1);
         // HTTP/2 per-stream send quota: bytes the peer has granted us via
         // SETTINGS_INITIAL_WINDOW_SIZE + accumulated WINDOW_UPDATE. Decremented
@@ -338,6 +540,32 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal long SendQuota => Volatile.Read(ref _sendQuota);
 
     /// <summary>
+    /// Cheap best-effort predicate: would a send of <paramref name="bytes"/>
+    /// be unable to reserve quota right now on either the per-stream or
+    /// per-connection window? Two <see cref="Volatile.Read"/> calls; no CAS.
+    /// </summary>
+    /// <remarks>
+    /// Used by <see cref="SendMessageAsync(System.ReadOnlyMemory{byte}, System.Threading.CancellationToken)"/>
+    /// together with <see cref="ShmReaderThreadContext.IsOnReaderThread"/>
+    /// to decide whether the outbound write must hop off the SHM frame-reader
+    /// thread BEFORE descending into <see cref="ReserveSendQuotaOrBlock"/> —
+    /// otherwise a flow-controlled send issued from an inline-receive
+    /// continuation deadlocks the connection. The check is intentionally
+    /// approximate: a stale "false" simply means we did NOT hop and the
+    /// blocking wait's <see cref="System.Diagnostics.Debug.Assert"/>
+    /// tripwire would catch the slip in DEBUG builds. A stale "true"
+    /// costs at most one <see cref="System.Threading.Tasks.Task.Yield"/>
+    /// hop for a write that turned out not to need it.
+    /// </remarks>
+    internal bool WouldBlockSendQuota(int bytes)
+    {
+        if (bytes <= 0) return false;
+        if (Volatile.Read(ref _sendQuota) < bytes) return true;
+        if (_connection.ConnSendQuota < bytes) return true;
+        return false;
+    }
+
+    /// <summary>
     /// Attempts to reserve <paramref name="n"/> bytes of send-window quota
     /// for an outbound DATA chunk. Returns <see langword="true"/> with the
     /// quota debited if the reservation succeeds; returns <see langword="false"/>
@@ -394,6 +622,52 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 return;
             }
         }
+    }
+
+    /// <summary>
+    /// Round-10 DEFER-1 fix: attempts to reserve <paramref name="n"/> bytes
+    /// from BOTH the per-stream window AND the connection-level window
+    /// atomically. Returns <see langword="true"/> with both debits
+    /// committed; <see langword="false"/> (both quotas unchanged) on
+    /// insufficient credit in either window. Mirrors grpc-go-shmem's
+    /// two-resource CAS pattern (shm_client_transport.go ~L343):
+    /// reserves stream first, then conn; rolls back the stream debit if
+    /// the conn CAS loses to ensure callers see all-or-nothing semantics.
+    /// Per RFC 7540/9113 §6.9.1 every outbound DATA frame MUST observe
+    /// both windows.
+    /// </summary>
+    internal bool TryReserveSendQuotaWithConn(int n)
+    {
+        if (n <= 0) return n == 0;
+        // Probe stream first (fail-fast without CAS) — conn quota check
+        // moved inside TryReserveConnSendQuota where the fast-path skip
+        // lives, so a redundant probe here would just add a wasted
+        // Volatile.Read in the dominant SHM-SHM hot path.
+        if (Volatile.Read(ref _sendQuota) < n) return false;
+        // Reserve stream first.
+        if (!TryReserveSendQuota(n)) return false;
+        // Reserve conn (fast-path skip when conn quota effectively
+        // unbounded; see ShmConnection.TryReserveConnSendQuota for the
+        // threshold rationale). Rolls back the stream debit on conn race.
+        if (!_connection.TryReserveConnSendQuota(n))
+        {
+            RefundSendQuota(n);
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Round-10 DEFER-1 fix: refunds <paramref name="n"/> bytes to BOTH
+    /// the per-stream window and the connection window. Used by every
+    /// DATA write site's catch/rollback path, mirroring the
+    /// <see cref="TryReserveSendQuotaWithConn"/> two-resource reservation.
+    /// </summary>
+    internal void RefundSendQuotaWithConn(int n)
+    {
+        if (n <= 0) return;
+        RefundSendQuota(n);
+        _connection.RefundConnSendQuota(n);
     }
 
     /// <summary>
@@ -459,18 +733,30 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal void ReserveSendQuotaOrBlock(int n, Action? drainBeforeWait, CancellationToken cancellationToken)
     {
         if (n <= 0) return;
-        // Fast path: quota readily available.
-        if (TryReserveSendQuota(n)) return;
+        // Fast path: both quotas readily available (round-10 DEFER-1
+        // upgraded this to reserve both stream + conn atomically).
+        if (TryReserveSendQuotaWithConn(n)) return;
 
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
             ThrowIfDisposed();
+            // BUG-FIX (round-10 GPT-5.5 #2): check _cancelled so a
+            // remote Cancel/RST during our quota wait aborts the
+            // send instead of waiting indefinitely for the caller's
+            // own token to fire.
+            if (_cancelled)
+            {
+                throw new OperationCanceledException("Stream cancelled by peer (CANCEL frame received).");
+            }
             // Reset BEFORE recheck to ensure we observe any quota added
             // before our Wait starts; sticky semantics of MRESlim mean
-            // a Set between Reset and Wait still wakes us.
+            // a Set between Reset and Wait still wakes us. _sendQuotaWake
+            // wakes on per-stream WU AND on conn-level WU (DEFER-1:
+            // AddSendQuota(streamId=0) explicitly wakes every active
+            // stream's MRES so writers parked here re-probe both windows).
             _sendQuotaWake.Reset();
-            if (TryReserveSendQuota(n)) return;
+            if (TryReserveSendQuotaWithConn(n)) return;
             // Re-check disposal AFTER Reset to close the missed-wake
             // race where Dispose() ran between our earlier
             // ThrowIfDisposed() and our Reset() — Dispose's wake-Set
@@ -480,10 +766,32 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             // Cancellation is re-checked symmetrically.
             ThrowIfDisposed();
             cancellationToken.ThrowIfCancellationRequested();
+            // Same re-check for remote-peer cancel as above; covers
+            // the race where Cancel arrived between our top-of-loop
+            // _cancelled read and our Reset() (Reset would have
+            // cleared the Cancel-path's wake-Set, dooming us to a
+            // Wait that never wakes).
+            if (_cancelled)
+            {
+                throw new OperationCanceledException("Stream cancelled by peer (CANCEL frame received).");
+            }
             // Flush pending control frames (Ping/Pong keepalive) so
             // they are not stranded behind a blocked DATA write while
             // we wait for the peer to grant more quota.
             drainBeforeWait?.Invoke();
+            // TRIPWIRE: blocking on the SHM frame-reader thread parks the
+            // very thread that processes peer WINDOW_UPDATEs → guaranteed
+            // deadlock. Callers entering the slow path from an inline
+            // receive continuation MUST first hop off via the
+            // WouldBlockSendQuota pre-flight in SendMessageAsync (see
+            // ShmReaderThreadContext). DEBUG-only assert keeps the
+            // release-build cost zero while surfacing missed call sites
+            // during test runs.
+            System.Diagnostics.Debug.Assert(
+                !ShmReaderThreadContext.IsOnReaderThread,
+                "ReserveSendQuotaOrBlock would block on the SHM reader thread — " +
+                "an outbound send path is missing a WouldBlockSendQuota pre-flight hop. " +
+                "See ShmReaderThreadContext for the deadlock invariant.");
             _sendQuotaWake.Wait(cancellationToken);
         }
     }
@@ -519,8 +827,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var (payload, payloadLength) = _requestHeaders.Encode();
-
         // Single-stream-mode inline-write fast path. When the connection
         // negotiated single-stream mode and only one stream is active,
         // bypass the WriterLoop queue and write Headers directly to the
@@ -536,6 +842,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         // Routing Headers through the same TryPause path serialises the
         // sends through `_inlineWriterActive` CAS; both writes go to the
         // ring in caller-thread order, no race.
+        //
+        // Round-7 PR-B: inline path now uses WriteInlineHeadersFrame which
+        // takes a HeadersV1 OBJECT and HPACK-encodes it directly,
+        // skipping the HeadersV1.Encode → bytes → DecodeHeadersV1
+        // round-trip the byte path requires.
         //
         // Falls back to the queued path when:
         //   * not in single-stream mode (multi-stream pipelining wants
@@ -563,8 +874,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         var batchOpened = true;
                         try
                         {
-                            writer.WriteInlineFrame(FrameType.Headers, StreamId,
-                                HeadersFlags.Initial, payload.AsSpan(0, payloadLength), default);
+                            writer.WriteInlineHeadersFrame(StreamId, _requestHeaders, default);
                             Volatile.Write(ref _pendingInlineBatch, 1);
                             batchOpened = false; // ownership transferred to HalfClose / Dispose
                         }
@@ -575,56 +885,24 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     }
                     else
                     {
-                        writer.WriteInlineFrame(FrameType.Headers, StreamId,
-                            HeadersFlags.Initial, payload.AsSpan(0, payloadLength), default);
+                        writer.WriteInlineHeadersFrame(StreamId, _requestHeaders, default);
                     }
                     return Task.CompletedTask;
                 }
                 finally
                 {
-                    ArrayPool<byte>.Shared.Return(payload);
                     writer.ResumeWriterLoop();
                 }
             }
         }
 
-        if (payloadLength <= 512)
-        {
-            Task task;
-            try
-            {
-                task = SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
-                    payload.AsMemory(0, payloadLength));
-            }
-            catch
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-                throw;
-            }
-            if (task.IsCompletedSuccessfully)
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-                return Task.CompletedTask;
-            }
-            return SendRequestHeadersReturnPoolAsync(task, payload);
-        }
-        else
-        {
-            return SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
-                payload.AsMemory(0, payloadLength), payload);
-        }
-    }
-
-    private static async Task SendRequestHeadersReturnPoolAsync(Task sendTask, byte[] payload)
-    {
-        try
-        {
-            await sendTask.ConfigureAwait(false);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(payload);
-        }
+        // Round-9 PR-F: queued fallback uses the object passthrough path
+        // (was Encode → bytes → SendFrameAsync → DecodeHeadersV1 round-
+        // trip). PR-B closed this on the inline single-stream branch;
+        // PR-D closed it for SendResponseHeadersAsync / SendTrailersAsync;
+        // PR-F now covers the client request HEADERS queued fallback so
+        // every Headers send path uses the new API.
+        return SendHeadersFrameAsync(HeadersFlags.Initial, _requestHeaders);
     }
 
     /// <summary>
@@ -663,9 +941,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var (payload, payloadLength) = _requestHeaders.Encode();
-        _stagedHeadersPayload = payload;
-        _stagedHeadersPayloadLength = payloadLength;
+        // Round-7 PR-B: store the HeadersV1 object directly — the inline
+        // flush path (WriteStagedHeadersInline) HPACK-encodes from the
+        // object without a HeadersV1.Encode round-trip. Encoding to bytes
+        // happens lazily only if FlushStagedHeadersAsync (cold queued
+        // fallback) is invoked instead.
+        _stagedHeaders = _requestHeaders;
         Volatile.Write(ref _stagedHeadersConsumed, 0);
     }
 
@@ -675,15 +956,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     internal bool HasStagedHeaders =>
         Volatile.Read(ref _stagedHeadersConsumed) == 0
-        && _stagedHeadersPayload != null;
+        && _stagedHeaders != null;
 
     /// <summary>
     /// Writes the staged Headers frame inline via <paramref name="writer"/>'s
     /// direct ring-write path. Caller MUST already hold
-    /// <c>writer.TryPauseWriterLoop</c>. The pooled payload buffer is
-    /// returned to <see cref="System.Buffers.ArrayPool{T}"/> after the
-    /// write. No-op if Headers were already consumed (idempotent under
-    /// CAS race with <see cref="FlushStagedHeadersAsync"/>).
+    /// <c>writer.TryPauseWriterLoop</c>. No-op if Headers were already
+    /// consumed (idempotent under CAS race with
+    /// <see cref="FlushStagedHeadersAsync"/>). Round-7 PR-B: uses the
+    /// object-passthrough API — no buffer to manage.
     /// </summary>
     internal void WriteStagedHeadersInline(ShmFrameWriter writer)
     {
@@ -691,19 +972,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             return; // already consumed
         }
-        var payload = _stagedHeadersPayload;
-        var len = _stagedHeadersPayloadLength;
-        _stagedHeadersPayload = null;
-        if (payload == null) return;
-        try
-        {
-            writer.WriteInlineFrame(FrameType.Headers, StreamId,
-                HeadersFlags.Initial, payload.AsSpan(0, len), default);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(payload);
-        }
+        var headers = _stagedHeaders;
+        _stagedHeaders = null;
+        if (headers == null) return;
+        writer.WriteInlineHeadersFrame(StreamId, headers, default);
     }
 
     /// <summary>
@@ -719,33 +991,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             return Task.CompletedTask; // already consumed
         }
-        var payload = _stagedHeadersPayload;
-        var len = _stagedHeadersPayloadLength;
-        _stagedHeadersPayload = null;
-        if (payload == null) return Task.CompletedTask;
+        var headers = _stagedHeaders;
+        _stagedHeaders = null;
+        if (headers == null) return Task.CompletedTask;
 
-        if (len <= 512)
-        {
-            Task task;
-            try
-            {
-                task = SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
-                    payload.AsMemory(0, len), cancellationToken);
-            }
-            catch
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-                throw;
-            }
-            if (task.IsCompletedSuccessfully)
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-                return Task.CompletedTask;
-            }
-            return SendRequestHeadersReturnPoolAsync(task, payload);
-        }
-        return SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
-            payload.AsMemory(0, len), payload, cancellationToken);
+        // Round-9 PR-F: cold queued fall-back now uses the object
+        // passthrough path too — no Encode/Decode round-trip even on
+        // this rare path. PR-B closed the WriteStagedHeadersInline
+        // fast path; PR-F closes the symmetric async fallback.
+        return SendHeadersFrameAsync(HeadersFlags.Initial, headers, cancellationToken);
     }
 
     /// <summary>
@@ -795,24 +1049,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var (payload, payloadLength) = _responseHeaders.Encode();
-        if (payloadLength <= 512)
-        {
-            try
-            {
-                await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
-                    payload.AsMemory(0, payloadLength));
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-            }
-        }
-        else
-        {
-            await SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
-                payload.AsMemory(0, payloadLength), payload);
-        }
+        // Round-8 PR-D: queued/async fallback uses the object passthrough
+        // path (was Encode → bytes → SendFrameAsync → DecodeHeadersV1
+        // round-trip). Companion to PR-B's inline single-stream fix —
+        // multi-stream / N>1 RPCs now also benefit.
+        await SendHeadersFrameAsync(HeadersFlags.Initial, _responseHeaders).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -824,13 +1065,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (_responseHeaders != null) return;
         metadata = InjectResponseEncoding(metadata);
         _responseHeaders = new HeadersV1 { Version = 1, HeaderType = 1, Metadata = ConvertMetadata(metadata) };
-        var (payload, payloadLength) = _responseHeaders.Encode();
-        try
-        {
-            writer.WriteInlineFrame(FrameType.Headers, StreamId, HeadersFlags.Initial,
-                payload.AsSpan(0, payloadLength), default);
-        }
-        finally { ArrayPool<byte>.Shared.Return(payload); }
+        // Round-7 PR-B: object-passthrough inline write (no upfront
+        // HeadersV1.Encode → bytes → DecodeHeadersV1 round-trip).
+        writer.WriteInlineHeadersFrame(StreamId, _responseHeaders, default);
     }
 
     private bool HasSentInitialHeaders()
@@ -869,6 +1106,22 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         ThrowIfDisposed();
         ThrowIfCannotSendMessage();
 
+        // SAFE-INLINE-RECEIVE DEADLOCK GUARD: if a user inline-receive
+        // continuation is calling us on the SHM frame-reader thread AND
+        // the upcoming send would block on per-stream or connection
+        // send-quota, hop to the ThreadPool before descending — otherwise
+        // ReserveSendQuotaOrBlock parks the reader thread on
+        // _sendQuotaWake and the peer's WINDOW_UPDATE can never be
+        // processed (no thread left to read it).  See
+        // ShmReaderThreadContext for the full invariant. The hop is paid
+        // ONLY for inline-RX writes that would block — common-case fast
+        // path (quota available) stays sync.
+        if (ShmReaderThreadContext.IsOnReaderThread
+            && WouldBlockSendQuota(data.Length))
+        {
+            return SendMessageWithReaderThreadHopAsync(data, cancellationToken);
+        }
+
         // No per-stream flow control: the ring's WaitForSpace provides
         // back-pressure via the SPSC ring buffer.
         var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
@@ -903,6 +1156,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     {
         ThrowIfDisposed();
         ThrowIfCannotSendMessage();
+
+        // SAFE-INLINE-RECEIVE DEADLOCK GUARD: same invariant as
+        // SendMessageAsync — see ShmReaderThreadContext for details.
+        if (ShmReaderThreadContext.IsOnReaderThread
+            && WouldBlockSendQuota(data.Length))
+        {
+            return SendMessageAndHalfCloseWithReaderThreadHopAsync(data, cancellationToken);
+        }
 
         var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
 
@@ -943,6 +1204,32 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Slow-path helper for <see cref="SendMessageAsync(System.ReadOnlyMemory{byte}, System.Threading.CancellationToken)"/>:
+    /// hops off the SHM frame-reader thread via <see cref="Task.Yield"/>
+    /// before recursing into the normal send path. After the yield the
+    /// continuation runs on a ThreadPool worker, so
+    /// <see cref="ShmReaderThreadContext.IsOnReaderThread"/> is false and
+    /// the recursive call takes the fast sync path (or blocks safely on
+    /// the worker thread, never on the reader). See
+    /// <see cref="ShmReaderThreadContext"/> for the deadlock invariant.
+    /// </summary>
+    private async Task SendMessageWithReaderThreadHopAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+        await SendMessageAsync(data, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Slow-path helper for <see cref="SendMessageAndHalfCloseAsync"/> —
+    /// see <see cref="SendMessageWithReaderThreadHopAsync"/> for rationale.
+    /// </summary>
+    private async Task SendMessageAndHalfCloseWithReaderThreadHopAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+        await SendMessageAndHalfCloseAsync(data, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Sends a message payload using zero-copy. The <paramref name="pooledBuffer"/>
     /// is returned to <see cref="ArrayPool{T}"/> after the data has been written
     /// to the ring buffer, replacing the caller's <c>finally</c> block.
@@ -960,9 +1247,29 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             throw;
         }
 
+        // SAFE-INLINE-RECEIVE DEADLOCK GUARD: same invariant as
+        // SendMessageAsync — hop off the SHM frame-reader thread if the
+        // upcoming write may block on per-stream / connection send-quota.
+        // See ShmReaderThreadContext for the full invariant.
+        if (ShmReaderThreadContext.IsOnReaderThread
+            && WouldBlockSendQuota(data.Length))
+        {
+            return SendMessageZeroCopyWithReaderThreadHopAsync(data, pooledBuffer, cancellationToken);
+        }
+
         // No per-stream flow control: ring WaitForSpace provides back-pressure.
         var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
         return SendFrameZeroCopyAsync(FrameType.Message, 0, data, pooledBuffer, ct);
+    }
+
+    /// <summary>
+    /// Slow-path helper for <see cref="SendMessageZeroCopyAsync"/> — see
+    /// <see cref="SendMessageWithReaderThreadHopAsync"/> for rationale.
+    /// </summary>
+    private async Task SendMessageZeroCopyWithReaderThreadHopAsync(ReadOnlyMemory<byte> data, byte[] pooledBuffer, CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+        await SendMessageZeroCopyAsync(data, pooledBuffer, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1044,16 +1351,8 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var (payload, payloadLength) = _trailers.Encode();
-        try
-        {
-            writer.WriteInlineFrame(FrameType.Trailers, StreamId, TrailersFlags.EndStream,
-                payload.AsSpan(0, payloadLength), default);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(payload);
-        }
+        // Round-7 PR-B: object-passthrough inline write.
+        writer.WriteInlineTrailersFrame(StreamId, _trailers, default);
         Volatile.Write(ref _halfCloseSent, 1);
     }
 
@@ -1075,24 +1374,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var (payload, payloadLength) = _trailers.Encode();
-        if (payloadLength <= 512)
-        {
-            try
-            {
-                await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream,
-                    payload.AsMemory(0, payloadLength));
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-            }
-        }
-        else
-        {
-            await SendFrameZeroCopyAsync(FrameType.Trailers, TrailersFlags.EndStream,
-                payload.AsMemory(0, payloadLength), payload);
-        }
+        // Round-8 PR-D: queued/async fallback uses the object passthrough
+        // path. Inline single-stream fast path (SendTrailersInline) was
+        // already PR-B; this covers the multi-stream / N>1 fallback.
+        await SendTrailersFrameAsync(TrailersFlags.EndStream, _trailers).ConfigureAwait(false);
         Volatile.Write(ref _halfCloseSent, 1);
     }
 
@@ -1161,6 +1446,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (_cancelled) return;
         _cancelled = true;
         CancelCancellationToken();
+        // BUG-FIX (round-10 GPT-5.5 #1): wake any sender parked on
+        // send-quota so it observes _cancelled and aborts. Mirrors
+        // the inbound-Cancel handler (FIX-1) and AbortForFlowControl.
+        // Without this, a writer parked in ReserveSendQuotaOrBlock
+        // stays parked even after the local user cancels its own RPC.
+        _sendQuotaWake.Set();
 
         try
         {
@@ -1169,13 +1460,38 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         catch { }
 
         _inboundFrames.Writer.TryComplete();
+
+        // BUG-FIX (round-10 GPT-5.5 #1): release the stream slot in
+        // the connection's stream-map. Previously CancelAsync did not
+        // do this -- only Dispose() did. ShmControlHandler.SendAsync
+        // catches OperationCanceledException, calls CancelAsync, then
+        // rethrows without disposing the stream. The stream stayed in
+        // the connection's stream-map until the connection itself was
+        // torn down, holding a permanent slot per cancelled RPC.
+        // Repeated cancellations on a long-lived connection would
+        // eventually exhaust the per-connection MAX_CONCURRENT_STREAMS
+        // budget and produce false "no available stream slot" errors
+        // for new RPCs.
+        //
+        // RemoveStream is idempotent so the subsequent Dispose() (when
+        // the stream object is garbage-collected or explicitly disposed)
+        // re-removing is a no-op. Mirrors what the inbound-Cancel
+        // handler at ~line 1812 already does on remote cancel.
+        _connection.RemoveStream(StreamId);
     }
 
     /// <summary>
     /// Receives the next frame from the stream.
     /// </summary>
     /// <returns>The frame, or null if the stream is closed.</returns>
-    public Task<InboundFrame?> ReceiveFrameAsync(CancellationToken cancellationToken = default)
+    /// <remarks>
+    /// Round-8 PR-C2: returns <see cref="ValueTask{TResult}"/> so the
+    /// synchronously-completed fast path (frame already buffered in the
+    /// per-stream channel — the dominant case under load) does not
+    /// allocate a <see cref="Task{TResult}"/>. <c>await</c> works
+    /// identically for ValueTask and Task callers.
+    /// </remarks>
+    public ValueTask<InboundFrame?> ReceiveFrameAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -1196,7 +1512,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     }
                 }
             }
-            return Task.FromResult<InboundFrame?>(frame);
+            return new ValueTask<InboundFrame?>(frame);
         }
 
         // Slow path: need to wait for a frame.
@@ -1314,7 +1630,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         return null;
     }
 
-    private async Task<InboundFrame?> ReceiveFrameSlowAsync(CancellationToken cancellationToken)
+    private async ValueTask<InboundFrame?> ReceiveFrameSlowAsync(CancellationToken cancellationToken)
     {
         // Only create LinkedCTS when the caller provided a cancellable token.
         // In streaming steady state, grpc-dotnet typically passes default.
@@ -1383,13 +1699,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         while (true)
         {
-            var frame = await ReceiveFrameAsync(cancellationToken);
+            var frame = await ReceiveFrameAsync(cancellationToken).ConfigureAwait(false);
             if (frame == null)
                 throw new InvalidOperationException("Stream closed before receiving headers");
 
             if (frame.Value.Type == FrameType.Headers)
             {
-                _requestHeaders = HeadersV1.Decode(frame.Value.Memory.Span);
+                _requestHeaders = frame.Value.AsHeaders();
                 frame.Value.ReturnToPool();
                 return _requestHeaders;
             }
@@ -1411,21 +1727,33 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             throw new InvalidOperationException("Only client receives response headers");
 
         var frameTask = ReceiveFrameAsync(cancellationToken);
-        if (frameTask.IsCompletedSuccessfully)
+        if (!frameTask.IsCompletedSuccessfully)
         {
-            var frame = frameTask.Result;
-            if (frame != null && frame.Value.Type == FrameType.Headers)
-            {
-                _responseHeaders = HeadersV1.Decode(frame.Value.Memory.Span);
-                frame.Value.ReturnToPool();
-                return Task.FromResult(_responseHeaders);
-            }
+            // Slow path: hand the unresolved ValueTask to the async slow
+            // helper which awaits it exactly once (ValueTask single-
+            // consume invariant).
+            return ReceiveResponseHeadersSlowAsync(frameTask, cancellationToken);
         }
-        return ReceiveResponseHeadersSlowAsync(frameTask, cancellationToken);
+
+        // Fast path completed synchronously: consume the ValueTask result
+        // here (exactly once) and dispatch on the resolved frame.
+        var firstFrame = frameTask.Result;
+        if (firstFrame != null && firstFrame.Value.Type == FrameType.Headers)
+        {
+            _responseHeaders = firstFrame.Value.AsHeaders();
+            firstFrame.Value.ReturnToPool();
+            return Task.FromResult(_responseHeaders);
+        }
+        // Fast path completed but the first frame wasn't HEADERS (e.g.,
+        // server returned trailers-only refusal). Re-wrap the already-
+        // resolved frame as a completed ValueTask so the slow path can
+        // await it without re-consuming the original.
+        return ReceiveResponseHeadersSlowAsync(
+            new ValueTask<InboundFrame?>(firstFrame), cancellationToken);
     }
 
     private async Task<HeadersV1> ReceiveResponseHeadersSlowAsync(
-        Task<InboundFrame?> firstFrameTask, CancellationToken cancellationToken)
+        ValueTask<InboundFrame?> firstFrameTask, CancellationToken cancellationToken)
     {
         var firstFrame = await firstFrameTask.ConfigureAwait(false);
         if (firstFrame == null)
@@ -1438,14 +1766,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         if (firstFrame.Value.Type == FrameType.Headers)
         {
-            _responseHeaders = HeadersV1.Decode(firstFrame.Value.Memory.Span);
+            _responseHeaders = firstFrame.Value.AsHeaders();
             firstFrame.Value.ReturnToPool();
             return _responseHeaders;
         }
 
         if (firstFrame.Value.Type == FrameType.Trailers)
         {
-            var trailers = TrailersV1.Decode(firstFrame.Value.Memory.Span);
+            var trailers = firstFrame.Value.AsTrailers();
             firstFrame.Value.ReturnToPool();
             _trailers = trailers;
             _halfCloseReceived = true;
@@ -1467,7 +1795,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
             if (frame.Value.Type == FrameType.Headers)
             {
-                _responseHeaders = HeadersV1.Decode(frame.Value.Memory.Span);
+                _responseHeaders = frame.Value.AsHeaders();
                 frame.Value.ReturnToPool();
                 return _responseHeaders;
             }
@@ -1476,7 +1804,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             // This happens when the server's max concurrent streams is exceeded.
             if (frame.Value.Type == FrameType.Trailers)
             {
-                var trailers = TrailersV1.Decode(frame.Value.Memory.Span);
+                var trailers = frame.Value.AsTrailers();
                 frame.Value.ReturnToPool();
                 _trailers = trailers;
                 _halfCloseReceived = true;
@@ -1498,7 +1826,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             if (_cancelled) yield break;
 
-            var frame = await ReceiveFrameAsync(cancellationToken);
+            var frame = await ReceiveFrameAsync(cancellationToken).ConfigureAwait(false);
             if (frame == null)
             {
                 // If the send side failed, surface it instead of silently
@@ -1549,7 +1877,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     yield break;
 
                 case FrameType.Trailers:
-                    _trailers = TrailersV1.Decode(f.Memory.Span);
+                    _trailers = f.AsTrailers();
                     f.ReturnToPool();
                     _halfCloseReceived = true;
                     yield break;
@@ -1659,7 +1987,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     return (default, default, true);
 
                 case FrameType.Trailers:
-                    _trailers = TrailersV1.Decode(f.Memory.Span);
+                    _trailers = f.AsTrailers();
                     f.ReturnToPool();
                     _halfCloseReceived = true;
                     return (default, default, true);
@@ -1693,7 +2021,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             {
                 if (_cancelled) yield break;
 
-                var frame = await ReceiveFrameAsync(cancellationToken);
+                var frame = await ReceiveFrameAsync(cancellationToken).ConfigureAwait(false);
                 if (frame == null)
                 {
                     var sendEx = _sendFailure;
@@ -1753,7 +2081,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         yield break;
 
                     case FrameType.Trailers:
-                        _trailers = TrailersV1.Decode(f.Memory.Span);
+                        _trailers = f.AsTrailers();
                         f.ReturnToPool();
                         _halfCloseReceived = true;
                         yield break;
@@ -1799,6 +2127,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 case FrameType.Cancel:
                     _cancelled = true;
                     CancelCancellationToken();
+                    // BUG-FIX (round-10 GPT-5.5 #2): wake any sender
+                    // parked in ReserveSendQuotaOrBlock so it observes
+                    // _cancelled at the top of its loop and aborts
+                    // promptly instead of waiting for the caller's
+                    // (unrelated) cancellation token or the eventual
+                    // RPC deadline. Mirrors the AbortForFlowControl
+                    // pattern at line ~2175 which already does this.
+                    _sendQuotaWake.Set();
                     frame.ReturnToPool();
                     ownsFrame = false;
                     _inboundFrames.Writer.TryComplete();
@@ -1896,7 +2232,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>Sets trailers from a Trailers frame.</summary>
     internal void SetTrailers(InboundFrame frame)
     {
-        _trailers = TrailersV1.Decode(frame.Memory.Span);
+        _trailers = frame.AsTrailers();
     }
 
     internal static void OnWindowUpdate(uint increment)
@@ -1931,10 +2267,93 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         return SendFrameAsyncContended(type, flags, payload, cancellationToken);
     }
 
+    /// <summary>
+    /// Round-8 PR-D: enqueues a HEADERS frame from a
+    /// <see cref="HeadersV1"/> object (no upfront byte encode). Used by
+    /// <see cref="SendResponseHeadersAsync"/>'s queued/async fallback when
+    /// the inline single-stream fast path is unavailable.
+    /// </summary>
+    private Task SendHeadersFrameAsync(byte flags, HeadersV1 headers, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+#pragma warning disable CA2016
+        if (_sendLock.Wait(0))
+#pragma warning restore CA2016
+        {
+            try
+            {
+                _connection.SendHeadersFrame(StreamId, flags, headers);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+            return Task.CompletedTask;
+        }
+        return SendHeadersFrameAsyncContended(flags, headers, cancellationToken);
+    }
+
+    private async Task SendHeadersFrameAsyncContended(byte flags, HeadersV1 headers, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            _connection.SendHeadersFrame(StreamId, flags, headers);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Round-8 PR-D companion to <see cref="SendHeadersFrameAsync"/> for TRAILERS.
+    /// </summary>
+    private Task SendTrailersFrameAsync(byte flags, TrailersV1 trailers, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+#pragma warning disable CA2016
+        if (_sendLock.Wait(0))
+#pragma warning restore CA2016
+        {
+            try
+            {
+                _connection.SendTrailersFrame(StreamId, flags, trailers);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+            return Task.CompletedTask;
+        }
+        return SendTrailersFrameAsyncContended(flags, trailers, cancellationToken);
+    }
+
+    private async Task SendTrailersFrameAsyncContended(byte flags, TrailersV1 trailers, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            _connection.SendTrailersFrame(StreamId, flags, trailers);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
+
     private async Task SendFrameAsyncContended(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        await _sendLock.WaitAsync(cancellationToken);
+        await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -1999,7 +2418,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
         try
         {
-            await _sendLock.WaitAsync(cancellationToken);
+            await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch
         {
@@ -2051,12 +2470,20 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     private void CancelCancellationToken()
     {
-        try
+        // Round-9 PR-I: lazy _cancellationCts. Set flag first so a
+        // first-read happening concurrently produces an already-
+        // cancelled CTS even if it loses our null-check race.
+        Volatile.Write(ref _cancelRequested, 1);
+        var cts = _cancellationCts;
+        if (cts != null)
         {
-            _cancellationCts.Cancel();
-        }
-        catch (ObjectDisposedException)
-        {
+            try
+            {
+                cts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
     }
 
@@ -2109,17 +2536,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         // Safety: if StageRequestHeaders was called but neither
         // WriteStagedHeadersInline nor FlushStagedHeadersAsync ran
-        // (e.g., request cancelled before body write), return the
-        // rented headers buffer to the pool to prevent a leak.
+        // (e.g., request cancelled before body write), clear the staged
+        // HeadersV1 reference so the object can be GC'd. Round-7 PR-B:
+        // no pooled buffer to return — staged storage is now just the
+        // managed object reference.
         if (Interlocked.Exchange(ref _stagedHeadersConsumed, 1) == 0)
         {
-            var staged = _stagedHeadersPayload;
-            _stagedHeadersPayload = null;
-            if (staged != null)
-            {
-                try { ArrayPool<byte>.Shared.Return(staged); }
-                catch { /* best effort */ }
-            }
+            _stagedHeaders = null;
         }
 
         _disposeCts.Cancel();
@@ -2134,7 +2557,21 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         _connection.RemoveStream(StreamId);
         _sendLock.Dispose();
-        _cancellationCts.Dispose();
+        // BUG-FIX (round-10 GPT-5.5 #10): dispose the send-quota wake
+        // MRES so its lazily-allocated kernel wait handle is released.
+        // Wake the MRES first (already done at top of Dispose) so any
+        // pending Wait observes the signal before we dispose; final
+        // pending waiter will get ObjectDisposedException which is
+        // caught by the existing send-path try/catch wrappers.
+        try { _sendQuotaWake.Dispose(); }
+        catch { /* defensive: never throw from Dispose */ }
+        // Round-9 PR-I + Round-10 Opus #5: atomically take ownership
+        // of the lazy CTS via Exchange so a concurrent CancellationToken
+        // getter (or one that races past our _disposed pre-check) can
+        // detect via its post-CAS disposed re-check that we no longer
+        // hold the field, and refrain from double-disposing.
+        var ctsToDispose = Interlocked.Exchange(ref _cancellationCts, null);
+        ctsToDispose?.Dispose();
         _disposeCts.Dispose();
     }
 

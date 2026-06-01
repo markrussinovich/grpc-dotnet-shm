@@ -43,6 +43,66 @@ internal static class HpackHeadersAdapter
     private const string GrpcStatus = "grpc-status";
     private const string GrpcMessage = "grpc-message";
 
+    // Round-7 perf: cache the ASCII byte[] representations of every
+    // constant HPACK value we emit so encoding HEADERS/TRAILERS frames
+    // does not allocate a fresh byte[] per call for static strings
+    // (~6-12 throwaway allocs per header frame previously, ~5 header
+    // frames per Unary RPC). Sourced from the matching const strings
+    // above so the wire bytes stay self-documenting.
+    private static readonly byte[] s_methodPostBytes = Encoding.ASCII.GetBytes("POST");
+    private static readonly byte[] s_schemeHttpBytes = Encoding.ASCII.GetBytes("http");
+    private static readonly byte[] s_contentTypeGrpcBytes = Encoding.ASCII.GetBytes(ContentTypeGrpc);
+    private static readonly byte[] s_teTrailersBytes = Encoding.ASCII.GetBytes(TeTrailers);
+    private static readonly byte[] s_status200Bytes = Encoding.ASCII.GetBytes("200");
+
+    // gRPC status codes are a fixed enum 0..16; pre-compute the ASCII
+    // byte[] for each so EncodeTrailers does not call int.ToString +
+    // Encoding.ASCII.GetBytes on every successful RPC (the OK=0 path is
+    // the dominant case).
+    private static readonly byte[][] s_grpcStatusBytes = BuildGrpcStatusTable();
+
+    private static byte[][] BuildGrpcStatusTable()
+    {
+        // StatusCode enum spans 0..16 (OK through Unauthenticated).
+        var table = new byte[17][];
+        for (int i = 0; i < table.Length; i++)
+        {
+            table[i] = Encoding.ASCII.GetBytes(i.ToString(CultureInfo.InvariantCulture));
+        }
+        return table;
+    }
+
+    private static byte[] GetGrpcStatusBytes(StatusCode code)
+    {
+        var i = (int)code;
+        if ((uint)i < (uint)s_grpcStatusBytes.Length)
+        {
+            return s_grpcStatusBytes[i];
+        }
+        // Defensive fallback for future enum extensions / out-of-range values.
+        return Encoding.ASCII.GetBytes(i.ToString(CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>
+    /// Returns a lowercase rendering of <paramref name="key"/> without
+    /// allocating when the string is already entirely lowercase. gRPC
+    /// metadata key validation in <c>Grpc.Core.Metadata.Entry</c> already
+    /// enforces lowercase, so in practice this fast-path hits ~100 % and
+    /// avoids one string alloc per metadata entry per header frame.
+    /// </summary>
+    private static string ToHeaderName(string key)
+    {
+        for (int i = 0; i < key.Length; i++)
+        {
+            var c = key[i];
+            if (c >= 'A' && c <= 'Z')
+            {
+                return key.ToLowerInvariant();
+            }
+        }
+        return key;
+    }
+
     /// <summary>
     /// Returns true if a gRPC header name marks a binary metadata header
     /// (gRFC G2 / gRPC-over-HTTP/2 spec): keys ending in <c>-bin</c> carry
@@ -130,15 +190,15 @@ internal static class HpackHeadersAdapter
         if (headers.HeaderType == 0)
         {
             // Client-initial: pseudo-headers required by gRPC over HTTP/2 (A4)
-            list.Add((PseudoMethod, Encoding.ASCII.GetBytes("POST")));
-            list.Add((PseudoScheme, Encoding.ASCII.GetBytes("http")));
+            list.Add((PseudoMethod, s_methodPostBytes));
+            list.Add((PseudoScheme, s_schemeHttpBytes));
             list.Add((PseudoPath, Encoding.UTF8.GetBytes(headers.Method ?? "/")));
             if (!string.IsNullOrEmpty(headers.Authority))
             {
                 list.Add((PseudoAuthority, Encoding.UTF8.GetBytes(headers.Authority!)));
             }
-            list.Add((ContentType, Encoding.ASCII.GetBytes(ContentTypeGrpc)));
-            list.Add((TeHeader, Encoding.ASCII.GetBytes(TeTrailers)));
+            list.Add((ContentType, s_contentTypeGrpcBytes));
+            list.Add((TeHeader, s_teTrailersBytes));
             if (headers.DeadlineUnixNano != 0)
             {
                 list.Add((GrpcTimeout, Encoding.ASCII.GetBytes(EncodeTimeout(headers.DeadlineUnixNano))));
@@ -147,13 +207,13 @@ internal static class HpackHeadersAdapter
         else
         {
             // Server-initial: :status only
-            list.Add((PseudoStatus, Encoding.ASCII.GetBytes("200")));
-            list.Add((ContentType, Encoding.ASCII.GetBytes(ContentTypeGrpc)));
+            list.Add((PseudoStatus, s_status200Bytes));
+            list.Add((ContentType, s_contentTypeGrpcBytes));
         }
 
         foreach (var kv in headers.Metadata)
         {
-            var lowerName = kv.Key.ToLowerInvariant();
+            var lowerName = ToHeaderName(kv.Key);
             foreach (var v in kv.Values)
             {
                 AddMetadataValue(list, lowerName, v);
@@ -169,14 +229,14 @@ internal static class HpackHeadersAdapter
     public static (byte[] Buffer, int Length) EncodeTrailers(TrailersV1 trailers)
     {
         var list = new List<(string Name, byte[] Value)>(2 + trailers.Metadata.Count);
-        list.Add((GrpcStatus, Encoding.ASCII.GetBytes(((int)trailers.GrpcStatusCode).ToString(CultureInfo.InvariantCulture))));
+        list.Add((GrpcStatus, GetGrpcStatusBytes(trailers.GrpcStatusCode)));
         if (!string.IsNullOrEmpty(trailers.GrpcStatusMessage))
         {
             list.Add((GrpcMessage, Encoding.UTF8.GetBytes(GrpcMessageEncoder.Encode(trailers.GrpcStatusMessage!))));
         }
         foreach (var kv in trailers.Metadata)
         {
-            var lowerName = kv.Key.ToLowerInvariant();
+            var lowerName = ToHeaderName(kv.Key);
             foreach (var v in kv.Values)
             {
                 AddMetadataValue(list, lowerName, v);

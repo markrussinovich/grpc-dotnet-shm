@@ -49,6 +49,11 @@ public sealed class ShmControlHandler : HttpMessageHandler
     private readonly ShmConnectionPool? _pool;
     private int _disposed;
 
+    // Round-8 PR-C1: cache the HttpResponseMessage.Version value once.
+    // `new Version(2, 0)` per RPC is one allocation per response on the
+    // unary hot path; the immutable singleton is safe to share.
+    private static readonly Version s_http20Version = new(2, 0);
+
     // Diagnostic counters for the wake-coalescing path; visible to bench.
     internal static long s_unaryRequests;
     internal static long s_streamingRequests;
@@ -268,8 +273,12 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
         if (request.Content != null)
         {
-            var writeStream = new ShmGrpcRequestStream(stream);
-            _ = SendBodyAsync(writeStream, request.Content, stream, cancellationToken);
+            // Round-8 PR-C1: SendBodyAsync owns the ShmGrpcRequestStream
+            // lifecycle via `using` (was leaked here on every RPC where
+            // the marshaller didn't take the IDirectMessageWriter fast
+            // path — _bodyBuf rented by the multi-fragment WriteAsync
+            // path was never returned to ArrayPool).
+            _ = SendBodyAsync(request.Content, stream, cancellationToken);
         }
         else
         {
@@ -297,7 +306,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
         var response = new HttpResponseMessage(HttpStatusCode.OK)
         {
             Content = responseContent,
-            Version = new Version(2, 0)
+            Version = s_http20Version
         };
         responseContent.SetTrailingHeaders(response.TrailingHeaders);
 
@@ -337,12 +346,23 @@ public sealed class ShmControlHandler : HttpMessageHandler
     /// Runs inline for unary calls (completes before yielding) and
     /// naturally yields for streaming calls via the async state machine.
     /// </summary>
+    /// <summary>
+    /// Sends the request body and half-close on the given stream.
+    /// Runs inline for unary calls (completes before yielding) and
+    /// naturally yields for streaming calls via the async state machine.
+    /// Round-8 PR-C1: constructs and OWNS the
+    /// <see cref="ShmGrpcRequestStream"/> lifecycle via <c>using</c>
+    /// to guarantee <c>_bodyBuf</c> returns to the pool on every exit
+    /// (success, exception, cancellation). Prior shape (caller-owned
+    /// stream + fire-and-forget call) leaked the pooled buffer on
+    /// custom HttpContent and multi-fragment WriteAsync paths.
+    /// </summary>
     private static async Task SendBodyAsync(
-        ShmGrpcRequestStream writeStream,
         HttpContent content,
         ShmGrpcStream stream,
         CancellationToken cancellationToken)
     {
+        using var writeStream = new ShmGrpcRequestStream(stream);
         try
         {
             await content.CopyToAsync(writeStream, cancellationToken).ConfigureAwait(false);
@@ -411,92 +431,125 @@ public sealed class ShmControlHandler : HttpMessageHandler
             // Send CONNECT request with preferred ring capacity from client options.
             // Server will negotiate: Min(clientPreferred, serverMax). Value 0 = use server default.
             // Wire format is always HTTP/2 (advertised in the extension).
+            //
+            // Nonce coordination (gRFC A — Stale Response Correlation):
+            // generate a fresh 8-byte CSPRNG nonce per CONNECT. The
+            // server echoes it in ACCEPT/REJECT so we can detect and
+            // skip stale responses left on the shared Ring B by a
+            // previously timed-out dialer (which would otherwise
+            // mis-bind us to the wrong peer's segment with the wrong
+            // singleStreamMode flag). Bounded skip loop matches
+            // grpc-go-shmem's maxStaleResponses=3.
             var preferredRing = _options.RingCapacity;
+            var ourNonce = ControlWire.NewConnectNonce();
             await WriteControlFrameAsync(ctlTx, FrameType.Connect,
-                ControlWire.EncodeConnectRequest(preferredRing, preferredRing, _options.SingleStreamMode), ct).ConfigureAwait(false);
+                ControlWire.EncodeConnectRequest(preferredRing, preferredRing, _options.SingleStreamMode, ourNonce), ct).ConfigureAwait(false);
 
-            // Read response
-            var (responseHeader, responsePayload) = await ReadControlFrameAsync(ctlRx, ct).ConfigureAwait(false);
-
-            switch (responseHeader.Type)
+            const int maxStaleResponses = 3;
+            for (int attempt = 0; attempt <= maxStaleResponses; attempt++)
             {
-                case FrameType.Accept:
-                    var dataSegmentName = ControlWire.DecodeConnectResponse(responsePayload.Span);
+                // Read response
+                var (responseHeader, responsePayload) = await ReadControlFrameAsync(ctlRx, ct).ConfigureAwait(false);
 
-                    // Open the data segment
-                    var dataSegment = Segment.Open(dataSegmentName);
-                    try
-                    {
-                        await dataSegment.WaitForServerAsync(ct).ConfigureAwait(false);
-
-                        // Signal that client has mapped the segment
-                        dataSegment.SetClientReady(true);
-
-                        // Optional security handshake on the data segment
-                        // BEFORE we hand it to ShmConnection — the connection
-                        // ctor starts the frame reader loop which would
-                        // otherwise race the handshake frame I/O. Mirrors
-                        // grpc-go-shmem's transport-layer
-                        // ShmSecurityHandshaker.ClientHandshake.
-                        ShmAuthInfo? authInfo = null;
-                        if (_options.Handshaker != null)
+                switch (responseHeader.Type)
+                {
+                    case FrameType.Accept:
+                        var (dataSegmentName, acceptNonce) = ControlWire.DecodeConnectResponse(responsePayload.Span);
+                        if (acceptNonce != ourNonce)
                         {
-                            // From the client's perspective: RingA is
-                            // client→server (we write), RingB is
-                            // server→client (we read).
-                            authInfo = await _options.Handshaker.ClientHandshakeAsync(
-                                writer: (type, payload, c) => WriteHandshakeFrameAsync(dataSegment.RingA, type, payload, c),
-                                reader: c => ReadHandshakeFrameAsync(dataSegment.RingB, c),
-                                ct).ConfigureAwait(false);
+                            // Stale ACCEPT from a previous dialer; skip
+                            // and keep reading for OUR response.
+                            continue;
                         }
 
-                        // Wire format is always HTTP/2 — the protocol layer rejected
-                        // anything else.
-                        // Create and return the connection
-                        var conn = ShmConnection.FromClientSegment(dataSegmentName, dataSegment);
-                        conn.AuthInfo = authInfo;
-                        if (_options.SingleStreamMode)
+                        // Open the data segment
+                        var dataSegment = Segment.Open(dataSegmentName);
+                        try
                         {
-                            conn.ZeroCopyRead = true;
-                            // SingleStreamMode propagates to TxRing/RxRing
-                            // (see ShmConnection.SingleStreamMode setter), so
-                            // the chain-ZC budget on the data rings reflects
-                            // the negotiated mode and the client-side inline-
-                            // write fast paths are unlocked.
-                            //
-                            // Correctness depends on `SendRequestHeadersAsync`
-                            // taking the TryPauseWriterLoop inline-write path
-                            // when this flag is set so Headers, Message, and
-                            // HalfClose all serialise through the same inline
-                            // writer (no concurrent WriterLoop dequeue racing
-                            // against an inline writer on the same ring).
-                            conn.SingleStreamMode = true;
-                            conn.FrameWriter?.EnableSingleStreamMode();
+                            await dataSegment.WaitForServerAsync(ct).ConfigureAwait(false);
+
+                            // Signal that client has mapped the segment
+                            dataSegment.SetClientReady(true);
+
+                            // Optional security handshake on the data segment
+                            // BEFORE we hand it to ShmConnection — the connection
+                            // ctor starts the frame reader loop which would
+                            // otherwise race the handshake frame I/O. Mirrors
+                            // grpc-go-shmem's transport-layer
+                            // ShmSecurityHandshaker.ClientHandshake.
+                            ShmAuthInfo? authInfo = null;
+                            if (_options.Handshaker != null)
+                            {
+                                // From the client's perspective: RingA is
+                                // client→server (we write), RingB is
+                                // server→client (we read).
+                                authInfo = await _options.Handshaker.ClientHandshakeAsync(
+                                    writer: (type, payload, c) => WriteHandshakeFrameAsync(dataSegment.RingA, type, payload, c),
+                                    reader: c => ReadHandshakeFrameAsync(dataSegment.RingB, c),
+                                    ct).ConfigureAwait(false);
+                            }
+
+                            // Wire format is always HTTP/2 — the protocol layer rejected
+                            // anything else.
+                            // Create and return the connection
+                            var conn = ShmConnection.FromClientSegment(dataSegmentName, dataSegment);
+                            conn.AuthInfo = authInfo;
+                            if (_options.SingleStreamMode)
+                            {
+                                conn.ZeroCopyRead = true;
+                                // SingleStreamMode propagates to TxRing/RxRing
+                                // (see ShmConnection.SingleStreamMode setter), so
+                                // the chain-ZC budget on the data rings reflects
+                                // the negotiated mode and the client-side inline-
+                                // write fast paths are unlocked.
+                                //
+                                // Correctness depends on `SendRequestHeadersAsync`
+                                // taking the TryPauseWriterLoop inline-write path
+                                // when this flag is set so Headers, Message, and
+                                // HalfClose all serialise through the same inline
+                                // writer (no concurrent WriterLoop dequeue racing
+                                // against an inline writer on the same ring).
+                                conn.SingleStreamMode = true;
+                                conn.FrameWriter?.EnableSingleStreamMode();
+                            }
+                            if (_options.InlineReceiveContinuations)
+                            {
+                                // Local receive-side opt-in: only affects this
+                                // client's Channel<InboundFrame> dispatch, not
+                                // the wire protocol. Each side picks its own
+                                // continuation model independently. See
+                                // ShmConnection.InlineReceiveContinuations.
+                                conn.InlineReceiveContinuations = true;
+                            }
+                            return conn;
                         }
-                        if (_options.InlineReceiveContinuations)
+                        catch
                         {
-                            // Local receive-side opt-in: only affects this
-                            // client's Channel<InboundFrame> dispatch, not
-                            // the wire protocol. Each side picks its own
-                            // continuation model independently. See
-                            // ShmConnection.InlineReceiveContinuations.
-                            conn.InlineReceiveContinuations = true;
+                            dataSegment.Dispose();
+                            throw;
                         }
-                        return conn;
-                    }
-                    catch
-                    {
-                        dataSegment.Dispose();
-                        throw;
-                    }
 
-                case FrameType.Reject:
-                    var message = ControlWire.DecodeConnectReject(responsePayload.Span);
-                    throw new InvalidOperationException($"Connection rejected by server: {message}");
+                    case FrameType.Reject:
+                        var (message, rejectNonce) = ControlWire.DecodeConnectReject(responsePayload.Span);
+                        if (rejectNonce != ourNonce)
+                        {
+                            // Stale REJECT (or 0-nonce decode-failure
+                            // REJECT for a previous dialer); skip.
+                            continue;
+                        }
+                        throw new InvalidOperationException($"Connection rejected by server: {message}");
 
-                default:
-                    throw new InvalidOperationException($"Unexpected response frame type: {responseHeader.Type}");
+                    default:
+                        throw new InvalidOperationException($"Unexpected response frame type: {responseHeader.Type}");
+                }
             }
+
+            // Exhausted the stale-skip budget without seeing our nonce.
+            // Treat as a soft handshake failure: the legitimate response
+            // is either delayed past our patience or got mis-consumed by
+            // an earlier dialer that beat us to Ring B reads.
+            throw new InvalidOperationException(
+                $"No matching connect response after {maxStaleResponses + 1} attempts (stale-skip budget exhausted).");
         }
         finally
         {
@@ -628,7 +681,12 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
     private static Metadata? ExtractMetadata(HttpRequestHeaders headers)
     {
-        var metadata = new Metadata();
+        // Round-7 perf: lazy-allocate. The dominant case (gRPC unary call
+        // with no user metadata) walks the headers, hits no surviving
+        // entry, and the old code still allocated a fresh Metadata
+        // instance just to return null. Allocate only when we find the
+        // first non-skipped entry — saves one alloc per RPC.
+        Metadata? metadata = null;
 
         foreach (var header in headers)
         {
@@ -650,18 +708,18 @@ public sealed class ShmControlHandler : HttpMessageHandler
                     // Binary metadata — skip malformed base64 instead of crashing.
                     try
                     {
-                        metadata.Add(new Metadata.Entry(header.Key, Convert.FromBase64String(value)));
+                        (metadata ??= new Metadata()).Add(new Metadata.Entry(header.Key, Convert.FromBase64String(value)));
                     }
                     catch (FormatException) { /* malformed base64 — skip */ }
                 }
                 else
                 {
-                    metadata.Add(new Metadata.Entry(header.Key, value));
+                    (metadata ??= new Metadata()).Add(new Metadata.Entry(header.Key, value));
                 }
             }
         }
 
-        return metadata.Count > 0 ? metadata : null;
+        return metadata;
     }
 
     private static DateTime? ExtractDeadline(HttpRequestHeaders headers)
@@ -847,9 +905,21 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
     private int _bodyBufLen;
     private int _bodyExpected;
 
+    // Round-8 PR-C1: test-only counter that lets regression tests assert
+    // every constructed stream was matched by a Dispose. Tracks the number
+    // of instances currently outstanding (incremented in ctor, decremented
+    // in Dispose). A non-zero post-RPC value means SendBodyAsync (or
+    // another caller) leaked the stream and therefore leaked `_bodyBuf`
+    // back to GC instead of the ArrayPool. Live counter (not interlocked
+    // for raw value but the +/- pair is via Interlocked) so a thread-safe
+    // observer can read it.
+    internal static int LiveInstanceCount => Volatile.Read(ref s_liveInstanceCount);
+    private static int s_liveInstanceCount;
+
     public ShmGrpcRequestStream(ShmGrpcStream shmStream)
     {
         _shmStream = shmStream;
+        Interlocked.Increment(ref s_liveInstanceCount);
     }
 
     protected override void Dispose(bool disposing)
@@ -858,6 +928,10 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         {
             ArrayPool<byte>.Shared.Return(_bodyBuf);
             _bodyBuf = null;
+        }
+        if (disposing)
+        {
+            Interlocked.Decrement(ref s_liveInstanceCount);
         }
         base.Dispose(disposing);
     }
@@ -997,6 +1071,28 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         Action<TMessage, Grpc.Core.SerializationContext> serializer,
         CancellationToken cancellationToken)
     {
+        // SAFE-INLINE-RECEIVE DEADLOCK GUARD (2026-06-01): when the
+        // caller is running inline on the SHM frame-reader Thread (a
+        // direct consequence of AllowSynchronousContinuations=true
+        // on the inbound channel) AND the upcoming write would block
+        // on per-stream / connection send quota, hop off to a
+        // ThreadPool worker before descending into the inline-direct
+        // path — otherwise WriteInlineDirectMultiFrame's inner
+        // ReserveSendQuotaOrBlock parks the reader Thread on
+        // _sendQuotaWake and the peer's WINDOW_UPDATE can never be
+        // processed (no Thread left to read it). Confirmed by
+        // dotnet-dump on the demo bench 64 MiB max ping-pong hang.
+        // Mirrors the same guard already present on
+        // ShmGrpcStream.SendMessageAsync; required here because this
+        // path takes the WriteInlineDirectMultiFrame fast path that
+        // bypasses SendMessageAsync.
+        if (ShmReaderThreadContext.IsOnReaderThread
+            && message is Google.Protobuf.IMessage protoSizeProbe
+            && _shmStream.WouldBlockSendQuota(5 + protoSizeProbe.CalculateSize()))
+        {
+            return WriteSerializedMessageWithReaderThreadHopAsync(message, serializer, cancellationToken);
+        }
+
         // Fast path: for protobuf IMessage types in singleStreamMode,
         // serialize directly into the ring buffer via
         // WriteInlineDirectMultiFrame (zero intermediate buffer).
@@ -1018,49 +1114,51 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
             {
                 var size = protoMsg.CalculateSize();
 
-                // Client-coalesce path (next-PR optimisation):
+                // Client-coalesce path (PR #21 + round-11 multi-frame
+                // expansion):
                 //
                 // When ShmControlHandler.SendOnStreamAsync detected a
                 // Unary-shaped request (PushUnaryContent / UnaryContent /
                 // WinHttpUnaryContent) it called StageRequestHeaders
                 // instead of SendRequestHeadersAsync, deferring the
                 // Headers wire write to right here. If the protobuf
-                // body fits in ONE wrap-safe H2 DATA frame AND the
-                // size is below the per-call latency cap, we open one
-                // inline batch and write HEADERS + DATA(END_STREAM)
+                // body fits within the multi-frame coalesce gate (lpm
+                // <= cap/8, no FairMaxFramePayload clamp), the size is
+                // below the per-call latency cap, and both stream + conn
+                // flow-control windows can absorb the full lpm, we open
+                // one inline batch and write HEADERS + DATA(END_STREAM)
                 // back-to-back -> 1 SignalData wake for the entire
-                // request (vs 3 wakes today: Headers + Data + HalfClose).
+                // request (vs 3 wakes today: Headers + Data + HalfClose;
+                // round-9 unary saved this for <= FairMax; round-11
+                // multi-frame extends to ~64 KiB Fair / 128 KiB Jumbo32).
                 //
-                // Two thresholds:
-                //   - writer.CanCoalesceInlineMessage(5 + size) is the
-                //     correctness gate (wrap-safe cap/8 from PR #21).
-                //   - CoalesceLatencyCapBytes is a per-call blast-radius
-                //     cap: even if cap/8 = 8 MiB allows a 1 MiB Unary
-                //     to "coalesce", holding the pause for that long
-                //     would starve other concurrent streams' wakes.
-                //     ~64 KiB matches the bench's small-Unary cell
-                //     range where the wake savings (10-15 us) dominate
-                //     over the marginal pause cost.
-                const int CoalesceLatencyCapBytes = 64 * 1024;
+                // Three thresholds:
+                //   - writer.CanCoalesceMultiFrameMessage(5 + size) is
+                //     the F1 correctness gate (cumulative bytes fit
+                //     cap/8 ring space — the writer may still emit N
+                //     FairMax-sized H2 DATA frames under the suppressed
+                //     wake without filling the ring).
+                //   - ShmFrameWriter.CoalesceLatencyCapBytes (128 KiB)
+                //     is a per-call blast-radius cap on how long the
+                //     paused WriterLoop / suppressed control frames
+                //     can be held — bounds tail latency for concurrent
+                //     control traffic.
+                //   - _shmStream.SendQuota >= lpm AND
+                //     _shmStream.Connection.ConnSendQuota >= lpm are
+                //     the F2 deadlock guard: suppressed HEADERS hides
+                //     our DATA from peer, so if inner per-chunk
+                //     ReserveSendQuotaOrBlock blocks waiting for WU
+                //     the peer would never know to send one. Pre-check
+                //     covers BOTH resources the reserve will debit
+                //     (stream + conn). Snapshot is sound because this
+                //     stream is single-producer for sends and WU only
+                //     INCREASES quota.
                 var lpmFramedSize = 5 + size;
-                // HTTP/2 send-quota gate: the coalesce branch opens
-                // BeginInlineBatch which SUPPRESSES the HEADERS wake until
-                // EndInlineBatch fires. WriteInlineDirectMultiFrame then
-                // calls ReserveSendQuotaOrBlock(lpmFramedSize) on the
-                // stream — if that blocks (quota < lpmFramedSize), the
-                // peer never sees the suppressed HEADERS, so no
-                // WINDOW_UPDATE can flow, deadlocking the stream
-                // (same F1/F2 shape as PR #21, just via FC quota).
-                // Pre-check the snapshot — this stream is single-producer
-                // for sends so the quota only grows from here until we
-                // call ReserveSendQuotaOrBlock. If insufficient, fall
-                // through to the safe non-batched fall-back path which
-                // commits HEADERS first (firing its own wake), letting
-                // the peer drain DATA and send WINDOW_UPDATE.
                 if (_shmStream.HasStagedHeaders
-                    && size <= CoalesceLatencyCapBytes
-                    && writer.CanCoalesceInlineMessage(lpmFramedSize)
+                    && lpmFramedSize <= ShmFrameWriter.CoalesceLatencyCapBytes
+                    && writer.CanCoalesceMultiFrameMessage(lpmFramedSize)
                     && _shmStream.SendQuota >= lpmFramedSize
+                    && _shmStream.Connection.ConnSendQuota >= lpmFramedSize
                     && writer.TryPauseWriterLoop())
                 {
                     try
@@ -1097,6 +1195,29 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 
                 if (writer.TryPauseWriterLoop())
                 {
+                    // Round-11 multi-frame streaming coalesce: when the
+                    // protobuf body exceeds the FairMaxFramePayload H2
+                    // frame cap (e.g., 16 KiB Fair = 16389 lpm spilling
+                    // into 2 chunks), WriteInlineDirectMultiFrame today
+                    // emits per-chunk SignalData wakes. Wrap the whole
+                    // call in BeginInlineBatch so N chunks collapse to
+                    // 1 wake at EndInlineBatch.
+                    //
+                    // Gates mirror Site 1 (unary) minus HasStagedHeaders:
+                    //   - lpm <= 128 KiB latency cap
+                    //   - CanCoalesceMultiFrameMessage (cap/8 ring space,
+                    //     no FairMax clamp)
+                    //   - stream + conn SendQuota >= lpm (F2 deadlock guard)
+                    // size==0 path is a single WriteInline commit with
+                    // no multi-frame to coalesce — skip the batch (no
+                    // gain, ~10ns saved).
+                    // (lpmFramedSize already computed for Site 1 gate above.)
+                    bool coalesce = size > 0
+                        && lpmFramedSize <= ShmFrameWriter.CoalesceLatencyCapBytes
+                        && writer.CanCoalesceMultiFrameMessage(lpmFramedSize)
+                        && _shmStream.SendQuota >= lpmFramedSize
+                        && _shmStream.Connection.ConnSendQuota >= lpmFramedSize;
+                    if (coalesce) writer.BeginInlineBatch();
                     try
                     {
                         writer.WriteInlineDirectMultiFrame(_shmStream.StreamId, size, protoMsg, 0, default, _shmStream);
@@ -1104,6 +1225,7 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
                     }
                     finally
                     {
+                        if (coalesce) writer.EndInlineBatch();
                         writer.ResumeWriterLoop();
                     }
                 }
@@ -1119,6 +1241,21 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         var ctx = new DirectWriteSerializationContext(_shmStream);
         serializer(message, ctx);
         return ctx.SendResult(cancellationToken);
+    }
+
+    /// <summary>
+    /// Slow-path helper for <see cref="WriteSerializedMessageAsync"/>:
+    /// hops off the SHM frame-reader Thread via <see cref="Task.Yield"/>
+    /// before recursing into the normal send path. See
+    /// <see cref="ShmReaderThreadContext"/> for the deadlock invariant.
+    /// </summary>
+    private async Task WriteSerializedMessageWithReaderThreadHopAsync<TMessage>(
+        TMessage message,
+        Action<TMessage, Grpc.Core.SerializationContext> serializer,
+        CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+        await WriteSerializedMessageAsync(message, serializer, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task WriteFlushHeadersThenMessageAsync<TMessage>(
@@ -1423,6 +1560,19 @@ internal sealed class ShmControlResponseContent : HttpContent,
     private LazyChainRos? _lazyChain;
     private bool _lazyChainSawEndStream;
 
+    // Multi-frame eager-pre-fetch state (deadlock-safe replacement for
+    // <see cref="LazyChainRos"/> on chain-ZC-budget-fitting LPMs;
+    // see <see cref="InboundChainHelper"/>). When non-null, holds every
+    // chunk of the most-recently-returned multi-frame uncompressed
+    // message. Same ownership protocol as <see cref="_lazyChain"/>:
+    // released at the top of the next <c>ReadNextMessage*</c> call,
+    // and if any chunk carried <see cref="MessageFlags.EndStream"/>
+    // we surface <c>(Empty, true)</c> on that next call (preserving
+    // the existing caller contract that EndStream is observed AFTER
+    // the message ROS is fully consumed).
+    private List<InboundFrame>? _prefetchedChunks;
+    private bool _prefetchedSawEndStream;
+
     // Multi-frame accumulation (compressed path only). Allocated lazily
     // via ArrayPool when the compressed code path needs a contiguous
     // buffer; returned to ArrayPool on Dispose. ArrayPool's LOH bucket
@@ -1619,9 +1769,31 @@ internal sealed class ShmControlResponseContent : HttpContent,
             }
         }
 
+        // Same release/EOS pattern for the eager-pre-fetch path.
+        if (_prefetchedChunks != null)
+        {
+            InboundChainHelper.ReleaseAll(_prefetchedChunks);
+            _prefetchedChunks = null;
+            if (_prefetchedSawEndStream)
+            {
+                _prefetchedSawEndStream = false;
+                _stream.MarkHalfCloseReceived();
+                ApplyTrailers();
+                return new ValueTask<(ReadOnlySequence<byte>, bool)>((ReadOnlySequence<byte>.Empty, true));
+            }
+        }
+
         // Fast path: try sync read.
         while (_stream.TryReceiveFrame(out var frame))
         {
+            // Multi-frame uncompressed first-chunk: take the
+            // deadlock-safe async path (hybrid eager-pre-fetch or
+            // yield-then-lazy; see InboundChainHelper). Must be
+            // dispatched as ValueTask because the helper is async.
+            if (TryDetectMultiFrameUncompressedFirstChunk(frame, out int lpmBodyLen))
+            {
+                return PrefetchMultiFrameAndBuildAsync(frame, lpmBodyLen, cancellationToken);
+            }
             var result = ProcessReceivedFrame(frame);
             if (result.Payload.Length == 0 && !result.EndOfStream)
                 continue;
@@ -1629,6 +1801,127 @@ internal sealed class ShmControlResponseContent : HttpContent,
         }
 
         return ReadNextMessageSlowAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> iff <paramref name="frame"/>
+    /// is the first chunk of a multi-frame UNCOMPRESSED LPM the
+    /// caller has not yet started accumulating. Sets
+    /// <paramref name="lpmBodyLen"/> from the LPM header. Mirrors
+    /// the server-side detector in
+    /// <c>ShmAsyncStreamReader.TryDetectMultiFrameUncompressedFirstChunk</c>.
+    /// </summary>
+    private bool TryDetectMultiFrameUncompressedFirstChunk(
+        InboundFrame frame, out int lpmBodyLen)
+    {
+        lpmBodyLen = 0;
+        if (frame.Type != FrameType.Message) return false;
+        if ((frame.Flags & MessageFlags.More) == 0) return false;
+        // Must be the first chunk: no multi-frame already in flight
+        // (neither the legacy lazy-chain compressed path nor a chain
+        // segment list nor the legacy _assembled compressed buffer).
+        if (_chainHead != null || _assembledPos != 0 || _lazyChain != null) return false;
+        if (frame.Length < 5) return false;
+        if (frame.Memory.Span[0] != 0) return false;
+        lpmBodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
+            frame.Memory.Span.Slice(1, 4));
+        return true;
+    }
+
+    /// <summary>
+    /// Deadlock-safe async parse of a multi-frame uncompressed LPM.
+    /// Hybrid dispatch: eager pre-fetch when the LPM fits the chain-ZC
+    /// budget (no extra memory cost because chain-ZC already freezes
+    /// the ring for the LPM duration); Task.Yield off the reader
+    /// Thread + existing <see cref="LazyChainRos"/> otherwise (keeps
+    /// pool footprint at ~2 frames for messages &gt; budget).
+    /// On the eager path the returned ROS is fully materialised so
+    /// the caller's <c>MergeFrom(ROS)</c> never pulls — safe under
+    /// inline-receive-continuations.
+    /// </summary>
+    private async ValueTask<(ReadOnlySequence<byte> Payload, bool EndOfStream)> PrefetchMultiFrameAndBuildAsync(
+        InboundFrame firstFrame, int lpmBodyLen, CancellationToken cancellationToken)
+    {
+        var ct = cancellationToken.CanBeCanceled
+            ? cancellationToken
+            : _stream.DisposeCancellationToken;
+
+        if (!InboundChainHelper.ShouldEagerPrefetch(_stream, lpmBodyLen))
+        {
+            // Huge non-ZC fallback: build a LazyChainRos that pulls
+            // chunks synchronously inside MergeFrom, but FIRST hop
+            // off the reader Thread so the sync pulls block a TP
+            // worker (not the reader Thread that's responsible for
+            // delivering subsequent chunks).
+            await InboundChainHelper.HopOffReaderThreadIfNeededAsync().ConfigureAwait(false);
+
+            // EndStream on the first chunk is unusual but valid.
+            if ((firstFrame.Flags & MessageFlags.EndStream) != 0)
+            {
+                _lazyChainSawEndStream = true;
+            }
+
+            InboundFrame? Pull(CancellationToken pullCt)
+            {
+                var pulled = _stream.ReceiveFrameSync(pullCt);
+                if (pulled is null) return null;
+                if (pulled.Value.Type != FrameType.Message)
+                {
+                    pulled.Value.ReturnToPool();
+                    return null;
+                }
+                if ((pulled.Value.Flags & MessageFlags.EndStream) != 0)
+                {
+                    _lazyChainSawEndStream = true;
+                }
+                return pulled.Value;
+            }
+
+            _lazyChain = new LazyChainRos(
+                firstFrame, firstFrameBodyOffset: 5,
+                totalBodyLen: lpmBodyLen,
+                pullNext: Pull,
+                ct: _stream.DisposeCancellationToken);
+            return (_lazyChain.Sequence, false);
+        }
+
+        // Eager pre-fetch path.
+        bool sawEndStream = false;
+        Action onEndStream = () => sawEndStream = true;
+
+        var chunks = await InboundChainHelper.PrefetchAllChunksAsync(
+            _stream, firstFrame, firstFrameBodyOffset: 5,
+            totalBodyLen: lpmBodyLen,
+            onEndStream: onEndStream,
+            cancellationToken: ct).ConfigureAwait(false);
+
+        // Defensive try/catch around BuildSequence: if the segment math
+        // throws AFTER a successful prefetch but BEFORE _prefetchedChunks
+        // captures ownership, the chunks would be stranded and the chain-ZC
+        // anchor would stay open — freezing header.ReadIdx → connection-wide
+        // RX stall. BuildSequence's bounds are guaranteed satisfied by
+        // PrefetchAllChunksAsync's invariants (length >= 5, offset = 5),
+        // so this is defense-in-depth; the server eager paths
+        // (ShmGrpcServer.UnaryHandler / ShmAsyncStreamReader) wrap their
+        // BuildSequence calls in finally/try-catch with the same release
+        // semantics.
+        ReadOnlySequence<byte> ros;
+        try
+        {
+            ros = InboundChainHelper.BuildSequence(
+                chunks, firstFrameBodyOffset: 5, totalBodyLen: lpmBodyLen);
+        }
+        catch
+        {
+            InboundChainHelper.ReleaseAll(chunks);
+            throw;
+        }
+        _prefetchedChunks = chunks;
+        _prefetchedSawEndStream = sawEndStream;
+        // Preserve the legacy contract: return (ROS, false) here and
+        // surface EndStream on the NEXT ReadNextMessageAsync call
+        // (after the caller has consumed the ROS).
+        return (ros, false);
     }
 
     private (ReadOnlySequence<byte> Payload, bool EndOfStream) ProcessReceivedFrame(InboundFrame frame)
@@ -1655,57 +1948,18 @@ internal sealed class ShmControlResponseContent : HttpContent,
                 //     _assembled until END.
                 if ((frame.Flags & MessageFlags.More) != 0)
                 {
-                    bool firstChunk = _chainHead == null && _assembledPos == 0 && _lazyChain == null;
+                    bool firstChunk = _chainHead == null && _assembledPos == 0 && _lazyChain == null && _prefetchedChunks == null;
 
-                    // Multi-frame UNCOMPRESSED messages take the
-                    // LazyChainRos path. Synchronously pulls subsequent
-                    // chunks as the caller's MergeFrom advances; pool
-                    // buffer footprint drops from O(message-size) to ~2
-                    // chunks. EndStream is captured by the puller closure
-                    // and surfaced on the NEXT ReadNextMessage* call.
-                    if (firstChunk && frame.Length >= 5 && frame.Memory.Span[0] == 0)
-                    {
-                        var lpmBodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
-                            frame.Memory.Span.Slice(1, 4));
-
-                        InboundFrame? Pull(CancellationToken pullCt)
-                        {
-                            var pulled = _stream.ReceiveFrameSync(pullCt);
-                            if (pulled is null) return null;
-                            if (pulled.Value.Type != FrameType.Message)
-                            {
-                                // Non-Message frame mid-LPM-body: release
-                                // and treat as truncation; the original
-                                // frame will be re-processed on the next
-                                // ReadNextMessage call.
-                                pulled.Value.ReturnToPool();
-                                return null;
-                            }
-                            if ((pulled.Value.Flags & MessageFlags.EndStream) != 0)
-                            {
-                                _lazyChainSawEndStream = true;
-                            }
-                            return pulled.Value;
-                        }
-
-                        // EndStream may also be set on the FIRST chunk
-                        // itself (More=1 + EndStream is unusual but
-                        // theoretically valid).
-                        if ((frame.Flags & MessageFlags.EndStream) != 0)
-                        {
-                            _lazyChainSawEndStream = true;
-                        }
-
-                        _lazyChain = new LazyChainRos(
-                            frame, firstFrameBodyOffset: 5,
-                            totalBodyLen: lpmBodyLen,
-                            pullNext: Pull,
-                            ct: _stream.DisposeCancellationToken);
-                        // Return ROS to the caller. EndStream is NOT yet
-                        // known - it surfaces on the NEXT ReadNextMessage
-                        // call once the puller sees the final chunk.
-                        return (_lazyChain.Sequence, false);
-                    }
+                    // NOTE: the multi-frame UNCOMPRESSED first-chunk
+                    // case is intercepted earlier in
+                    // ReadNextMessageAsync / ReadNextMessageSlowAsync
+                    // via TryDetectMultiFrameUncompressedFirstChunk +
+                    // PrefetchMultiFrameAndBuildAsync (the safe
+                    // hybrid eager-pre-fetch / yield-then-lazy path).
+                    // ProcessReceivedFrame should never see that case
+                    // as a first chunk; only compressed multi-frame
+                    // first chunks and subsequent chunks of an already
+                    // accumulating chain reach here.
 
                     bool useChain;
                     if (firstChunk)
@@ -1900,6 +2154,11 @@ internal sealed class ShmControlResponseContent : HttpContent,
 
                 if (_stream.TryReceiveFrame(out var frame))
                 {
+                    if (TryDetectMultiFrameUncompressedFirstChunk(frame, out int lpmBodyLen))
+                    {
+                        return await PrefetchMultiFrameAndBuildAsync(frame, lpmBodyLen, ct)
+                            .ConfigureAwait(false);
+                    }
                     var result = ProcessReceivedFrame(frame);
                     if (result.Payload.Length == 0 && !result.EndOfStream)
                         continue;
@@ -2087,6 +2346,13 @@ internal sealed class ShmControlResponseContent : HttpContent,
             {
                 _lazyChain.Dispose();
                 _lazyChain = null;
+            }
+
+            if (_prefetchedChunks != null)
+            {
+                InboundChainHelper.ReleaseAll(_prefetchedChunks);
+                _prefetchedChunks = null;
+                _prefetchedSawEndStream = false;
             }
 
             if (_assembled != null)

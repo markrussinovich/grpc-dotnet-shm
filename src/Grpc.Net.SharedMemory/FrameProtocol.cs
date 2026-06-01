@@ -37,6 +37,18 @@ public static class FrameProtocol
     /// <summary>
     /// Reads a frame from the ring and returns a pooled-buffer payload.
     /// Always uses the HTTP/2 wire format (the only supported format).
+    /// <para>
+    /// <b>Round-7 PR-B contract change for HEADERS / TRAILERS frame types:</b>
+    /// the returned <see cref="FramePayload"/> carries the already-decoded
+    /// <see cref="HeadersV1"/> / <see cref="TrailersV1"/> via
+    /// <see cref="FramePayload.DecodedHeader"/> instead of serialized bytes
+    /// in <see cref="FramePayload.Memory"/> (Memory is empty for these
+    /// frame types). Consumers MUST check <c>DecodedHeader</c> first when
+    /// the frame type is <see cref="FrameType.Headers"/> or
+    /// <see cref="FrameType.Trailers"/>. The <see cref="InboundFrame.AsHeaders"/>
+    /// / <see cref="InboundFrame.AsTrailers"/> helpers implement this fall-back
+    /// pattern automatically. DATA and other frame types are unaffected.
+    /// </para>
     /// </summary>
     public static (FrameHeader Header, FramePayload Payload) ReadFramePayload(
         ShmRing ring,
@@ -70,6 +82,24 @@ public static class FrameProtocol
     /// <param name="cancellationToken">Cancellation token.</param>
     public static void WriteFrame(ShmRing ring, FrameHeader header, ReadOnlySpan<byte> payload1, ReadOnlySpan<byte> payload2, CancellationToken cancellationToken = default)
         => Wire.Http2Codec.WriteFrame(ring, header, payload1, payload2, cancellationToken);
+
+    /// <summary>
+    /// Round-7 PR-B: writes a HEADERS frame directly from a <see cref="HeadersV1"/>
+    /// object, skipping the <c>HeadersV1.Encode → bytes → HeadersV1.Decode</c>
+    /// round-trip the byte path requires. Saves ~4.36 µs + 312 B per Unary RPC
+    /// (measured by HeaderPathProfileTests). Use this whenever you have the
+    /// already-built object in hand.
+    /// </summary>
+    public static void WriteHeadersFrame(
+        ShmRing ring, uint streamId, HeadersV1 headers, CancellationToken cancellationToken = default)
+        => Wire.Http2Codec.WriteH2HeadersFromObject(ring, streamId, headers, cancellationToken);
+
+    /// <summary>
+    /// Round-7 PR-B companion to <see cref="WriteHeadersFrame"/> for TRAILERS.
+    /// </summary>
+    public static void WriteTrailersFrame(
+        ShmRing ring, uint streamId, TrailersV1 trailers, CancellationToken cancellationToken = default)
+        => Wire.Http2Codec.WriteH2TrailersFromObject(ring, streamId, trailers, cancellationToken);
 
     /// <summary>
     /// Writes a PING frame.
@@ -174,6 +204,8 @@ public static class FrameProtocol
             // Refund quota if WriteFrame throws: we have debited but the
             // bytes never reached the peer, so no future WU will arrive
             // to refund and the stream would stall on the next send.
+            // Round-10 DEFER-1: refund BOTH stream + conn (the
+            // ReserveSendQuotaOrBlock above now debits both).
             try
             {
                 var header = new FrameHeader(FrameType.Message, streamId, (uint)data.Length, flags);
@@ -181,7 +213,7 @@ public static class FrameProtocol
             }
             catch
             {
-                fairStream?.RefundSendQuota(data.Length);
+                fairStream?.RefundSendQuotaWithConn(data.Length);
                 throw;
             }
             return;
@@ -214,6 +246,8 @@ public static class FrameProtocol
             // chunkSize bytes but the peer never received them, so no WU
             // will ever refund this credit. Prior chunks in this loop are
             // already on the wire and will be acked by peer WU as normal.
+            // Round-10 DEFER-1: refund BOTH stream + conn (the
+            // ReserveSendQuotaOrBlock above now debits both).
             try
             {
                 var header = new FrameHeader(FrameType.Message, streamId, (uint)chunkSize, chunkFlags);
@@ -221,7 +255,7 @@ public static class FrameProtocol
             }
             catch
             {
-                fairStream?.RefundSendQuota(chunkSize);
+                fairStream?.RefundSendQuotaWithConn(chunkSize);
                 throw;
             }
         }

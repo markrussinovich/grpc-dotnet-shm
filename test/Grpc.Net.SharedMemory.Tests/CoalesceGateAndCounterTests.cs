@@ -141,6 +141,66 @@ public class CoalesceGateAndCounterTests
             "_clientStreamCount MUST reset to 0 after DisposeAsync");
     }
 
+    [Test]
+    public void CanCoalesceMultiFrameMessage_BoundaryIsCapDivEight()
+    {
+        // Round-11 multi-frame coalesce predicate is LOOSER than
+        // the single-frame CanCoalesceInlineMessage: it drops the
+        // FairMaxFramePayload clamp and admits messages up to
+        // min(cap/8, H2_24bit_max). The writer still chunks at
+        // FairMaxFramePayload boundaries but all chunks happen
+        // under one suppressed-signal batch.
+        var name = $"test_coalesce_multiframe_{Guid.NewGuid():N}";
+        using var connection = ShmConnection.CreateAsServer(name, ringCapacity: 64 * 1024 * 1024, maxStreams: 100);
+        var writer = connection.FrameWriter;
+        Assert.That(writer, Is.Not.Null);
+
+        // Binary-search boundary.
+        int low = 1, high = 64 * 1024 * 1024;
+        while (low < high)
+        {
+            int mid = (int)(((long)low + high + 1) / 2);
+            if (writer!.CanCoalesceMultiFrameMessage(mid))
+                low = mid;
+            else
+                high = mid - 1;
+        }
+        int threshold = low;
+
+        // Boundary should be exactly min(cap/8, H2max).
+        var expectedThreshold = Math.Min(64 * 1024 * 1024 / 8,
+            Grpc.Net.SharedMemory.Wire.Http2FrameHeader.MaxAllowedPayloadLength);
+        Assert.That(threshold, Is.EqualTo(expectedThreshold),
+            "MultiFrame threshold must be min(cap/8, H2max) — NOT FairMax-clamped");
+
+        // Multi-frame predicate MUST admit messages above FairMaxFramePayload
+        // (when FairMax is set, e.g. 16384) as long as cumulative bytes
+        // fit in cap/8. This is the whole point of the new predicate.
+        Assert.That(writer!.CanCoalesceMultiFrameMessage(threshold), Is.True);
+        Assert.That(writer!.CanCoalesceMultiFrameMessage(threshold + 1), Is.False);
+
+        // Multi-frame must be at least as permissive as single-frame.
+        // If single-frame returns true, multi-frame must also return true.
+        for (int probe = 1; probe < threshold; probe = Math.Max(probe + 1, probe + probe / 4))
+        {
+            if (writer!.CanCoalesceInlineMessage(probe))
+            {
+                Assert.That(writer!.CanCoalesceMultiFrameMessage(probe), Is.True,
+                    $"MultiFrame predicate must admit any size SingleFrame admits (probe={probe})");
+            }
+        }
+    }
+
+    [Test]
+    public void CoalesceLatencyCapBytes_Is128KiB()
+    {
+        // Round-11 bumped CoalesceLatencyCapBytes from 64 KiB to 128 KiB
+        // so mid-payload sizes (32K-128K) can coalesce in non-Fair windows.
+        // Fair mode is still capped by SendQuota=65535 regardless.
+        Assert.That(ShmFrameWriter.CoalesceLatencyCapBytes, Is.EqualTo(128 * 1024),
+            "CoalesceLatencyCapBytes constant must be 128 KiB (round-11)");
+    }
+
     private static void SetPrivateCounter(ShmConnection connection, string fieldName, int value)
     {
         var f = typeof(ShmConnection).GetField(fieldName,
