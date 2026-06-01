@@ -596,13 +596,16 @@ public class EndToEndTests
     /// on the continuation execution thread.
     ///
     /// Note: with the receive-side striper enabled (default), the
-    /// inbound channel uses AllowSynchronousContinuations=true even
-    /// when InlineReceiveContinuations is left at its default value,
-    /// because the stripe Thread is a safe single-dispatch-point.
-    /// So both halves of this test exercise the non-ThreadPool
-    /// dispatch path; setting SHM_RECEIVE_STRIPER=0 restores the
-    /// legacy reader-Thread-only behaviour where InlineReceiveContinuations
-    /// is the sole knob.
+    /// inbound channel uses AllowSynchronousContinuations=true ONLY
+    /// when the stream is NOT on the bypass-the-striper path (i.e.
+    /// the writer is a stripe Thread, not the reader Thread itself).
+    /// On the bypass-striper path (single-stream-Unary fast path
+    /// taken when ActiveStreamCount &lt;= 1), inline continuations
+    /// are disabled to avoid the self-deadlock where the inline
+    /// continuation issues a follow-up flow-controlled blocking
+    /// send that parks the reader Thread and blocks the very
+    /// WindowUpdate frames that would unblock it. Repro: max-profile
+    /// 32+ MiB unary where the LPM exceeds the 32 MiB initial window.
     /// </summary>
     [Test]
     [Platform("Win")]
@@ -620,32 +623,25 @@ public class EndToEndTests
             "via ThreadPool — i.e., AllowSynchronousContinuations was NOT " +
             "honoured on the inbound Channel.");
 
-        // Striper default-on. With the striper enabled, the stripe
-        // Thread is the inbound-channel writer and
-        // AllowSynchronousContinuations is forced ON regardless of
-        // the InlineReceiveContinuations flag (see ShmGrpcStream
-        // ctor). So the default-environment branch dispatches inline
-        // on the stripe Thread as well.
-        var striperDisabled = string.Equals(
-            Environment.GetEnvironmentVariable("SHM_RECEIVE_STRIPER"),
-            "0", StringComparison.Ordinal);
-        if (striperDisabled)
-        {
-            Assert.That(legacyThreadIsPool, Is.True,
-                "InlineReceiveContinuations=false (default) with striper off: " +
-                "consumer continuation should run on a ThreadPool worker. " +
-                "IsThreadPoolThread=false means the continuation was inlined " +
-                "despite the flag being off.");
-        }
-        else
-        {
-            Assert.That(legacyThreadIsPool, Is.False,
-                "InlineReceiveContinuations=false (default) with striper on: " +
-                "consumer continuation should still run on the stripe Thread " +
-                "(non-ThreadPool). IsThreadPoolThread=true means the striper " +
-                "did not engage AllowSynchronousContinuations on the per-stream " +
-                "channel.");
-        }
+        // With the default-on striper but bypass-striper path engaged
+        // (single-stream-Unary fast path: ActiveStreamCount <= 1 at the
+        // moment this stream was constructed), the inbound channel's
+        // writer is the reader Thread itself, not a stripe Thread.
+        // Inline continuations on that path can self-deadlock when
+        // the user awaiter issues a follow-up flow-controlled blocking
+        // send (max-profile 32 MiB+ unary repro). Default-mode
+        // continuations therefore dispatch to the ThreadPool unless
+        // the explicit InlineReceiveContinuations opt-in is set
+        // (which the caller MUST gate on knowing this risk).
+        Assert.That(legacyThreadIsPool, Is.True,
+            "InlineReceiveContinuations=false (default): consumer continuation " +
+            "should run on a ThreadPool worker — either because the striper is " +
+            "off (no inline path active) OR because the bypass-striper path is " +
+            "in effect (single-stream-Unary fast path, where inline-on-reader " +
+            "self-deadlocks if the awaiter issues a large follow-up send). " +
+            "Use the explicit InlineReceiveContinuations=true opt-in only when " +
+            "the caller guarantees no large follow-up sends from the awaiter " +
+            "continuation.");
 
         static async Task<bool> RunInlineReceiveContractAsync(bool inline)
         {

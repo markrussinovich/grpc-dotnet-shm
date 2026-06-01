@@ -34,6 +34,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private readonly ConcurrentDictionary<uint, ShmGrpcStream> _streams;
     private readonly CancellationTokenSource _disposeCts;
     private readonly Task _frameReaderTask;
+    // Round-14 N1: see FrameReaderLoopAsync. Used by Dispose /
+    // DisposeAsync to detect self-join (reader inline-ran a user
+    // continuation that called Dispose) and skip the Wait that would
+    // otherwise deadlock against this same Thread.
+    private Thread? _frameReaderThread;
     private readonly Channel<ShmGrpcStream> _incomingStreamsChannel;
     private uint _nextStreamId;
     private int _disposed;
@@ -566,6 +571,27 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Round-8 PR-D: enqueues a HEADERS frame via the object passthrough
+    /// path (no byte encode round-trip). Used by
+    /// <see cref="ShmGrpcStream.SendResponseHeadersAsync"/> queued
+    /// fallback. See <see cref="ShmFrameWriter.EnqueueHeaders"/>.
+    /// </summary>
+    internal void SendHeadersFrame(uint streamId, byte flags, HeadersV1 headers)
+    {
+        ThrowIfDisposed();
+        _frameWriter!.EnqueueHeaders(streamId, flags, headers);
+    }
+
+    /// <summary>
+    /// Round-8 PR-D companion to <see cref="SendHeadersFrame"/> for TRAILERS.
+    /// </summary>
+    internal void SendTrailersFrame(uint streamId, byte flags, TrailersV1 trailers)
+    {
+        ThrowIfDisposed();
+        _frameWriter!.EnqueueTrailers(streamId, flags, trailers);
+    }
+
+    /// <summary>
     /// Enqueues a frame without copying the payload. <paramref name="pooledBuffer"/>
     /// is returned to <see cref="ArrayPool{T}"/> after the ring write completes.
     /// </summary>
@@ -622,6 +648,12 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 {
                     var (header, payload) = FrameProtocol.ReadFramePayload(
                         RxRing, _disposeCts.Token, zeroCopy: ZeroCopyRead);
+                    // Marker enables the safe-inline-receive deadlock guard
+                    // in ShmGrpcStream.SendMessageAsync: outbound writes that
+                    // detect IsOnReaderThread AND would block on flow-control
+                    // quota hop to the ThreadPool before the blocking wait.
+                    // See ShmReaderThreadContext for the full invariant.
+                    using var readerScope = ShmReaderThreadContext.Enter();
                     try
                     {
                         ProcessFrame(header, payload);
@@ -662,6 +694,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             IsBackground = true,
             Name = $"ShmFrameReader-{Name}"
         };
+        // Round-14 N1: capture the reader Thread so Dispose / DisposeAsync
+        // can self-join-guard. With the per-stream bypass-the-striper
+        // path active, ProcessFrame may run user awaiter continuations
+        // inline on this Thread (via Channel<T> AllowSynchronousContinuations),
+        // and those continuations can legitimately call connection.Dispose
+        // (e.g. EndToEndTests.H2_PayloadAtFrameBoundary_RoundTrip's
+        // `using var conn = ...` going out of scope inside the receive
+        // loop). Dispose's _frameReaderTask.Wait would then self-deadlock
+        // \u2014 mirror the existing ReceiveStriper.Stripe.Dispose
+        // self-join-guard pattern instead.
+        _frameReaderThread = thread;
         thread.Start();
         return tcs.Task;
     }
@@ -688,15 +731,38 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 // SetResult + ThreadPool.UnsafeQueueUserWorkItem tax for
                 // every frame. The legacy direct path remains as the
                 // fallback when SHM_RECEIVE_STRIPER=0.
-                if (_receiveStriper != null)
+                //
+                // Round-14 N1: per-stream bypass. A stream that was
+                // created when ActiveStreamCount <= 1 (snapshot at
+                // ctor — see ShmGrpcStream._bypassStriper) skips the
+                // stripe-Thread hop and writes directly into its
+                // _inboundFrames Channel<T>. Saves one ThreadPool wake
+                // per frame on the single-stream Unary hot path.
+                // The bypass decision is fixed for the stream's
+                // lifetime, so per-stream FIFO is preserved (every
+                // frame of stream N follows the same route, regardless
+                // of how ActiveStreamCount fluctuates afterwards).
+                if (_streams.TryGetValue(header.StreamId, out var stream))
                 {
+                    var frame = new InboundFrame(header.Type, payload, header.Flags);
+                    if (stream._bypassStriper || _receiveStriper == null)
+                    {
+                        stream.OnFrameReceived(frame);
+                    }
+                    else
+                    {
+                        _receiveStriper.Enqueue(header.StreamId, frame);
+                    }
+                }
+                else if (_receiveStriper != null)
+                {
+                    // Stream not yet visible to this reader (e.g. a
+                    // late HEADERS racing with us via the striper's
+                    // own queue). Hand the frame to the striper so it
+                    // can deliver in arrival order once the stream is
+                    // installed.
                     var frame = new InboundFrame(header.Type, payload, header.Flags);
                     _receiveStriper.Enqueue(header.StreamId, frame);
-                }
-                else if (_streams.TryGetValue(header.StreamId, out var stream))
-                {
-                    var frame = new InboundFrame(header.Type, payload, header.Flags);
-                    stream.OnFrameReceived(frame);
                 }
                 else
                 {
@@ -763,9 +829,38 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // Check if stream already exists
         if (_streams.TryGetValue(streamId, out var existingStream))
         {
-            // Route to existing stream (e.g., response headers for client)
+            // Route to existing stream (e.g., response headers for client).
+            //
+            // Round-7 perf: under high concurrency (N>>1 active streams),
+            // dispatching response HEADERS inline on the reader Thread
+            // can head-of-line block other streams' frames when the user
+            // awaiter for the HEADERS task runs synchronously on the
+            // reader (AllowSynchronousContinuations=true is on by
+            // default when the striper is enabled). Route HEADERS
+            // through the striper in that regime so any user inline
+            // work runs on the per-stream stripe Thread instead.
+            //
+            // FIFO is preserved per stream because DATA / Trailers
+            // already go through the same striper using the same
+            // StreamId hash \u2014 HEADERS, DATA, Trailers for stream N
+            // all land on stripe StripeIndex(N).
+            //
+            // Round-14 N1: use the stream's locked-in _bypassStriper
+            // decision instead of a fresh ActiveStreamCount probe so
+            // HEADERS, DATA, and Trailers for stream N follow the
+            // SAME route for the stream's lifetime. Without this, a
+            // late HEADERS could take the direct path while earlier
+            // DATA frames were still pending on the stripe queue,
+            // breaking per-stream FIFO.
             var frame = new InboundFrame(header.Type, payload, header.Flags);
-            existingStream.OnFrameReceived(frame);
+            if (existingStream._bypassStriper || _receiveStriper == null)
+            {
+                existingStream.OnFrameReceived(frame);
+            }
+            else
+            {
+                _receiveStriper.Enqueue(streamId, frame);
+            }
             return;
         }
 
@@ -800,11 +895,16 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 return;
             }
 
-            // Decode headers
+            // Decode headers — round-7 PR-B: prefer the pre-decoded
+            // object attached by the H2 codec read path (avoids the
+            // HeadersV1 → bytes → HeadersV1 round-trip the byte
+            // fallback path requires). Falls back to byte decode if the
+            // codec didn't attach an object (defensive).
             HeadersV1 headersV1;
             try
             {
-                headersV1 = HeadersV1.Decode(payload.Memory.Span);
+                headersV1 = payload.DecodedHeader as HeadersV1
+                    ?? HeadersV1.Decode(payload.Memory.Span);
             }
             catch (Exception ex)
             {
@@ -929,8 +1029,23 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// because every outbound DATA flows through the writer task after
     /// Phase B refactor.
     /// </para>
+    /// <para>
+    /// Round-10 DEFER-1: initialised to <see cref="ShmConstants.MaxWindowSize"/>
+    /// (= <c>int.MaxValue</c>, ~2 GiB) matching grpc-go-shmem's SHM-mode
+    /// choice (see shm_client_transport.go#L864-L871). Rationale: in pure
+    /// SHM-SHM operation both peers advertise high windows; initialising
+    /// the local credit to a conservative 65535 / 32 MiB would cause
+    /// permanent under-utilisation and trip deadlocks for streaming
+    /// workloads (e.g. ping-pong tests where both sides exhaust the
+    /// 32 MiB conn window before the threshold-driven WU drip kicks in).
+    /// The debit path now ensures the field's value tracks actual
+    /// per-frame send accounting; interop with a strict-H2 peer that
+    /// genuinely advertises 65535 would require a peer-driven init via
+    /// SETTINGS_INITIAL_WINDOW_SIZE handshake hook, which is out of
+    /// scope for the SHM-only path today.
+    /// </para>
     /// </summary>
-    private long _connSendQuota = ShmConstants.InitialWindowSize;
+    private long _connSendQuota = ShmConstants.MaxWindowSize;
 
     /// <summary>
     /// Wake signal for senders blocked on insufficient conn-level quota.
@@ -968,6 +1083,115 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     internal long ConnSendQuota => Volatile.Read(ref _connSendQuota);
 
     /// <summary>
+    /// Round-10 DEFER-1 fast-path threshold (~1 GiB). When
+    /// <see cref="_connSendQuota"/> is above this value the connection
+    /// FC window is effectively unbounded (matches the SHM-SHM init =
+    /// <see cref="ShmConstants.MaxWindowSize"/> ~ 2 GiB choice). In that
+    /// regime the per-frame CAS-debit / refund and the O(N) wake-all
+    /// hops can be safely skipped because no sender can be parked on
+    /// conn credit. 1 GiB leaves > 1 GiB headroom — a 100-stream ×
+    /// 16 MiB MaxFramePayload in-flight burst (~1.6 GiB potential debit)
+    /// crosses into the slow CAS path well before the quota hits 0.
+    /// Strict-H2 interop scenarios that initialise the conn quota to
+    /// 65535 always take the slow path, preserving spec invariant per
+    /// RFC 7540/9113 §6.9.1.
+    /// </summary>
+    internal const long ConnQuotaFastPathThreshold = int.MaxValue / 2;
+
+    /// <summary>
+    /// Round-10 DEFER-1 fix: attempts to reserve <paramref name="n"/> bytes
+    /// of conn-level H2 send quota. Returns <see langword="true"/> with the
+    /// CAS-debit committed if quota is sufficient; <see langword="false"/>
+    /// (quota unchanged) otherwise. Mirrors the conn leg of grpc-go-shmem's
+    /// <c>tryReserveSendQuota</c> two-resource CAS pattern
+    /// (shm_client_transport.go ~L343). Per RFC 7540/9113 §6.9.1, every
+    /// outbound DATA frame MUST debit BOTH the per-stream window and the
+    /// connection window; this is the conn half of that contract.
+    /// <para>
+    /// Fast-path: if <see cref="_connSendQuota"/> is above
+    /// <see cref="ConnQuotaFastPathThreshold"/> the CAS is skipped entirely
+    /// (just a single <c>Volatile.Read</c> + branch). This is the dominant
+    /// SHM-SHM hot path and recovers the per-frame perf regression that
+    /// showed up as Stream 1KB SHM/UDS ratio dropping 1.81x -> 1.40x and
+    /// Conc 100×1MB ratio 6.16x -> 5.25x on the post-DEFER-1 bench run.
+    /// The slow CAS path engages only when the field has been driven down
+    /// (strict-H2 interop with a small advertised conn window).
+    /// </para>
+    /// </summary>
+    internal bool TryReserveConnSendQuota(int n)
+    {
+        if (n <= 0) return n == 0;
+        var current = Volatile.Read(ref _connSendQuota);
+        // Fast-path: conn window effectively unbounded -> no debit, no CAS.
+        if (current > ConnQuotaFastPathThreshold) return true;
+        while (true)
+        {
+            if (current < n) return false;
+            if (Interlocked.CompareExchange(ref _connSendQuota, current - n, current) == current)
+                return true;
+            current = Volatile.Read(ref _connSendQuota);
+            // CAS race may have pushed us back above the threshold (a
+            // concurrent WU(0) refill clamped at int.MaxValue). Re-check.
+            if (current > ConnQuotaFastPathThreshold) return true;
+        }
+    }
+
+    /// <summary>
+    /// Round-10 DEFER-1 fix: refunds <paramref name="n"/> bytes of
+    /// conn-level send quota (called when an outbound DATA write fails
+    /// after the conn debit committed but before the bytes reach the ring,
+    /// e.g. ring-write throw / CancelledException). Wakes
+    /// <see cref="_connSendQuotaWake"/> AND every active stream's per-stream
+    /// wake so any sender parked on insufficient credit re-probes.
+    /// <para>
+    /// Fast-path: if the quota is already in unbounded territory
+    /// (<see cref="ConnQuotaFastPathThreshold"/>) the refund is a no-op —
+    /// <see cref="AddSendQuota"/>(streamId=0,…) caps at <c>int.MaxValue</c>
+    /// anyway, so a refund here would just clamp. Skips the O(N) wake-all
+    /// cost.
+    /// </para>
+    /// </summary>
+    internal void RefundConnSendQuota(int n)
+    {
+        if (n <= 0) return;
+        var current = Volatile.Read(ref _connSendQuota);
+        // Fast-path: nothing meaningful to refund when already unbounded.
+        if (current > ConnQuotaFastPathThreshold) return;
+        while (true)
+        {
+            var desired = current + n;
+            if (desired > int.MaxValue) desired = int.MaxValue;
+            if (Interlocked.CompareExchange(ref _connSendQuota, desired, current) == current)
+            {
+                _connSendQuotaWake.Set();
+                WakeAllStreamsForConnQuotaChange();
+                return;
+            }
+            current = Volatile.Read(ref _connSendQuota);
+            if (current > ConnQuotaFastPathThreshold) return;
+        }
+    }
+
+    /// <summary>
+    /// Round-10 DEFER-1 fix: wakes every active stream's per-stream
+    /// send-quota MRES so writers parked inside
+    /// <see cref="ShmGrpcStream.ReserveSendQuotaOrBlock"/> on insufficient
+    /// CONN credit re-evaluate after fresh conn credit arrives. Without this
+    /// hop, blocked writers only ever observe their own per-stream wake
+    /// and would stay parked through conn-level WU bursts. Iteration over
+    /// <see cref="_streams"/> (ConcurrentDictionary) is concurrent-safe;
+    /// each MRES.Set is idempotent and O(1).
+    /// </summary>
+    private void WakeAllStreamsForConnQuotaChange()
+    {
+        foreach (var stream in _streams.Values)
+        {
+            try { stream.SendQuotaWake.Set(); }
+            catch { /* defensive: stream may be mid-Dispose */ }
+        }
+    }
+
+    /// <summary>
     /// Routes an inbound <c>WINDOW_UPDATE</c> frame from the H2 codec
     /// to the appropriate quota.
     /// </summary>
@@ -1002,6 +1226,19 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 if (Interlocked.CompareExchange(ref _connSendQuota, desired, current) == current)
                 {
                     _connSendQuotaWake.Set();
+                    // Round-10 DEFER-1 fast-path: if the refill leaves us
+                    // in unbounded territory (the common SHM-SHM case where
+                    // the quota was never debited and the new value just
+                    // re-clamps at int.MaxValue), no sender can be parked
+                    // on conn FC, so skip the O(N) wake-all iteration.
+                    // Only when the field is genuinely below threshold
+                    // (strict-H2 interop / contended cell) do we need to
+                    // wake every stream's per-stream MRES so writers
+                    // parked in ReserveSendQuotaOrBlock re-probe.
+                    if (desired <= ConnQuotaFastPathThreshold)
+                    {
+                        WakeAllStreamsForConnQuotaChange();
+                    }
                     return;
                 }
             }
@@ -1348,20 +1585,25 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             return;
         }
 
-        _frameWriter?.Dispose();
-
+        // Round-15: route GOAWAY through the writer BEFORE disposing it,
+        // so the writer lease serialises this frame with any in-flight
+        // inline writes. The legacy direct FrameProtocol.WriteFrame(TxRing,
+        // ...) call after _frameWriter.Dispose() bypassed the lease and
+        // could race a still-running ThreadPool handler's inline write
+        // during teardown — same SPSC-violation bug class as the
+        // demo's mid-stream 0x20 hang.
         if (Volatile.Read(ref _goAwaySent) == 0)
         {
             Interlocked.Exchange(ref _goAwaySent, 1);
             try
             {
-                using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
                 var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
-                var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
-                FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
+                _frameWriter?.Enqueue(FrameType.GoAway, 0, (byte)GoAwayFlags.Draining, payload);
             }
-            catch { /* best-effort */ }
+            catch { /* best-effort; writer may already be disposed */ }
         }
+
+        _frameWriter?.Dispose();
 
         _incomingStreamsChannel.Writer.TryComplete();
         _disposeCts.Cancel();
@@ -1391,17 +1633,39 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // The Linux FUTEX_WAIT path now wires the CT to FUTEX_WAKE so the
         // reader unparks within microseconds; 5 s is a generous safety
         // budget that mostly covers extremely slow CI scheduling.
-        try { _frameReaderTask.Wait(TimeSpan.FromSeconds(5)); }
-        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.Dispose: frame reader: {ex.Message}"); }
-        if (!_frameReaderTask.IsCompleted)
+        //
+        // Round-14 N1 self-join guard: with the per-stream bypass-the-
+        // striper path, ProcessFrame may run user awaiter continuations
+        // inline on the reader Thread (via Channel<T> AllowSync).  Those
+        // continuations can legitimately call connection.Dispose (e.g.
+        // a `using var conn = …` going out of scope inside the receive
+        // loop). Waiting on _frameReaderTask in that case would deadlock
+        // against ourselves — the reader Thread IS the one calling
+        // Wait. Detect the self-join, skip the wait, and leak the
+        // Segment exactly as the 5-s-timeout path does. The reader
+        // Thread will observe _disposeCts.IsCancellationRequested on
+        // its next loop iteration (after this Dispose call unwinds and
+        // ProcessFrame returns) and exit naturally. Mirrors the same
+        // self-join skip in ReceiveStriper.Stripe.Dispose.
+        var readerSelfJoin = _frameReaderThread != null
+            && Thread.CurrentThread == _frameReaderThread;
+        if (!readerSelfJoin)
         {
-            // The reader did not honour cancellation in time. Skip the
+            try { _frameReaderTask.Wait(TimeSpan.FromSeconds(5)); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.Dispose: frame reader: {ex.Message}"); }
+        }
+        if (readerSelfJoin || !_frameReaderTask.IsCompleted)
+        {
+            // Either the reader did not honour cancellation in time
+            // OR we are the reader Thread ourselves. Skip the
             // Segment.Dispose (it would munmap memory the reader is
-            // about to touch). This leaks the segment file/handles but
-            // keeps the process alive. Log so operators notice.
+            // about to touch / is currently using). This leaks the
+            // segment file/handles but keeps the process alive. Log
+            // so operators notice.
             System.Diagnostics.Debug.WriteLine(
-                "ShmConnection.Dispose: frame reader did not exit in 5 s; " +
-                "leaking Segment to avoid use-after-free.");
+                readerSelfJoin
+                    ? "ShmConnection.Dispose: called from reader Thread (inline continuation); leaking Segment to avoid use-after-free."
+                    : "ShmConnection.Dispose: frame reader did not exit in 5 s; leaking Segment to avoid use-after-free.");
         }
 
         // Stop the receive-side fan-out AFTER the reader Thread has
@@ -1435,11 +1699,23 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         Interlocked.Exchange(ref _serverStreamCount, 0);
 
         // Only dispose the Segment if the reader has confirmed it is
-        // outside any header.WriteIdx read.
-        if (_frameReaderTask.IsCompleted)
+        // outside any header.WriteIdx read. The readerSelfJoin path
+        // (Dispose called from the reader Thread itself via an inline
+        // user continuation) ALSO skips segment dispose because the
+        // reader is mid-ProcessFrame and will touch ring memory after
+        // this Dispose call unwinds.
+        if (!readerSelfJoin && _frameReaderTask.IsCompleted)
         {
             _segment.Dispose();
         }
+        // BUG-FIX (round-10 GPT-5.5 #10): dispose the connection-level
+        // send-quota wake MRES (allocated alongside _connSendQuota in
+        // the field initialiser). Without this the kernel wait handle
+        // it lazily allocates for blocking waits would leak per
+        // connection. Same pattern as the per-stream _sendQuotaWake
+        // disposal added by the companion fix in ShmGrpcStream.Dispose.
+        try { _connSendQuotaWake.Dispose(); }
+        catch { /* defensive: never throw from Dispose */ }
         _disposeCts.Dispose();
     }
 
@@ -1451,20 +1727,21 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             return;
         }
 
-        _frameWriter?.Dispose();
-
+        // Round-15: see sync Dispose. Route GOAWAY through the writer
+        // queue BEFORE disposing it so it serialises with in-flight
+        // inline writes via the writer lease (no SPSC violation on teardown).
         if (Volatile.Read(ref _goAwaySent) == 0)
         {
             Interlocked.Exchange(ref _goAwaySent, 1);
             try
             {
-                using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
                 var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
-                var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
-                FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
+                _frameWriter?.Enqueue(FrameType.GoAway, 0, (byte)GoAwayFlags.Draining, payload);
             }
-            catch { /* best-effort */ }
+            catch { /* best-effort; writer may already be disposed */ }
         }
+
+        _frameWriter?.Dispose();
 
         _incomingStreamsChannel.Writer.TryComplete();
         _disposeCts.Cancel();
@@ -1478,15 +1755,21 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
 
         // See sync Dispose for rationale on the 5 s timeout + leak-on-
-        // timeout policy.
-        try { await _frameReaderTask.WaitAsync(TimeSpan.FromSeconds(5)); }
-        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.DisposeAsync: frame reader: {ex.Message}"); }
-        var readerExited = _frameReaderTask.IsCompleted;
+        // timeout policy AND the self-join guard.
+        var readerSelfJoinAsync = _frameReaderThread != null
+            && Thread.CurrentThread == _frameReaderThread;
+        if (!readerSelfJoinAsync)
+        {
+            try { await _frameReaderTask.WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.DisposeAsync: frame reader: {ex.Message}"); }
+        }
+        var readerExited = !readerSelfJoinAsync && _frameReaderTask.IsCompleted;
         if (!readerExited)
         {
             System.Diagnostics.Debug.WriteLine(
-                "ShmConnection.DisposeAsync: frame reader did not exit in 5 s; " +
-                "leaking Segment to avoid use-after-free.");
+                readerSelfJoinAsync
+                    ? "ShmConnection.DisposeAsync: called from reader Thread (inline continuation); leaking Segment to avoid use-after-free."
+                    : "ShmConnection.DisposeAsync: frame reader did not exit in 5 s; leaking Segment to avoid use-after-free.");
         }
 
         // See sync Dispose for rationale on striper-after-reader ordering.
@@ -1515,6 +1798,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         {
             _segment.Dispose();
         }
+        // BUG-FIX (round-10 GPT-5.5 #10): see sync Dispose for rationale.
+        try { _connSendQuotaWake.Dispose(); }
+        catch { /* defensive: never throw from DisposeAsync */ }
         _disposeCts.Dispose();
     }
 }

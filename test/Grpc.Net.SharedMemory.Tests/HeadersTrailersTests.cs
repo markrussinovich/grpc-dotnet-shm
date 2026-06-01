@@ -270,4 +270,85 @@ public class HeadersTrailersTests
         data[0] = 2; // Invalid version
         Assert.Throws<InvalidDataException>(() => TrailersV1.Decode(data));
     }
+
+    // ------------------------------------------------------------------
+    // Round-7 PR-A: TrailersV1.OkEmpty singleton fast-path tests
+    // ------------------------------------------------------------------
+
+    [Test]
+    public void TrailersV1_DecodeOkEmpty_ReturnsSharedSingleton()
+    {
+        // Round-7 perf: the dominant case (successful RPC with no
+        // app-level trailers) encodes to an exact 11-byte payload.
+        // Decode must return the shared singleton, not a fresh
+        // TrailersV1+List<MetadataKV>(0), to remove allocation from
+        // the unary hot path.
+        var src = new TrailersV1
+        {
+            GrpcStatusCode = StatusCode.OK,
+            GrpcStatusMessage = null,
+            Metadata = Array.Empty<MetadataKV>(),
+        };
+        var encoded = src.EncodeToArray();
+        var d1 = TrailersV1.Decode(encoded);
+        var d2 = TrailersV1.Decode(encoded);
+        Assert.That(d1, Is.SameAs(TrailersV1.OkEmpty),
+            "OK-empty payload must short-circuit to OkEmpty singleton");
+        Assert.That(d2, Is.SameAs(TrailersV1.OkEmpty),
+            "Singleton must be returned across calls");
+        Assert.That(d1.GrpcStatusCode, Is.EqualTo(StatusCode.OK));
+        Assert.That(d1.GrpcStatusMessage, Is.Null);
+        Assert.That(d1.Metadata, Is.Empty);
+    }
+
+    [Test]
+    public void TrailersV1_DecodeNonOk_DoesNotReturnSingleton()
+    {
+        // Sanity: any non-OK status must take the full decode path,
+        // not the OkEmpty fast-path.
+        var src = new TrailersV1
+        {
+            GrpcStatusCode = StatusCode.Unavailable,
+            GrpcStatusMessage = null,
+            Metadata = Array.Empty<MetadataKV>(),
+        };
+        var encoded = src.EncodeToArray();
+        var d = TrailersV1.Decode(encoded);
+        Assert.That(d, Is.Not.SameAs(TrailersV1.OkEmpty));
+        Assert.That(d.GrpcStatusCode, Is.EqualTo(StatusCode.Unavailable));
+    }
+
+    [Test]
+    public void TrailersV1_DecodeOkWithMessage_DoesNotReturnSingleton()
+    {
+        // Sanity: OK + non-empty status message must NOT take the
+        // 11-byte fast-path (length wouldn't match anyway, but verify
+        // the message survives).
+        var src = new TrailersV1
+        {
+            GrpcStatusCode = StatusCode.OK,
+            GrpcStatusMessage = "ok",
+            Metadata = Array.Empty<MetadataKV>(),
+        };
+        var encoded = src.EncodeToArray();
+        var d = TrailersV1.Decode(encoded);
+        Assert.That(d, Is.Not.SameAs(TrailersV1.OkEmpty));
+        Assert.That(d.GrpcStatusMessage, Is.EqualTo("ok"));
+    }
+
+    [Test]
+    public void TrailersV1_DecodeOkWithMetadata_DoesNotReturnSingleton()
+    {
+        // Sanity: OK + trailing metadata must NOT take the fast-path.
+        var src = new TrailersV1
+        {
+            GrpcStatusCode = StatusCode.OK,
+            GrpcStatusMessage = null,
+            Metadata = new[] { new MetadataKV("trailer-k", "v") },
+        };
+        var encoded = src.EncodeToArray();
+        var d = TrailersV1.Decode(encoded);
+        Assert.That(d, Is.Not.SameAs(TrailersV1.OkEmpty));
+        Assert.That(d.Metadata.Count, Is.EqualTo(1));
+    }
 }

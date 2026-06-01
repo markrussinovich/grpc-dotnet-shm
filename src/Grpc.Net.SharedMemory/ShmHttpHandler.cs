@@ -87,47 +87,72 @@ public sealed class ShmHttpHandler : DelegatingHandler
             var ctlTx = ctlSegment.RingA;
             var ctlRx = ctlSegment.RingB;
 
-            // Send CONNECT request
-            WriteControlFrame(ctlTx, FrameType.Connect, ControlWire.EncodeConnectRequest());
+            // Send CONNECT request with a fresh per-CONNECT correlation
+            // nonce. Server echoes it in ACCEPT/REJECT so we can detect
+            // and skip stale responses left on the shared Ring B by a
+            // previously timed-out dialer (gRFC A — Stale Response
+            // Correlation). Bounded skip loop matches grpc-go-shmem
+            // maxStaleResponses=3.
+            var ourNonce = ControlWire.NewConnectNonce();
+            WriteControlFrame(ctlTx, FrameType.Connect, ControlWire.EncodeConnectRequest(0, 0, false, ourNonce));
 
-            // Read response
-            var (header, payload) = await ReadControlFrameAsync(ctlRx, cancellationToken)
-                .ConfigureAwait(false);
-
-            switch (header.Type)
+            const int maxStaleResponses = 3;
+            for (int attempt = 0; attempt <= maxStaleResponses; attempt++)
             {
-                case FrameType.Accept:
-                    var dataSegmentName = ControlWire.DecodeConnectResponse(payload.Span);
+                // Read response
+                var (header, payload) = await ReadControlFrameAsync(ctlRx, cancellationToken)
+                    .ConfigureAwait(false);
 
-                    // Open the data segment
-                    var dataSegment = Segment.Open(dataSegmentName);
-                    try
-                    {
-                        await dataSegment.WaitForServerAsync(cancellationToken).ConfigureAwait(false);
+                switch (header.Type)
+                {
+                    case FrameType.Accept:
+                        var (dataSegmentName, acceptNonce) = ControlWire.DecodeConnectResponse(payload.Span);
+                        if (acceptNonce != ourNonce)
+                        {
+                            // Stale ACCEPT for a different dialer; skip.
+                            continue;
+                        }
 
-                        // Signal that client has mapped the segment
-                        dataSegment.SetClientReady(true);
+                        // Open the data segment
+                        var dataSegment = Segment.Open(dataSegmentName);
+                        try
+                        {
+                            await dataSegment.WaitForServerAsync(cancellationToken).ConfigureAwait(false);
 
-                        // Client reads from RingB (server→client), writes to RingA (client→server)
-                        // Pass dataSegment ownership to ShmStream so it gets disposed
-                        // when the stream is closed, preventing memory-mapped file +
-                        // kernel event handle leaks.
-                        return new ShmStream(dataSegment.RingB, dataSegment.RingA, dataSegment);
-                    }
-                    catch
-                    {
-                        dataSegment.Dispose();
-                        throw;
-                    }
+                            // Signal that client has mapped the segment
+                            dataSegment.SetClientReady(true);
 
-                case FrameType.Reject:
-                    var message = ControlWire.DecodeConnectReject(payload.Span);
-                    throw new InvalidOperationException($"Connection rejected by server: {message}");
+                            // Client reads from RingB (server→client), writes to RingA (client→server)
+                            // Pass dataSegment ownership to ShmStream so it gets disposed
+                            // when the stream is closed, preventing memory-mapped file +
+                            // kernel event handle leaks.
+                            return new ShmStream(dataSegment.RingB, dataSegment.RingA, dataSegment);
+                        }
+                        catch
+                        {
+                            dataSegment.Dispose();
+                            throw;
+                        }
 
-                default:
-                    throw new InvalidOperationException(
-                        $"Unexpected response frame type: {header.Type}");
+                    case FrameType.Reject:
+                        var (message, rejectNonce) = ControlWire.DecodeConnectReject(payload.Span);
+                        if (rejectNonce != ourNonce)
+                        {
+                            // Stale REJECT (or 0-nonce decode-failure
+                            // REJECT for a previous dialer); skip.
+                            continue;
+                        }
+                        throw new InvalidOperationException($"Connection rejected by server: {message}");
+
+                    default:
+                        throw new InvalidOperationException(
+                            $"Unexpected response frame type: {header.Type}");
+                }
             }
+
+            // Exhausted the stale-skip budget without seeing our nonce.
+            throw new InvalidOperationException(
+                $"No matching connect response after {maxStaleResponses + 1} attempts (stale-skip budget exhausted).");
         }
         finally
         {

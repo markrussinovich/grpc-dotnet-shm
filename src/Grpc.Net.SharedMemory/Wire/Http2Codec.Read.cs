@@ -134,13 +134,53 @@ internal static partial class Http2Codec
         }
     }
 
+    /// <summary>
+    /// Per-stream LPM accumulation mode.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>None</b> — no LPM in progress (no body bytes seen since last
+    /// complete LPM). The next DATA frame may take any path: single-frame
+    /// ZC fast path, chain-ZC start, or accumulator copy.
+    /// </para>
+    /// <para>
+    /// <b>ChainZcInProgress</b> — first DATA frame of a multi-frame LPM
+    /// was surfaced as a <see cref="MessageFlags.More"/> chunk with
+    /// <see cref="FramePayload.FromRingMemorySpeculative"/>; ring's
+    /// chain-ZC anchor is open (<see cref="ShmRing.IsChainOpen"/>=true,
+    /// <see cref="ShmRing.IsZcChainActive"/>=true). Subsequent DATA
+    /// frames are surfaced per-frame as More chunks (or copy-on-wrap)
+    /// until <see cref="LpmAccumulator.ChainRemaining"/> reaches 0, at
+    /// which point the chain ends with a no-More chunk and
+    /// <see cref="ShmRing.CloseZcChain"/> fires.
+    /// </para>
+    /// <para>
+    /// The accumulator copy path is detected via the
+    /// <see cref="LpmAccumulator.Pos"/> field (Pos &gt; 0 = mid-LPM-copy);
+    /// it does not write to this enum so there is no
+    /// <c>CopyInProgress</c> value here.
+    /// </para>
+    /// </remarks>
+    internal enum AccMode : byte
+    {
+        None = 0,
+        ChainZcInProgress = 1,
+    }
+
     /// <summary>Accumulates a single in-progress gRPC LPM message across multiple DATA frames.</summary>
     private sealed class LpmAccumulator
     {
-        public byte[]? Buffer;          // pooled, 0..ExpectedTotal capacity
-        public int Pos;                 // bytes written so far
+        public byte[]? Buffer;          // pooled, 0..ExpectedTotal capacity (Copy mode only)
+        public int Pos;                 // bytes written so far (Copy mode only)
         public int ExpectedTotal;       // 5 (header) + body length once header is parsed; 0 before that
         public int HeaderBytesSeen;     // 0..5
+
+        // ChainZcInProgress mode state. ChainRemaining counts LPM body bytes
+        // (NOT including the 5-byte LPM header, which was carried inline in
+        // the first chain frame) still owed by subsequent DATA frames.
+        // Reaches 0 → emit final no-More chunk + CloseZcChain.
+        public AccMode Mode;
+        public long ChainRemaining;
 
         // Reusable 5-byte LPM header buffer for partial header reads.
         public readonly byte[] HeaderBuf = new byte[5];
@@ -155,6 +195,8 @@ internal static partial class Http2Codec
             Pos = 0;
             ExpectedTotal = 0;
             HeaderBytesSeen = 0;
+            Mode = AccMode.None;
+            ChainRemaining = 0;
         }
     }
 
@@ -378,6 +420,26 @@ internal static partial class Http2Codec
         ShmRing ring, ulong baseCommitReadIdx, uint streamId, byte h2Flags, int payloadLen,
         bool zeroCopy, Http2DecoderState state, CancellationToken ct)
     {
+        // BUG-FIX (round-10 GPT-5.5 #7): RFC 7540 §6.1 — DATA frames
+        // MUST be associated with a stream. Receiving a DATA frame on
+        // stream 0 is a PROTOCOL_ERROR connection error. Previously
+        // this was silently accepted and would have driven flow-
+        // control state and the LPM accumulator on the connection
+        // pseudo-stream, leaving the codec in undefined state.
+        // Drain the malformed payload first so the ring read pointer
+        // stays in sync (matches the RST_STREAM malformed-payload
+        // pattern at ~line 1079).
+        if (streamId == 0)
+        {
+            if (payloadLen > 0)
+            {
+                var _ = ring.ReserveRead(payloadLen, ct);
+            }
+            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            throw new InvalidDataException(
+                $"H2 DATA frame on connection stream 0 (RFC 7540 §6.1 PROTOCOL_ERROR)");
+        }
+
         // Per RFC 7540 §6.9.1, the entire DATA frame payload (including
         // Pad Length byte and padding) is included in flow control. Fire
         // the per-DATA-frame hook here so the connection can drive
@@ -403,6 +465,16 @@ internal static partial class Http2Codec
                 state.StreamsWithInitialHeaders.Remove(streamId);
                 if (RemoveAcc(state, streamId, out var stale))
                 {
+                    // Chain-ZC leak guard (2026-06-01): if the stream had
+                    // a chain in flight, close the anchor before resetting
+                    // so future Releases can publish header.ReadIdx via
+                    // the FramePayload.Release gate. Without this,
+                    // _chainOpen stays true forever, EndZcReservation
+                    // never fires, ring permanently shrinks.
+                    if (stale!.Mode == AccMode.ChainZcInProgress)
+                    {
+                        ring.CloseZcChain();
+                    }
                     stale!.Reset(); // free pooled buffer if any
                 }
                 return (new FrameHeader(FrameType.HalfClose, streamId, 0, 0), FramePayload.Empty);
@@ -433,10 +505,23 @@ internal static partial class Http2Codec
 
         var totalBytes = Http2FrameHeader.Size + payloadLen;
 
+        // === Chain-ZC continuation (2026-06-01 PR): when this stream
+        // has an active multi-frame chain-ZC anchor, surface this DATA
+        // frame's body as the next per-chunk Message and route the
+        // CommitReadRaw through the deferred path (`_zcActive=true` in
+        // ShmRing). Pre-empts both the single-frame fast path and the
+        // accumulator slow path. ===
+        var existedAcc = TryGetAcc(state, streamId, out var existingAcc);
+        if (existedAcc && existingAcc!.Mode == AccMode.ChainZcInProgress)
+        {
+            return EmitChainContinuation(
+                ring, state, streamId, existingAcc, baseCommitReadIdx,
+                payloadReservation, bodyOffset, bodyLength, totalBytes, endStream);
+        }
+
         // === Fast path: single complete LPM message in this DATA frame, ===
         // === no accumulator state, contiguous body. Eligible for zero-copy. ===
-        var hasAccumulator = TryGetAcc(state, streamId, out var existingAcc)
-            && existingAcc!.Pos > 0;
+        var hasAccumulator = existedAcc && existingAcc!.Pos > 0;
         if (!hasAccumulator && bodyLength >= 5 && payloadReservation.Second.IsEmpty)
         {
             var bodySpan = payloadReservation.First.Span.Slice(bodyOffset, bodyLength);
@@ -459,9 +544,13 @@ internal static partial class Http2Codec
                     && ring.IsSpeculativeZcEligible(bodyLength, contiguous: payloadReservation.Second.IsEmpty))
                 {
                     // Fused single-frame ZC: see FrameProtocol hot-path
-                    // comment. H2 reader only does single-frame ZC (multi-
-                    // frame H2 messages always go through the LpmAccumulator
-                    // copy path), so the fused commit is always safe here.
+                    // comment. The single-frame ZC anchor is independent
+                    // of the multi-frame chain-ZC anchor (the chain-ZC
+                    // start branch lives below this block); both share
+                    // the at-most-one-ZC FIFO invariant via
+                    // SpeculativeReservedBytes + _zcActive + _chainOpen
+                    // gates in IsSpeculativeZcEligible and
+                    // IsChainZcStartEligible.
                     ring.BeginSingleFrameZcCommit(baseCommitReadIdx, totalBytes);
                     Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
                     return (hdr, FramePayload.FromRingMemorySpeculative(
@@ -472,6 +561,126 @@ internal static partial class Http2Codec
                 bodySpan.CopyTo(pooled);
                 ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
                 return (hdr, FramePayload.FromPooled(pooled, bodyLength));
+            }
+
+            // Multi-frame LPM (declared body + 5 > this frame's body). Try
+            // chain-ZC START: each subsequent DATA frame is surfaced per-chunk
+            // as a More-flagged Message with FromRingMemorySpeculative; the
+            // existing downstream LazyChainRos consumer (already used for
+            // streaming RPCs at ShmControlHandler.cs#L1758) builds a
+            // lazy-pull ReadOnlySequence over the frame stream so the
+            // receive-side full-payload memcpy floor is eliminated.
+            // Eligibility gated by ring.IsChainZcStartEligible (back-pressure,
+            // budget, at-most-one-ZC, compression flag, ring size, etc).
+            if (declaredLpmBody <= (uint)int.MaxValue - 5
+                && (int)declaredLpmBody + 5 > bodyLength)
+            {
+                var lpmTotal = 5 + (long)declaredLpmBody;
+                var compFlag = bodySpan[0];
+
+                // Malformed-peer guard (2026-06-01 PR round-2 review):
+                // an H2 DATA frame carrying END_STREAM with an
+                // incomplete LPM is a protocol error (the writer
+                // declared an N-byte body but is closing the stream
+                // after only `bodyLength` bytes). Our own writer never
+                // emits this; symmetric with the empty-DATA-with-EOS
+                // chain leak guard above and the chain-continuation
+                // over-run guard below. Without this, chain-start would
+                // open the anchor and surface a `More`-flagged chunk;
+                // the consumer's LazyChainRos would then block forever
+                // on `Pull` waiting for body bytes that never arrive,
+                // and the chain anchor would leak (`_chainOpen` stays
+                // true, ring permanently shrinks).
+                if (endStream)
+                {
+                    ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+                    state.StreamsWithInitialHeaders.Remove(streamId);
+                    throw new InvalidDataException(
+                        $"H2 stream {streamId} carries END_STREAM on the " +
+                        $"first DATA frame of a multi-frame LPM (declared " +
+                        $"body={declaredLpmBody}, this frame body={bodyLength}). " +
+                        "Incomplete-LPM END_STREAM is a protocol error.");
+                }
+
+                if (zeroCopy && bodyOffset == 0
+                    && ring.IsChainZcStartEligible(lpmTotal, bodyLength, compFlag))
+                {
+                    // Open the chain anchor BEFORE the deferred commit so
+                    // EndZcReservation cannot be triggered out from under
+                    // us by a concurrent Release before we've published
+                    // the first chunk.
+                    //
+                    // EXCEPTION SAFETY (per Opus 4.8 review 2026-06-01):
+                    // any throw between OpenZcChain and the successful
+                    // FromRingMemorySpeculative return must roll back the
+                    // anchor state, otherwise _chainOpen / _zcActive stay
+                    // true forever and the ring permanently shrinks.
+                    // GetOrAddAcc allocates and OnMessageStart calls into
+                    // user code (InFlow.MaybeAdjustAdditive) which can
+                    // raise — both happen AFTER the deferred commit, so
+                    // we must catch and unwind.
+                    ring.OpenZcChain();
+                    ring.BeginZcReservation(baseCommitReadIdx);
+                    Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
+                    ring.CommitReadRaw(baseCommitReadIdx, totalBytes); // deferred (_zcActive)
+
+                    try
+                    {
+                        // Initialize per-stream chain state.
+                        var acc = GetOrAddAcc(state, streamId);
+                        acc.Mode = AccMode.ChainZcInProgress;
+                        acc.ExpectedTotal = (int)Math.Min(lpmTotal, int.MaxValue);
+                        acc.ChainRemaining = lpmTotal - bodyLength;
+
+                        // Fire OnMessageStart at the LPM-header parse moment,
+                        // matching FeedAccumulator's HeaderBytesSeen 4→5
+                        // transition timing (line ~795). lpmTotal is always
+                        // > 0 here because it equals 5 + declaredLpmBody (uint)
+                        // so the bounds check is for cast safety only:
+                        // OnMessageStart's parameter is uint, and our
+                        // ChainZcBudget gate above already capped lpmTotal
+                        // far below uint.MaxValue, but Math.Min is kept
+                        // as defense-in-depth against future budget changes.
+                        if (state.OnMessageStart != null)
+                        {
+                            state.OnMessageStart(streamId, (uint)Math.Min(lpmTotal, uint.MaxValue));
+                        }
+
+                        // Surface the first chunk: H2 DATA body (which starts
+                        // with the 5-byte gRPC LPM header) as one Message
+                        // with the More flag. The downstream LazyChainRos
+                        // consumer treats the first 5 bytes as the LPM header
+                        // (firstFrameBodyOffset:5) and the rest as body.
+                        var firstHdr = new FrameHeader(
+                            FrameType.Message, streamId, (uint)bodyLength, MessageFlags.More);
+                        return (firstHdr, FramePayload.FromRingMemorySpeculative(
+                            payloadReservation.First.Slice(bodyOffset, bodyLength),
+                            ring, totalBytes));
+                    }
+                    catch
+                    {
+                        // Roll back the chain-ZC anchor so the ring's
+                        // ReadIdx can resume normal advance. The
+                        // CommitReadRaw above already published the
+                        // deferred target for this frame; undo
+                        // SpeculativeReservedBytes, close the chain
+                        // (which fires EndZcReservation defensively when
+                        // SpecReserved is now 0), and drop the per-stream
+                        // acc state so a future first frame on this
+                        // stream re-evaluates eligibility cleanly.
+                        Interlocked.Add(ref ring.SpeculativeReservedBytes, -totalBytes);
+                        ring.CloseZcChain();
+                        if (RemoveAcc(state, streamId, out var failedAcc))
+                        {
+                            failedAcc!.Reset();
+                        }
+                        throw;
+                    }
+                }
+                // Chain-ZC ineligible — fall through to existing accumulator
+                // copy path. (LpmAccumulator.Mode is currently unused by the
+                // copy path; FeedAccumulator uses the Pos field as its
+                // mid-LPM marker.)
             }
             // Falls through to slow path: more bytes needed, or multiple LPMs in this frame.
         }
@@ -706,6 +915,159 @@ internal static partial class Http2Codec
     }
 
     /// <summary>
+    /// Emits the next per-chunk synthetic Message frame for a multi-frame
+    /// chain-ZC LPM in progress on <paramref name="acc"/>. Each call
+    /// consumes exactly one H2 DATA frame and surfaces one internal
+    /// Message frame whose payload is either a ring memory speculative
+    /// view (the common path) or a pooled copy (only when the ring
+    /// reservation wraps the buffer boundary). The CommitReadRaw call
+    /// goes through the deferred path (<see cref="ShmRing"/>'s
+    /// <c>_zcActive</c> is still true) so shared <c>header.ReadIdx</c>
+    /// remains frozen until the final chunk's Release publishes the
+    /// accumulated target.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Wrap-around (mixed-mode chain):</b> when this frame's ring
+    /// reservation wraps the buffer boundary
+    /// (<c>payloadReservation.Second</c> non-empty), copy the body into a
+    /// pooled buffer instead of holding the ring slice. SpeculativeReservedBytes
+    /// is NOT incremented for the copied frame (no ring memory held), but
+    /// the chain anchor stays open via <see cref="ShmRing.IsChainOpen"/>
+    /// so earlier ZC frames' Release calls cannot fire EndZcReservation
+    /// prematurely. On the final frame's <see cref="ShmRing.CloseZcChain"/>,
+    /// the defensive <c>(SpecReserved==0 &amp;&amp; IsZcChainActive)</c>
+    /// check fires EndZcReservation if all ZC frames were already
+    /// released before close.
+    /// </para>
+    /// <para>
+    /// <b>Over-run protection:</b> if a peer sends a DATA frame whose
+    /// body exceeds the remaining chain bytes (writer-side coalesced
+    /// "next LPM tail in same frame"), throw InvalidDataException.
+    /// Our writer never coalesces inside a chain; this is purely a
+    /// defensive guard against a misbehaving peer.
+    /// </para>
+    /// </remarks>
+    private static (FrameHeader Header, FramePayload Payload) EmitChainContinuation(
+        ShmRing ring,
+        Http2DecoderState state,
+        uint streamId,
+        LpmAccumulator acc,
+        ulong baseCommitReadIdx,
+        ReadReservation payloadReservation,
+        int bodyOffset,
+        int bodyLength,
+        int totalBytes,
+        bool endStream)
+    {
+        // Peer over-run check: a chain frame must carry AT MOST the
+        // remaining body bytes. Coalesced-tail-after-chain (an extra
+        // LPM packed into the same wire frame after the current chain's
+        // final bytes) is legal per RFC 7540 §6.1 but our own writer
+        // never produces it. Tear down the chain to prevent corruption;
+        // InvalidDataException is connection-fatal per FrameReaderLoopAsync.
+        if (bodyLength > acc.ChainRemaining)
+        {
+            // Publish the ring read so the cross-process writer sees
+            // these bytes consumed; the deferred commit path advances
+            // _deferredReadIdxTarget which CloseZcChain will publish.
+            // SpeculativeReservedBytes is NOT incremented (no ring memory
+            // is being held — we're abandoning the frame), so CloseZcChain's
+            // defensive (SpecReserved==0 && _zcActive) check fires
+            // EndZcReservation and ReadIdx advances past everything.
+            ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+            ring.CloseZcChain();
+            RemoveAcc(state, streamId, out _);
+            throw new InvalidDataException(
+                $"H2 DATA frame on chain-ZC stream {streamId} carries " +
+                $"{bodyLength} bytes but only {acc.ChainRemaining} bytes " +
+                "remain in the LPM body. Coalesced-tail-after-chain is " +
+                "not supported on the chain-ZC path.");
+        }
+
+        acc.ChainRemaining -= bodyLength;
+        var isLastChunk = acc.ChainRemaining == 0;
+
+        // Protocol error guard (2026-06-01 PR final review): an H2 DATA
+        // frame carrying END_STREAM mid-chain is illegal per gRPC framing
+        // (the LPM is incomplete). Our own writer never produces this,
+        // but defend defensively: tear down the chain and throw. Without
+        // this guard the END_STREAM flag would be silently dropped (only
+        // the isLastChunk branch consults endStream below), the anchor
+        // would never close, and the ring would permanently shrink as
+        // _chainOpen/_zcActive leak forever.
+        if (endStream && !isLastChunk)
+        {
+            // CommitReadRaw publishes this frame's bytes into the deferred
+            // target; SpecReserved is NOT incremented (we're abandoning
+            // the body), so CloseZcChain's defensive
+            // (SpecReserved==0 && _zcActive) check fires EndZcReservation.
+            ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+            ring.CloseZcChain();
+            RemoveAcc(state, streamId, out _);
+            throw new InvalidDataException(
+                $"H2 stream {streamId} ended mid-chain-ZC LPM " +
+                $"({acc.ChainRemaining} body bytes still expected, this " +
+                $"frame carried {bodyLength}). END_STREAM mid-LPM is " +
+                "a protocol error.");
+        }
+
+        var flags = isLastChunk
+            ? (endStream ? MessageFlags.EndStream : (byte)0)
+            : MessageFlags.More;
+        var hdr = new FrameHeader(FrameType.Message, streamId, (uint)bodyLength, flags);
+
+        FramePayload payload;
+        if (payloadReservation.Second.IsEmpty)
+        {
+            // Common path: contiguous ring slice → keep as speculative ZC.
+            // SpeculativeReservedBytes is incremented BEFORE CommitReadRaw
+            // to match the single-frame ZC ordering (single-frame ZC at
+            // line ~531 also increments before the speculative payload is
+            // returned; FramePayload.Release decrements via Interlocked).
+            Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
+            ring.CommitReadRaw(baseCommitReadIdx, totalBytes); // deferred (_zcActive)
+            payload = FramePayload.FromRingMemorySpeculative(
+                payloadReservation.First.Slice(bodyOffset, bodyLength),
+                ring, totalBytes);
+        }
+        else
+        {
+            // Wrap-around: copy this frame to a pooled buffer. Anchor
+            // stays open via IsChainOpen; CommitReadRaw still goes
+            // through the deferred path because _zcActive is true.
+            var pooled = ArrayPool<byte>.Shared.Rent(bodyLength);
+            CopyFromReservationSlice(payloadReservation, bodyOffset, pooled.AsSpan(0, bodyLength));
+            ring.CommitReadRaw(baseCommitReadIdx, totalBytes); // deferred
+            payload = FramePayload.FromPooled(pooled, bodyLength);
+        }
+
+        if (isLastChunk)
+        {
+            // Close the chain marker so the in-flight chunks' Release
+            // calls can fire EndZcReservation via the
+            // (remaining == 0 && !IsChainOpen) gate in
+            // FramePayload.Release. CloseZcChain itself fires
+            // EndZcReservation defensively if SpeculativeReservedBytes
+            // is already 0 at close time (e.g., all ZC chunks released
+            // and the final chunk is the wrap-copy variant).
+            ring.CloseZcChain();
+            if (endStream)
+            {
+                state.StreamsWithInitialHeaders.Remove(streamId);
+            }
+            // Drop per-stream chain state. In chain mode acc.Buffer is
+            // always null so Reset() is a cheap field reset.
+            if (RemoveAcc(state, streamId, out var doneAcc))
+            {
+                doneAcc!.Reset();
+            }
+        }
+
+        return (hdr, payload);
+    }
+
+    /// <summary>
     /// Copies as many bytes from <paramref name="body"/> into <paramref name="acc"/>
     /// as needed to either (a) complete one in-progress LPM message or
     /// (b) reach end-of-input. Returns the completed message (or
@@ -814,6 +1176,22 @@ internal static partial class Http2Codec
         ShmRing ring, ulong baseCommitReadIdx, uint streamId, byte h2Flags, int payloadLen,
         Http2DecoderState state, CancellationToken ct)
     {
+        // BUG-FIX (round-10 GPT-5.5 #7): RFC 7540 §6.2 — HEADERS frames
+        // MUST be associated with a stream. Receiving HEADERS on stream
+        // 0 is a PROTOCOL_ERROR connection error. Previously this was
+        // silently routed to EmitDecodedHeaders which would have driven
+        // header state on a non-existent stream.
+        if (streamId == 0)
+        {
+            if (payloadLen > 0)
+            {
+                var _ = ring.ReserveRead(payloadLen, ct);
+            }
+            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            throw new InvalidDataException(
+                $"H2 HEADERS frame on connection stream 0 (RFC 7540 §6.2 PROTOCOL_ERROR)");
+        }
+
         var endStream = (h2Flags & Http2Flags.EndStream) != 0;
         var endHeaders = (h2Flags & Http2Flags.EndHeaders) != 0;
         var padded = (h2Flags & Http2Flags.Padded) != 0;
@@ -868,6 +1246,20 @@ internal static partial class Http2Codec
             // CONTINUATION almost never necessary).
             if (endHeaders)
             {
+                // BUG-FIX (round-10 GPT-5.5 #9): enforce MaxHeaderListSize
+                // here too. The CONTINUATION path already checks the
+                // cumulative payload (see line ~984), but the single-
+                // HEADERS fast path skipped the check. A peer could send
+                // one oversized HEADERS frame up to the per-frame cap
+                // (MaxH2FramePayloadSize) and force us to HPACK-decode
+                // and materialise the entire block despite our declared
+                // MaxHeaderListSize budget. Reject early.
+                if (firstHeaderBlockLength > MaxHeaderListSize)
+                {
+                    throw new InvalidDataException(
+                        $"H2 HEADERS payload {firstHeaderBlockLength} bytes exceeds " +
+                        $"MaxHeaderListSize ({MaxHeaderListSize})");
+                }
                 var single = firstFragment.AsSpan(firstHeaderBlockOffset, firstHeaderBlockLength);
                 return EmitDecodedHeaders(single, streamId, state, endStream);
             }
@@ -997,8 +1389,6 @@ internal static partial class Http2Codec
 
         FrameType internalType;
         byte internalFlags;
-        byte[] payloadBytes;
-        int payloadLen;
 
         if (!hasInitial)
         {
@@ -1025,44 +1415,62 @@ internal static partial class Http2Codec
             // <see cref="Http2DecoderState.PendingFrameHeader"/>. The next
             // call to <see cref="ReadFramePayloadInternal"/> returns the
             // stash before touching the ring, preserving FIFO order.
+            //
+            // Round-7 PR-B: pass the decoded HeadersV1 / TrailersV1 OBJECT
+            // straight through via <see cref="FramePayload.FromDecodedHeader"/>
+            // instead of re-serializing it to bytes for the upper layer to
+            // re-parse. Eliminates ~50% of the read-side header path cost
+            // (see HeaderPathProfileTests measurements).
             if (endStream)
             {
                 var (headersV1, trailersV1) = HpackHeadersAdapter.DecodeTrailersOnly(headerBlock);
 
-                var (hPayload, hLen) = headersV1.Encode();
-                var (tPayload, tLen) = trailersV1.Encode();
-
                 EnqueuePendingFrame(state,
-                    new FrameHeader(FrameType.Trailers, streamId, (uint)tLen, TrailersFlags.EndStream),
-                    FramePayload.FromPooled(tPayload, tLen));
+                    new FrameHeader(FrameType.Trailers, streamId, 0, TrailersFlags.EndStream),
+                    FramePayload.FromDecodedHeader(trailersV1));
 
                 // No persistent stream state to retain: trailers-only means
                 // the stream ended in this single HEADERS frame; any further
                 // wire frames on this stream id (none expected from a well-
                 // behaved peer) get treated as a fresh stream.
                 var hHdr = new FrameHeader(
-                    FrameType.Headers, streamId, (uint)hLen, HeadersFlags.Initial);
-                return (hHdr, FramePayload.FromPooled(hPayload, hLen));
+                    FrameType.Headers, streamId, 0, HeadersFlags.Initial);
+                return (hHdr, FramePayload.FromDecodedHeader(headersV1));
             }
 
             var v1 = HpackHeadersAdapter.DecodeHeaders(headerBlock);
-            (payloadBytes, payloadLen) = v1.Encode();
             internalType = FrameType.Headers;
             internalFlags = (byte)HeadersFlags.Initial;
             state.StreamsWithInitialHeaders[streamId] = 1;
+            var hdrFirst = new FrameHeader(internalType, streamId, 0, internalFlags);
+            return (hdrFirst, FramePayload.FromDecodedHeader(v1));
         }
         else
         {
-            // Subsequent HEADERS → trailers.
+            // Subsequent HEADERS → trailers per gRPC over HTTP/2.
+            // BUG-FIX (round-10 GPT-5.5 #8): trailers MUST carry
+            // END_STREAM. Per RFC 7540 §8.1 + the gRPC over HTTP/2
+            // wire spec, the trailing metadata HEADERS block MUST set
+            // the END_STREAM flag (it is the final frame of the stream).
+            // Without this guard a malformed/malicious peer could send
+            // "trailers" without END_STREAM and the upper layer would
+            // unconditionally mark _halfCloseReceived = true, complete
+            // the inbound channel, and remove the stream — leaving any
+            // subsequent peer frames routed to nothing (silent data
+            // loss + a spurious "successful" RPC completion).
+            if (!endStream)
+            {
+                throw new InvalidDataException(
+                    $"H2 trailers HEADERS on stream {streamId} missing END_STREAM " +
+                    "(RFC 7540 §8.1 + gRPC over HTTP/2: trailing metadata must end the stream)");
+            }
             var v1 = HpackHeadersAdapter.DecodeTrailers(headerBlock);
-            (payloadBytes, payloadLen) = v1.Encode();
             internalType = FrameType.Trailers;
-            internalFlags = endStream ? TrailersFlags.EndStream : (byte)0;
+            internalFlags = TrailersFlags.EndStream;
             state.StreamsWithInitialHeaders.Remove(streamId);
+            var hdrSub = new FrameHeader(internalType, streamId, 0, internalFlags);
+            return (hdrSub, FramePayload.FromDecodedHeader(v1));
         }
-
-        var hdr = new FrameHeader(internalType, streamId, (uint)payloadLen, internalFlags);
-        return (hdr, FramePayload.FromPooled(payloadBytes, payloadLen));
     }
 
     private static (FrameHeader Header, FramePayload Payload) ReadRstStreamFrame(
@@ -1098,6 +1506,16 @@ internal static partial class Http2Codec
         state.StreamsWithInitialHeaders.Remove(streamId);
         if (RemoveAcc(state, streamId, out var pendingAcc))
         {
+            // Chain-ZC leak guard (2026-06-01): if the canceled stream had
+            // a chain anchor open, close it now so subsequent Releases on
+            // already-surfaced ZC frames can publish ReadIdx via the
+            // FramePayload.Release gate. Without this, _chainOpen stays
+            // true after the cancel, EndZcReservation never fires, ring
+            // permanently shrinks from the cross-process writer's view.
+            if (pendingAcc!.Mode == AccMode.ChainZcInProgress)
+            {
+                ring.CloseZcChain();
+            }
             pendingAcc!.Reset();
         }
 

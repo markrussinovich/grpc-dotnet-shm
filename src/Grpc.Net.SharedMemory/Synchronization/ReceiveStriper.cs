@@ -323,10 +323,19 @@ internal sealed class ReceiveStriper : IDisposable
         {
             try
             {
-                return _queue.Reader.WaitToReadAsync()
-                    .AsTask()
-                    .GetAwaiter()
-                    .GetResult();
+                // Round-8 PR-C2: WaitToReadAsync returns ValueTask<bool>.
+                // When the channel already has items queued (the steady-
+                // state hot path under sustained traffic), the ValueTask
+                // is synchronously completed and we can return its Result
+                // without allocating a Task wrapper via .AsTask(). Only
+                // fall through to AsTask() when we actually need to block
+                // on the underlying IValueTaskSource (no data yet).
+                var vt = _queue.Reader.WaitToReadAsync();
+                if (vt.IsCompletedSuccessfully)
+                {
+                    return vt.Result;
+                }
+                return vt.AsTask().GetAwaiter().GetResult();
             }
             catch (ChannelClosedException)
             {

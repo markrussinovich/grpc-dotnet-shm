@@ -42,6 +42,27 @@ public sealed class TrailersV1
     public IReadOnlyList<MetadataKV> Metadata { get; init; } = Array.Empty<MetadataKV>();
 
     /// <summary>
+    /// Shared singleton for the dominant case: OK status, no status message,
+    /// no trailing metadata. The exact 11-byte payload
+    /// (<c>version=1 | statusCode=0 | msgLen=0 | metadataCount=0</c>) covers
+    /// every successful unary/server-streaming RPC with no app-level trailers,
+    /// which is the overwhelming majority of traffic. Returning this singleton
+    /// from <see cref="Decode"/> avoids allocating a fresh <see cref="TrailersV1"/>
+    /// plus a backing <see cref="List{T}"/>(0) per RPC.
+    /// <para>
+    /// Safe to share across threads: all properties are <c>init</c>-only and
+    /// <see cref="Metadata"/> is the immutable <see cref="Array.Empty{T}"/>.
+    /// </para>
+    /// </summary>
+    public static readonly TrailersV1 OkEmpty = new()
+    {
+        Version = 1,
+        GrpcStatusCode = StatusCode.OK,
+        GrpcStatusMessage = null,
+        Metadata = Array.Empty<MetadataKV>(),
+    };
+
+    /// <summary>
     /// Encodes this trailers payload into a pooled buffer.
     /// The caller takes ownership of the returned buffer and must return it
     /// to <see cref="ArrayPool{T}.Shared"/> after use (or transfer ownership
@@ -135,6 +156,21 @@ public sealed class TrailersV1
     /// </summary>
     public static TrailersV1 Decode(ReadOnlySpan<byte> data)
     {
+        // Fast-path: OK / no-message / no-metadata is the dominant case
+        // (every successful RPC without app-level trailers). The exact
+        // 11-byte payload is version(1=0x01) | statusCode(4=0) | msgLen(4=0)
+        // | metadataCount(2=0). Returning the shared OkEmpty singleton
+        // avoids allocating a fresh TrailersV1 + List<MetadataKV>(0) per
+        // RPC on the hot path.
+        if (data.Length == 11
+            && data[0] == 1
+            && BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(1, 4)) == 0
+            && BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(5, 4)) == 0
+            && BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(9, 2)) == 0)
+        {
+            return OkEmpty;
+        }
+
         if (data.Length < 1 + 4 + 4)
         {
             throw new InvalidDataException("Trailers payload too short");

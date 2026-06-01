@@ -84,7 +84,11 @@ public class Http2CodecTests
         {
             Assert.That(rh.Type, Is.EqualTo(FrameType.Headers));
             Assert.That(rh.StreamId, Is.EqualTo(1u));
-            var rt = HeadersV1.Decode(rp.Memory.Span);
+            // Round-7 PR-B: codec attaches the decoded HeadersV1 object
+            // directly to FramePayload.DecodedHeader, eliminating the
+            // bytes → HeadersV1 round-trip. Fall back to byte decode if
+            // the object isn't attached (defensive).
+            var rt = rp.DecodedHeader as HeadersV1 ?? HeadersV1.Decode(rp.Memory.Span);
             Assert.That(rt.HeaderType, Is.EqualTo((byte)0));
             Assert.That(rt.Method, Is.EqualTo(v1.Method));
             Assert.That(rt.Authority, Is.EqualTo(v1.Authority));
@@ -131,7 +135,8 @@ public class Http2CodecTests
         {
             Assert.That(hdr2.Type, Is.EqualTo(FrameType.Trailers));
             Assert.That(hdr2.StreamId, Is.EqualTo(streamId));
-            var rt = TrailersV1.Decode(pld2.Memory.Span);
+            // Round-7 PR-B: prefer codec-attached object over byte decode.
+            var rt = pld2.DecodedHeader as TrailersV1 ?? TrailersV1.Decode(pld2.Memory.Span);
             Assert.That(rt.GrpcStatusCode, Is.EqualTo(global::Grpc.Core.StatusCode.OK));
             Assert.That(rt.GrpcStatusMessage, Is.EqualTo("ok"));
             Assert.That(rt.Metadata.Count, Is.EqualTo(1));
@@ -264,7 +269,8 @@ public class Http2CodecTests
             // check at the internal-frame level.
             Assert.That(h1.Flags, Is.EqualTo((byte)HeadersFlags.Initial));
 
-            var hv1 = HeadersV1.Decode(p1.Memory.Span);
+            // Round-7 PR-B: prefer codec-attached object over byte decode.
+            var hv1 = p1.DecodedHeader as HeadersV1 ?? HeadersV1.Decode(p1.Memory.Span);
             Assert.That(hv1.HeaderType, Is.EqualTo((byte)1),
                 "Trailers-only's Headers half maps to server-initial style.");
         }
@@ -283,7 +289,8 @@ public class Http2CodecTests
             Assert.That(h2.Flags & TrailersFlags.EndStream, Is.EqualTo(TrailersFlags.EndStream),
                 "Trailers half must carry EndStream (signals call completion).");
 
-            var tv1 = TrailersV1.Decode(p2.Memory.Span);
+            // Round-7 PR-B: prefer codec-attached object over byte decode.
+            var tv1 = p2.DecodedHeader as TrailersV1 ?? TrailersV1.Decode(p2.Memory.Span);
             Assert.That(tv1.GrpcStatusCode, Is.EqualTo(global::Grpc.Core.StatusCode.NotFound),
                 "Trailers half must carry the parsed grpc-status (gRFC G3).");
             Assert.That(tv1.GrpcStatusMessage, Is.EqualTo("not found"),
@@ -830,7 +837,8 @@ public class Http2CodecTests
                 Assert.That(h.Type, Is.EqualTo(FrameType.Headers));
                 Assert.That(h.StreamId, Is.EqualTo(streamId));
 
-                var hv1 = HeadersV1.Decode(p.Memory.Span);
+                // Round-7 PR-B: prefer codec-attached object over byte decode.
+                var hv1 = p.DecodedHeader as HeadersV1 ?? HeadersV1.Decode(p.Memory.Span);
                 Assert.That(hv1.HeaderType, Is.EqualTo((byte)0),
                     "Reassembled HEADERS must be parsed as client-initial.");
                 Assert.That(hv1.Method, Is.EqualTo("/svc/M"));
@@ -918,5 +926,277 @@ public class Http2CodecTests
 
         WriteGoodMessageFrame(ring, streamId: 29);
         AssertNextReadIsGoodMessage(ring, streamId: 29);
+    }
+
+    // ===== Chain-ZC tests (2026-06-01 PR) =====
+    //
+    // Verify the multi-frame chain-ZC receive path:
+    //   1. Each H2 DATA frame body surfaces as a per-chunk synthetic
+    //      Message with MessageFlags.More (last has More=0 + optional
+    //      EndStream).
+    //   2. The first chunk includes the 5-byte gRPC LPM header so
+    //      LazyChainRos can decode it via firstFrameBodyOffset:5.
+    //   3. SpeculativeReservedBytes is non-zero during the chain (anchor
+    //      held) and returns to 0 after all chunks Release.
+    //   4. CloseZcChain fires EndZcReservation so header.ReadIdx is
+    //      published — ring's UsedBytesApprox returns to 0.
+
+    [Test]
+    public void ChainZc_MultiFrame_SurfacesPerChunkAndReleasesAnchor()
+    {
+        var name = $"grpc_chainzc_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 4 * 1024 * 1024, maxStreams: 10);
+        var ring = seg.RingA;
+        // Chain-ZC currently requires SingleStreamMode (see
+        // IsChainZcStartEligible). Set it so the codec engages the chain
+        // path; without this the test would silently fall back to copy.
+        ring.SingleStreamMode = true;
+
+        // 1 MiB LPM body — meets ChainZcMinLpmBytes (1 MiB) and
+        // ChainZcMinChunkBytes (256 KiB) gates. Split into 3 DATA
+        // frames whose body sizes are: [400 KiB, 400 KiB, 224 KiB].
+        // (First frame's 400 KiB body carries 5-byte LPM header + 395 KiB
+        // of LPM body; subsequent frames are pure LPM body bytes.)
+        const int totalBodyLen = 1024 * 1024;
+        var lpmBody = new byte[totalBodyLen];
+        new Random(42).NextBytes(lpmBody);
+
+        // Frame 1: 5-byte LPM header + first 399 KiB of body.
+        const int chunk1Body = 400 * 1024;
+        var frame1 = new byte[5 + chunk1Body - 5];
+        frame1[0] = 0;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            frame1.AsSpan(1, 4), (uint)totalBodyLen);
+        lpmBody.AsSpan(0, chunk1Body - 5).CopyTo(frame1.AsSpan(5));
+        FrameProtocol.WriteFrame(ring,
+            new FrameHeader(FrameType.Message, streamId: 1, (uint)frame1.Length, MessageFlags.More),
+            frame1);
+
+        // Frames 2..N: pure body continuations.
+        const int chunk2Body = 400 * 1024;
+        var frame2 = lpmBody.AsSpan(chunk1Body - 5, chunk2Body).ToArray();
+        FrameProtocol.WriteFrame(ring,
+            new FrameHeader(FrameType.Message, streamId: 1, (uint)frame2.Length, MessageFlags.More),
+            frame2);
+
+        var frame3Len = totalBodyLen - (chunk1Body - 5) - chunk2Body;
+        var frame3 = lpmBody.AsSpan(chunk1Body - 5 + chunk2Body, frame3Len).ToArray();
+        FrameProtocol.WriteFrame(ring,
+            new FrameHeader(FrameType.Message, streamId: 1, (uint)frame3.Length, MessageFlags.EndStream),
+            frame3);
+
+        // Read all 3 chunks. Each must surface as Message with the
+        // appropriate More / EndStream flags, payload bytes intact,
+        // and ZC anchor held until the LAST Release.
+        var (h1, p1) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        Assert.That(h1.Type, Is.EqualTo(FrameType.Message));
+        Assert.That(((byte)h1.Flags & MessageFlags.More), Is.EqualTo(MessageFlags.More),
+            "First chain chunk must have More flag set.");
+        Assert.That(p1.IsSpeculativeZeroCopy, Is.True,
+            "First chain chunk must be a speculative-ZC ring view (no copy).");
+        Assert.That(ring.SpeculativeReservedBytes, Is.GreaterThan(0L),
+            "Anchor must be held after first chunk surface.");
+        Assert.That(ring.IsChainOpen, Is.True,
+            "ChainOpen marker must be set during chain.");
+
+        var (h2, p2) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        Assert.That(h2.Type, Is.EqualTo(FrameType.Message));
+        Assert.That(((byte)h2.Flags & MessageFlags.More), Is.EqualTo(MessageFlags.More),
+            "Middle chain chunk must have More flag set.");
+        Assert.That(p2.IsSpeculativeZeroCopy, Is.True,
+            "Middle chain chunk must be ZC.");
+
+        var (h3, p3) = FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
+        Assert.That(h3.Type, Is.EqualTo(FrameType.Message));
+        Assert.That(((byte)h3.Flags & MessageFlags.More), Is.EqualTo(0),
+            "Final chain chunk must NOT have More flag.");
+        Assert.That(((byte)h3.Flags & MessageFlags.EndStream), Is.EqualTo(MessageFlags.EndStream),
+            "Final chain chunk inherits END_STREAM from H2 DATA frame.");
+        Assert.That(ring.IsChainOpen, Is.False,
+            "ChainOpen cleared after final chunk's CloseZcChain.");
+
+        // Verify body content: first 5 bytes of p1 are LPM header,
+        // then body[0..chunk1Body-5] in p1[5..], body[chunk1Body-5..chunk1Body-5+chunk2Body] in p2,
+        // body[...] in p3.
+        Assert.That(p1.Memory.Span[0], Is.EqualTo((byte)0), "compFlag");
+        var declared = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(p1.Memory.Span.Slice(1, 4));
+        Assert.That(declared, Is.EqualTo((uint)totalBodyLen));
+        Assert.That(p1.Memory.Slice(5).ToArray(), Is.EquivalentTo(lpmBody.AsSpan(0, chunk1Body - 5).ToArray()));
+        Assert.That(p2.Memory.ToArray(), Is.EquivalentTo(lpmBody.AsSpan(chunk1Body - 5, chunk2Body).ToArray()));
+        Assert.That(p3.Memory.ToArray(), Is.EquivalentTo(lpmBody.AsSpan(chunk1Body - 5 + chunk2Body, frame3Len).ToArray()));
+
+        // Release in arbitrary order — order independence is critical
+        // because LazyChainRos releases prev-frame during next-segment's
+        // GetSpan (i.e., during MergeFrom).
+        p2.Release();
+        Assert.That(ring.IsZcChainActive, Is.True, "Anchor still held while frames remain.");
+        p1.Release();
+        Assert.That(ring.IsZcChainActive, Is.True, "Anchor still held while final frame in flight.");
+        p3.Release();
+        Assert.That(ring.IsZcChainActive, Is.False,
+            "Anchor must release after the last chain frame's Release publishes header.ReadIdx.");
+        Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(0L),
+            "No reserved bytes after all chunks released.");
+        Assert.That(ring.UsedBytesApprox(), Is.EqualTo(0UL),
+            "Ring fully drained — header.ReadIdx caught up to WriteIdx.");
+    }
+
+    /// <summary>
+    /// Chain-ZC must NOT engage when SingleStreamMode is off, because
+    /// the chain-frozen header.ReadIdx would starve any concurrent
+    /// stream's reservations on the same ring. Verifies the explicit
+    /// SingleStreamMode gate in IsChainZcStartEligible by feeding ALL
+    /// chunks of a multi-frame LPM, then asserting (a) no chain anchor
+    /// ever opened and (b) the message surfaced via the accumulator
+    /// copy path (single FromPooled, no ZC).
+    /// </summary>
+    [Test]
+    public void ChainZc_FallsBackToCopy_WhenSingleStreamModeOff()
+    {
+        var name = $"grpc_chainzc_ssoff_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 4 * 1024 * 1024, maxStreams: 10);
+        var ring = seg.RingA;
+        // Deliberately leave SingleStreamMode at its default (false).
+
+        WriteChainFrames(ring, totalBodyLen: 1024 * 1024, compFlag: 0);
+
+        // The codec will accumulate all 3 frames into LpmAccumulator.Buffer
+        // and surface ONE Message at the end. We must drain all 3 codec-
+        // level reads (the first 2 may return null = no completion).
+        var (h, p) = DrainChainFromCodec(ring);
+        try
+        {
+            Assert.That(h.Type, Is.EqualTo(FrameType.Message));
+            Assert.That(p.IsSpeculativeZeroCopy, Is.False,
+                "With SingleStreamMode=false the chain-ZC start gate rejects, " +
+                "so the codec must accumulate-and-copy.");
+            Assert.That(ring.IsChainOpen, Is.False,
+                "_chainOpen must remain false: chain-ZC never started.");
+            Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(0L),
+                "No anchor held: no SpeculativeReservedBytes increment.");
+        }
+        finally { p.Release(); }
+    }
+
+    /// <summary>
+    /// Chain-ZC must NOT engage when the gRPC LPM compression flag is set,
+    /// because LazyChainRos-fed downstream consumers cannot feed segmented
+    /// ROS to a decompressor.
+    /// </summary>
+    [Test]
+    public void ChainZc_FallsBackToCopy_WhenCompressed()
+    {
+        var name = $"grpc_chainzc_cz_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 4 * 1024 * 1024, maxStreams: 10);
+        var ring = seg.RingA;
+        ring.SingleStreamMode = true;
+
+        WriteChainFrames(ring, totalBodyLen: 1024 * 1024, compFlag: 1);
+
+        var (h, p) = DrainChainFromCodec(ring);
+        try
+        {
+            Assert.That(h.Type, Is.EqualTo(FrameType.Message));
+            Assert.That(p.IsSpeculativeZeroCopy, Is.False,
+                "compFlag != 0 must fall back to accumulator copy " +
+                "(decompressor needs contiguous input).");
+            Assert.That(ring.IsChainOpen, Is.False,
+                "_chainOpen must remain false: compFlag gate rejected the chain.");
+            Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(0L),
+                "No anchor held: compFlag gate fired before BeginZcReservation.");
+        }
+        finally { p.Release(); }
+    }
+
+    /// <summary>
+    /// Malformed-peer guard (2026-06-01 round-2): an H2 DATA frame with
+    /// END_STREAM AND an incomplete LPM body (declared > body) must throw
+    /// InvalidDataException BEFORE opening a chain anchor — otherwise the
+    /// downstream LazyChainRos would block forever on the next Pull and
+    /// the chain anchor would leak.
+    /// </summary>
+    [Test]
+    public void ChainZc_MalformedEndStreamOnFirstFrame_ThrowsAndDoesNotOpenAnchor()
+    {
+        var name = $"grpc_chainzc_eos1_{Guid.NewGuid():N}";
+        using var seg = Segment.Create(name, ringCapacity: 4 * 1024 * 1024, maxStreams: 10);
+        var ring = seg.RingA;
+        ring.SingleStreamMode = true;
+
+        // Declare a 1 MiB LPM but only send a 400 KiB DATA frame with EOS.
+        const int declaredBody = 1024 * 1024;
+        const int chunk1Body = 400 * 1024;
+        var frame1 = new byte[chunk1Body];
+        frame1[0] = 0;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            frame1.AsSpan(1, 4), (uint)declaredBody);
+        new Random(99).NextBytes(frame1.AsSpan(5));
+        FrameProtocol.WriteFrame(ring,
+            new FrameHeader(FrameType.Message, streamId: 1,
+                (uint)frame1.Length, MessageFlags.EndStream),
+            frame1);
+
+        Assert.Throws<InvalidDataException>(() =>
+            FrameProtocol.ReadFramePayload(ring, zeroCopy: true),
+            "Incomplete-LPM END_STREAM on the first frame must throw " +
+            "InvalidDataException before chain-ZC anchor opens.");
+
+        Assert.That(ring.IsChainOpen, Is.False,
+            "_chainOpen must NEVER have been set: malformed-EOS gate fires " +
+            "before OpenZcChain.");
+        Assert.That(ring.IsZcChainActive, Is.False,
+            "_zcActive must NEVER have been set: malformed-EOS gate fires " +
+            "before BeginZcReservation.");
+        Assert.That(ring.SpeculativeReservedBytes, Is.EqualTo(0L),
+            "No anchor held: malformed-EOS gate fires before " +
+            "Interlocked.Add(SpeculativeReservedBytes).");
+    }
+
+    // Helper: writes a 3-frame multi-frame LPM (400 KiB + 400 KiB + tail)
+    // with the given compression flag in the first chunk's LPM header.
+    private static void WriteChainFrames(ShmRing ring, int totalBodyLen, byte compFlag)
+    {
+        var lpmBody = new byte[totalBodyLen];
+        new Random(13).NextBytes(lpmBody);
+
+        const int chunk1Body = 400 * 1024;
+        var frame1 = new byte[chunk1Body];
+        frame1[0] = compFlag;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            frame1.AsSpan(1, 4), (uint)totalBodyLen);
+        lpmBody.AsSpan(0, chunk1Body - 5).CopyTo(frame1.AsSpan(5));
+        FrameProtocol.WriteFrame(ring,
+            new FrameHeader(FrameType.Message, streamId: 1, (uint)frame1.Length, MessageFlags.More),
+            frame1);
+
+        const int chunk2Body = 400 * 1024;
+        var frame2 = lpmBody.AsSpan(chunk1Body - 5, chunk2Body).ToArray();
+        FrameProtocol.WriteFrame(ring,
+            new FrameHeader(FrameType.Message, streamId: 1, (uint)frame2.Length, MessageFlags.More),
+            frame2);
+
+        var frame3Len = totalBodyLen - (chunk1Body - 5) - chunk2Body;
+        var frame3 = lpmBody.AsSpan(chunk1Body - 5 + chunk2Body, frame3Len).ToArray();
+        FrameProtocol.WriteFrame(ring,
+            new FrameHeader(FrameType.Message, streamId: 1, (uint)frame3.Length, MessageFlags.EndStream),
+            frame3);
+    }
+
+    // Helper: drains a chain (or accumulator-assembled) message from the
+    // codec. Returns the FINAL completed Message (the accumulator copy
+    // path may return null on the intermediate frames; we drain until a
+    // Message surfaces).
+    private static (FrameHeader, FramePayload) DrainChainFromCodec(ShmRing ring)
+    {
+        // For the copy path the codec consumes intermediate frames into
+        // LpmAccumulator and returns ONE Message on the final frame. For
+        // the chain path it returns one Message per frame. Either way
+        // ReadFramePayload only returns when SOME logical frame is
+        // available, so a single call returns the FIRST surfaced
+        // Message. For the copy path that is the assembled LPM (one
+        // call); for the chain path we'd see the first chunk (three
+        // calls total). Both cases this helper returns the first
+        // surfaced frame, which is sufficient for the fall-back assertions.
+        return FrameProtocol.ReadFramePayload(ring, zeroCopy: true);
     }
 }

@@ -46,18 +46,47 @@ public readonly struct FramePayload
     /// </summary>
     public bool IsSpeculativeZeroCopy => _speculativeRing != null;
 
+    /// <summary>
+    /// Round-7 PR-B object passthrough: when this payload carries a HEADERS
+    /// or TRAILERS frame whose HPACK block was decoded directly to a
+    /// <see cref="HeadersV1"/> / <see cref="TrailersV1"/> by the H2 codec,
+    /// the decoded object is stashed here so upper-layer consumers can
+    /// skip the redundant <c>HeadersV1.Encode</c> &#x2192; bytes &#x2192;
+    /// <c>HeadersV1.Decode</c> round-trip. <see langword="null"/> for all
+    /// other frame types (DATA, control frames) and for HEADERS frames
+    /// that took the byte-fallback path.
+    /// </summary>
+    public object? DecodedHeader { get; }
+
     private FramePayload(ReadOnlyMemory<byte> memory, byte[]? pooledBuffer,
-        ShmRing? speculativeRing = null, int speculativeBytes = 0)
+        ShmRing? speculativeRing = null, int speculativeBytes = 0,
+        object? decodedHeader = null)
     {
         Memory = memory;
         _pooledBuffer = pooledBuffer;
         _speculativeRing = speculativeRing;
         _speculativeBytes = speculativeBytes;
+        DecodedHeader = decodedHeader;
     }
 
     public static FramePayload FromPooled(byte[] buffer, int length)
     {
         return new FramePayload(buffer.AsMemory(0, length), buffer);
+    }
+
+    /// <summary>
+    /// Round-7 PR-B: creates a payload that carries an already-decoded
+    /// <see cref="HeadersV1"/> or <see cref="TrailersV1"/> instead of
+    /// serialized bytes. Used by the H2 codec read path to hand the
+    /// decoded object directly to the upper layer, eliminating the
+    /// <c>Encode</c>-then-<c>Decode</c> round-trip the byte path requires.
+    /// The returned payload has empty <see cref="Memory"/>; consumers MUST
+    /// check <see cref="DecodedHeader"/> first for HEADERS / TRAILERS
+    /// frame types before reading bytes.
+    /// </summary>
+    internal static FramePayload FromDecodedHeader(object decodedHeader)
+    {
+        return new FramePayload(ReadOnlyMemory<byte>.Empty, null, decodedHeader: decodedHeader);
     }
 
     /// <summary>
